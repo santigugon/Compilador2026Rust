@@ -1,0 +1,1 @@
+def cami es tonta = = + 1= 0;
