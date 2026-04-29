@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 regex = "1.12.3"
+strum = "0.28.0"
+strum_macros = "0.28.0"
