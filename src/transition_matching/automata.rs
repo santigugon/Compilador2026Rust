@@ -3,7 +3,7 @@ use crate::enums::transition_tables::MachineStates;
 use crate::enums::token_category::TokenCategory;
 use crate::models::token_model::TokenStruct;
 
-pub fn state_match(c:char, current_state:States)->States{
+fn state_match(c:char, current_state:States)->States{
     match (c,current_state){
         // WHILE
         ('w',States::Q0)=>States::Q1,
@@ -20,10 +20,14 @@ pub fn state_match(c:char, current_state:States)->States{
         ('e',States::Q13)=>States::Q14_ELSE,
         ('i',States::Q12)=>States::Q15,
         ('f',States::Q15)=>States::Q16_ELIF,
-        // INT, FLOAT
+        // INT
         ('0'..='9', States::Q0) => States::Q7_INT,
+        ('0'..='9', States::Q7_INT) => States::Q7_INT,
+
+        // FLOAT
         ('.', States::Q7_INT) => States::Q8_FLOAT,
         ('0'..='9', States::Q8_FLOAT) => States::Q8_FLOAT,
+        
         // OPERATORS
         ('-',States::Q0)=>States::Q17_MINUS,
         ('+',States::Q0)=>States::Q18_PLUS,
@@ -67,12 +71,13 @@ pub fn state_match(c:char, current_state:States)->States{
     }
 }
 
-pub fn transform_to_machine_state(state:States) ->MachineStates{
+fn transform_to_machine_state(state:States) ->MachineStates{
     match(state){
         States::Q5_WHILE=>MachineStates::FINALSTATE,
         States::Q6_OPEN_PAR=>MachineStates::FINALSTATE,
         States::Q7_INT=>MachineStates::FINALSTATE,
         States::Q8_FLOAT=>MachineStates::FINALSTATE,
+        States::Q10_IF=>MachineStates::FINALSTATE,
         States::Q14_ELSE=>MachineStates::FINALSTATE,
         States::Q16_ELIF=>MachineStates::FINALSTATE,
         States::Q17_MINUS=>MachineStates::FINALSTATE,
@@ -84,28 +89,32 @@ pub fn transform_to_machine_state(state:States) ->MachineStates{
         States::Q24_FLOORDIV=>MachineStates::FINALSTATE,
         States::Q25_MOD=>MachineStates::FINALSTATE,
         States::Q27_STR=>MachineStates::FINALSTATE,
+
         States::Q19_DEADSTATE=>MachineStates::DEADSTATE,
+
         _=>MachineStates::NONFINAL
     }
 }
 
-pub fn lookahead_makes_final_state_valid(next_c:char,current_state:States)->MachineStates{
+fn lookahead_makes_final_state_valid(next_c:char,current_state:States)->bool{
     match(next_c, current_state){
-        ('(', States::Q5_WHILE)=>MachineStates::FINALSTATE,
-        ('(', States::Q10_IF)=>MachineStates::FINALSTATE,
-        ('(', States::Q16_ELIF)=>MachineStates::FINALSTATE,
+        ('(', States::Q5_WHILE)=>true,
+        ('(', States::Q10_IF)=>true,
+        ('(', States::Q16_ELIF)=>true,
 
-        ('*', States::Q21_PROD)=>MachineStates::NONFINAL,
-        ('/', States::Q23_DIV)=>MachineStates::NONFINAL,
+        ('*', States::Q21_PROD)=>false,
+        ('/', States::Q23_DIV)=>false,
 
-        (_, States::Q21_PROD)=>MachineStates::FINALSTATE,
-        (_, States::Q23_DIV)=>MachineStates::FINALSTATE,
+        (_, States::Q21_PROD)=>true,
+        (_, States::Q23_DIV)=>true,
 
-        (_,_)=>MachineStates::NONFINAL
+        (' ',_)=>true,
+
+        (_,_)=>false
     }
 }
 
-pub fn requires_lookeahead(current_state:States)->bool{
+fn requires_lookeahead(current_state:States)->bool{
     match(current_state){
         States::Q5_WHILE=>true,
         States::Q10_IF=>true,
@@ -117,7 +126,7 @@ pub fn requires_lookeahead(current_state:States)->bool{
     }
 }
 
-pub fn is_operator(current_state:States)->bool{
+fn is_operator(current_state:States)->bool{
     match(current_state){
         States::Q17_MINUS=>true,
         States::Q18_PLUS=>true,
@@ -130,7 +139,66 @@ pub fn is_operator(current_state:States)->bool{
     }
 }
 
-pub fn match_transitions(input:String){
+fn state_category_matching(state:States)->TokenCategory{
+    match(state) {
+        States::Q5_WHILE=>TokenCategory::Keyword,
+        States::Q6_OPEN_PAR=>TokenCategory::Delimiter,
+        States::Q7_INT=>TokenCategory::Integer,
+        States::Q8_FLOAT=>TokenCategory::Float,
+        States::Q10_IF=>TokenCategory::Keyword,
+        States::Q14_ELSE=>TokenCategory::Keyword,
+        States::Q16_ELIF=>TokenCategory::Keyword,
+        States::Q17_MINUS=>TokenCategory::Operator,
+        States::Q18_PLUS=>TokenCategory::Operator,
+        States::Q20_VAR=>TokenCategory::Identifier,
+        States::Q21_PROD=>TokenCategory::Operator,
+        States::Q22_POW=>TokenCategory::Operator,
+        States::Q23_DIV=>TokenCategory::Operator,
+        States::Q24_FLOORDIV=>TokenCategory::Operator,
+        States::Q25_MOD=>TokenCategory::Operator,
+        States::Q27_STR=>TokenCategory::StringToken,
+        States::Q19_DEADSTATE=>TokenCategory::Unknown,
+
+        _=>TokenCategory::Unknown
+    }
+}
+
+pub fn return_used_positions(tokens: &Vec<TokenStruct>)->Vec<bool>{
+    let mut result =vec![false; tokens.len()];
+    let last_ind =tokens.len()-1;
+    let mut fill_with_true_till=last_ind;
+
+    for i in 0..=last_ind{
+        let iterator= last_ind-i;
+        println!("Iterator, {}", iterator);
+        let token = &tokens[iterator];
+
+        if (fill_with_true_till<=iterator){
+            result[iterator]=true;
+            continue;
+        }
+
+        match(token.category){
+            TokenCategory::Unknown=>{
+                continue;
+            }
+            _=>{
+                let word_len = token.word.len();
+
+                fill_with_true_till = iterator.saturating_sub(word_len - 1);
+
+                println!("iterator {} word_len {}  fill_with_true_till{}", iterator,word_len,fill_with_true_till);
+                result[iterator]=true;
+            }
+        }
+    }
+    return result;
+
+}
+
+pub fn match_transitions(input:&String)->Vec<TokenStruct>{
+
+    println!("HEllooo {}", input);
     let mut current_state=States::Q0;
 
     let unknown_token= TokenStruct{
@@ -149,44 +217,54 @@ pub fn match_transitions(input:String){
 
     for ch in input.chars() {
         let next_char= ch;
-
+        
         if(first_iteration){
             past_char= next_char;
             first_iteration=false;
-            break;
+            continue;
         }
+
+        // println!("Current state {}", current_state.clone());
+        // println!("Char and next char {}-{} ",past_char.clone(),next_char.clone());
+        current_state=state_match(past_char, current_state);
+        // println!("New state {} \n", current_state.clone());
         
         let lookahead = requires_lookeahead(current_state);
+        let lookahead_is_final =lookahead_makes_final_state_valid(next_char.clone(),current_state);
+        
+        let token_finalization:bool= (!lookahead||lookahead_is_final) && (next_char==' '|| next_char == '\n' || is_operator(current_state));
+        // println!("\n Lookahead is final {} \n", lookahead_is_final);
+        // println!("Token finalizatio {} \n", token_finalization);
+        
         let machine_state_enum= transform_to_machine_state(current_state);
-        
-        current_state=state_match(past_char, current_state);
-        
-        let token_finalization:bool= !lookahead && (next_char==' '|| next_char == '\n' || is_operator(current_state));
-
-        
-        
-        
-        past_char = next_char;
         
         if( past_char != ' '){
             token_word.push(past_char);
         }
-
-
+        
+        let current_category = state_category_matching(current_state);
+        
         match machine_state_enum {
             MachineStates::FINALSTATE if(token_finalization)=> {
                 let new_token =TokenStruct{
-                    word:token_word,
+                    word:token_word.clone(),
                     rule:None,
-                    category: TokenCategory::Unknown
+                    category: current_category.clone()
                 };
+                println!("\n Iterator {} Word: {} Category {} \n", iterator, token_word, current_category);
                 token_references[iterator]= new_token;
                 token_word = String::new();
+                current_state = States::Q0;
             },
+            MachineStates::DEADSTATE=>{
+                token_word=String::new();
+            } 
             _=>{}
         }
         
-
+        past_char = next_char;
         iterator+=1;
     }
+
+    return token_references;
 }
