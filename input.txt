@@ -1,2 +1,20 @@
-def cami es tonta = = + 1= 0;
-/while if ifa whilea +-= 44 4.2898 asd4 
+def calc(x, y):
+    if x > 0:
+        return x + y
+    elif x < 0:
+        return x - y
+    else:
+        pass
+    while x != 0:
+        x = x - 1
+    for i in items:
+        total = total + i
+    a = 1 + 2 + 3
+    b = x * y
+    c = z / 2
+    d = n % 2
+    e = p ** 2
+    f = q // 2
+    (a + b)
+    [a, b]
+    True and False
