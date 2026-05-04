@@ -1,20 +1,9 @@
-def calc(x, y):
-    if x > 0:
-        return x + y
-    elif x < 0:
-        return x - y
-    else:
-        pass
-    while x != 0:
-        x = x - 1
-    for i in items:
-        total = total + i
-    a = 1 + 2 + 3
-    b = x * y
-    c = z / 2
-    d = n % 2
-    e = p ** 2
-    f = q // 2
-    (a + b)
-    [a, b]
-    True and False
+def bad_lex(x):
+    a = 1 + 2
+    b = x * 3
+    c = "invalido
+    d = 4
+    e = money$here
+    f = 3otrosimbolo
+    g = $invalido
+    return a

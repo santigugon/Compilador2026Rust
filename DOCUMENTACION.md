@@ -141,10 +141,10 @@ Aparece `Lexical analysis: failed` con mensajes como `unexpected character '$'` 
 def bad_lex(x):
     a = 1 + 2
     b = x * 3
-    c = valido
+    c = "invalido
     d = 4
     e = money$here
-    f = otro$simbolo
+    f = 3otrosimbolo
     g = $invalido
     return a
 
