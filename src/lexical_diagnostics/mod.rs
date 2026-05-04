@@ -1,5 +1,3 @@
-//! Post-pass over automaton + merge diagnostics: drop issues that the regex layer
-//! (or merged output) already resolved at the reported byte index.
 
 use crate::enums::token_category::TokenCategory;
 use crate::models::lexical_issue::LexicalIssue;
@@ -23,8 +21,6 @@ fn issue_superseded_by_regex_or_merge(
     known_raw || known_regex
 }
 
-/// Merges automaton and merge-phase issues, removes false positives when the regex
-/// or merged grid already classifies the byte, then sorts and deduplicates.
 pub fn consolidate_lexical_issues(
     automata_issues: Vec<LexicalIssue>,
     merge_issues: Vec<LexicalIssue>,
