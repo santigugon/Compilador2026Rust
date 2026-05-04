@@ -6,6 +6,4 @@ pub fn read_input()->String{
     contents.push(' ');
 
     return contents;
-
-
 }

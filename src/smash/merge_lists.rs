@@ -44,11 +44,6 @@ pub fn filter_unknowns(final_list: &Vec<TokenStruct>) -> Vec<TokenStruct> {
     result
 }
 
-/// Positions covered by a successful automaton token are still `Unknown` in the per-slot
-/// vector except at the lexeme's end index. Only flag runs where the automaton did not
-/// claim the character (`positions_list[i] == false`), merged output is `Unknown`, and the
-/// regex layer also has no classification at that byte (regex may still match what the DFA
-/// rejected).
 fn collect_unknown_runs(
     merged: &[TokenStruct],
     input: &str,

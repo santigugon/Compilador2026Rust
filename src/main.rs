@@ -5,12 +5,11 @@ mod models;
 mod transition_matching;
 mod smash;
 mod semantic_analysis;
+mod lexical_diagnostics;
 
 use regex::utils;
 use transition_matching::automata;
 use smash::merge_lists;
-use enums::token_category::TokenCategory;
-use models::lexical_issue::LexicalIssue;
 use models::token_model::TokenStruct;
 
 const LEXEME_COLUMN_WIDTH: usize = 32;
@@ -40,7 +39,7 @@ fn print_tokens(tokens: &[TokenStruct]) {
 }
 
 fn main() {
-    println!("Hello, world!");
+    // println!("Hello, world!");
     // let input =String::from("/while if ifa whilea +-= 44 4.2898 asd4 ");
     let  input: String = read_file::read_input();
     let (automata_tokens, automata_issues) = automata::match_transitions(&input);
@@ -50,39 +49,12 @@ fn main() {
     let (smashed_list, merge_issues, raw_merged) =
         merge_lists::automata_regex_match(&automata_tokens, &used_positions, &regex_list, &input);
 
-    fn issue_superseded_by_regex_or_merge(
-        issue: &LexicalIssue,
-        raw: &[TokenStruct],
-        regex_list: &[TokenStruct],
-    ) -> bool {
-        if issue.message.contains("unterminated") {
-            return false;
-        }
-        let Some(i) = issue.char_index else {
-            return false;
-        };
-        let known_raw = i < raw.len() && !matches!(raw[i].category, TokenCategory::Unknown);
-        let known_regex = i < regex_list.len()
-            && !matches!(regex_list[i].category, TokenCategory::Unknown);
-        known_raw || known_regex
-    }
-
-    let automata_issues: Vec<LexicalIssue> = automata_issues
-        .into_iter()
-        .filter(|issue| !issue_superseded_by_regex_or_merge(issue, &raw_merged, &regex_list))
-        .collect();
-
-    let merge_issues: Vec<LexicalIssue> = merge_issues
-        .into_iter()
-        .filter(|issue| !issue_superseded_by_regex_or_merge(issue, &raw_merged, &regex_list))
-        .collect();
-
-    let mut lexical_issues: Vec<LexicalIssue> = automata_issues;
-    lexical_issues.extend(merge_issues);
-    lexical_issues.sort();
-    lexical_issues.dedup_by(|a, b| {
-        a.lexeme == b.lexeme && a.message == b.message && a.char_index == b.char_index
-    });
+    let lexical_issues = lexical_diagnostics::consolidate_lexical_issues(
+        automata_issues,
+        merge_issues,
+        &raw_merged,
+        &regex_list,
+    );
 
     match semantic_analysis::validate_operator_operands(&smashed_list) {
         Ok(()) => println!("Semantic analysis: OK (operators have valid neighbors)."),
