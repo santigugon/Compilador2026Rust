@@ -3,16 +3,10 @@ use crate::enums::token_category::TokenCategory;
 
 
 pub fn filter_unknowns(final_list: &Vec<TokenStruct>)->Vec<TokenStruct>{
-    let unknown_token= TokenStruct{
-            word:String::from("unknown"),
-            rule:None,
-            category: TokenCategory::Unknown
-    };
-
     let mut result: Vec<TokenStruct> = vec![];
 
     for token in final_list{
-        match (token.category){
+        match token.category{
             TokenCategory::Unknown=>{
                 continue;
             }

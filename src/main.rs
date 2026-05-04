@@ -7,7 +7,6 @@ mod smash;
 
 use regex::utils;
 use transition_matching::automata;
-use enums::transition_tables::States;
 use smash::merge_lists;
 
 fn main() {

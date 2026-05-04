@@ -1,7 +1,8 @@
 use strum_macros::Display;
 
-#[derive(Display,Copy,Clone)]
-pub enum States{
+#[derive(Display, Copy, Clone)]
+#[allow(non_camel_case_types)]
+pub enum States {
     Q0,
     Q1,
     Q2,
@@ -29,7 +30,7 @@ pub enum States{
     Q24_FLOORDIV,
     Q25_MOD,
     Q26,
-    Q27_STR
+    Q27_STR,
 }
 
 #[derive(Display)]

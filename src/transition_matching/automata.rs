@@ -37,6 +37,17 @@ fn state_match(c:char, current_state:States)->States{
         ('/',States::Q23_DIV)=>States::Q24_FLOORDIV,
         ('%',States::Q0)=>States::Q25_MOD,
 
+        // OPEN PAREN (delimiter)
+        ('(', States::Q0) => States::Q6_OPEN_PAR,
+        ('(', States::Q5_WHILE) => States::Q6_OPEN_PAR,
+        ('(', States::Q10_IF) => States::Q6_OPEN_PAR,
+        ('(', States::Q14_ELSE) => States::Q6_OPEN_PAR,
+        ('(', States::Q16_ELIF) => States::Q6_OPEN_PAR,
+        ('(', States::Q20_VAR) => States::Q6_OPEN_PAR,
+        ('(', States::Q7_INT) => States::Q6_OPEN_PAR,
+        ('(', States::Q8_FLOAT) => States::Q6_OPEN_PAR,
+        ('(', States::Q6_OPEN_PAR) => States::Q6_OPEN_PAR,
+
         // STRING
         ('"',States::Q0)=>States::Q26,
         ('\n',States::Q26)=>States::Q19_DEADSTATE,
@@ -72,7 +83,7 @@ fn state_match(c:char, current_state:States)->States{
 }
 
 fn transform_to_machine_state(state:States) ->MachineStates{
-    match(state){
+    match state {
         States::Q5_WHILE=>MachineStates::FINALSTATE,
         States::Q6_OPEN_PAR=>MachineStates::FINALSTATE,
         States::Q7_INT=>MachineStates::FINALSTATE,
@@ -100,6 +111,7 @@ fn lookahead_makes_final_state_valid(next_c:char,current_state:States)->bool{
     match(next_c, current_state){
         ('(', States::Q5_WHILE)=>true,
         ('(', States::Q10_IF)=>true,
+        ('(', States::Q14_ELSE)=>true,
         ('(', States::Q16_ELIF)=>true,
 
         ('*', States::Q21_PROD)=>false,
@@ -115,9 +127,10 @@ fn lookahead_makes_final_state_valid(next_c:char,current_state:States)->bool{
 }
 
 fn requires_lookeahead(current_state:States)->bool{
-    match(current_state){
+    match current_state {
         States::Q5_WHILE=>true,
         States::Q10_IF=>true,
+        States::Q14_ELSE=>true,
         States::Q16_ELIF=>true,
 
         States::Q21_PROD=>true,
@@ -127,7 +140,7 @@ fn requires_lookeahead(current_state:States)->bool{
 }
 
 fn is_operator(current_state:States)->bool{
-    match(current_state){
+    match current_state {
         States::Q17_MINUS=>true,
         States::Q18_PLUS=>true,
         States::Q21_PROD=>true,
@@ -140,7 +153,7 @@ fn is_operator(current_state:States)->bool{
 }
 
 fn state_category_matching(state:States)->TokenCategory{
-    match(state) {
+    match state {
         States::Q5_WHILE=>TokenCategory::Keyword,
         States::Q6_OPEN_PAR=>TokenCategory::Delimiter,
         States::Q7_INT=>TokenCategory::Integer,
@@ -172,12 +185,12 @@ pub fn return_used_positions(tokens: &Vec<TokenStruct>)->Vec<bool>{
         let iterator= last_ind-i;
         let token = &tokens[iterator];
 
-        if (fill_with_true_till<=iterator){
+        if fill_with_true_till <= iterator {
             result[iterator]=true;
             continue;
         }
 
-        match(token.category){
+        match token.category {
             TokenCategory::Unknown=>{
                 continue;
             }
@@ -215,7 +228,7 @@ pub fn match_transitions(input:&String)->Vec<TokenStruct>{
     for ch in input.chars() {
         let next_char= ch;
         
-        if(first_iteration){
+        if first_iteration {
             past_char= next_char;
             first_iteration=false;
             continue;
@@ -229,13 +242,18 @@ pub fn match_transitions(input:&String)->Vec<TokenStruct>{
         let lookahead = requires_lookeahead(current_state);
         let lookahead_is_final =lookahead_makes_final_state_valid(next_char.clone(),current_state);
         
-        let token_finalization:bool= (!lookahead||lookahead_is_final) && (next_char==' '|| next_char == '\n' || is_operator(current_state));
+        let token_finalization: bool = (!lookahead || lookahead_is_final)
+            && (next_char == ' '
+                || next_char == '\n'
+                || is_operator(current_state)
+                || next_char == '('
+                || matches!(current_state, States::Q6_OPEN_PAR));
         // println!("\n Lookahead is final {} \n", lookahead_is_final);
         // println!("Token finalizatio {} \n", token_finalization);
         
         let machine_state_enum= transform_to_machine_state(current_state);
         
-        if( past_char != ' ' && past_char != '\n'){
+        if past_char != ' ' && past_char != '\n' {
             println!("the past char {}", past_char);
             token_word.push(past_char);
         }
@@ -243,7 +261,7 @@ pub fn match_transitions(input:&String)->Vec<TokenStruct>{
         let current_category = state_category_matching(current_state);
         
         match machine_state_enum {
-            MachineStates::FINALSTATE if(token_finalization)=> {
+            MachineStates::FINALSTATE if token_finalization => {
                 let new_token =TokenStruct{
                     word:token_word.clone(),
                     rule:None,
