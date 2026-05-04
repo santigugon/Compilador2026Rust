@@ -170,7 +170,6 @@ pub fn return_used_positions(tokens: &Vec<TokenStruct>)->Vec<bool>{
 
     for i in 0..=last_ind{
         let iterator= last_ind-i;
-        println!("Iterator, {}", iterator);
         let token = &tokens[iterator];
 
         if (fill_with_true_till<=iterator){
@@ -186,8 +185,6 @@ pub fn return_used_positions(tokens: &Vec<TokenStruct>)->Vec<bool>{
                 let word_len = token.word.len();
 
                 fill_with_true_till = iterator.saturating_sub(word_len - 1);
-
-                println!("iterator {} word_len {}  fill_with_true_till{}", iterator,word_len,fill_with_true_till);
                 result[iterator]=true;
             }
         }
@@ -238,7 +235,8 @@ pub fn match_transitions(input:&String)->Vec<TokenStruct>{
         
         let machine_state_enum= transform_to_machine_state(current_state);
         
-        if( past_char != ' '){
+        if( past_char != ' ' && past_char != '\n'){
+            println!("the past char {}", past_char);
             token_word.push(past_char);
         }
         
@@ -251,7 +249,7 @@ pub fn match_transitions(input:&String)->Vec<TokenStruct>{
                     rule:None,
                     category: current_category.clone()
                 };
-                println!("\n Iterator {} Word: {} Category {} \n", iterator, token_word, current_category);
+                // println!("\n Iterator {} Word: {} Category {} \n", iterator, token_word, current_category);
                 token_references[iterator]= new_token;
                 token_word = String::new();
                 current_state = States::Q0;

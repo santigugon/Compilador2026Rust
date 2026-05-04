@@ -16,6 +16,12 @@ pub fn filter_unknowns(final_list: &Vec<TokenStruct>)->Vec<TokenStruct>{
             TokenCategory::Unknown=>{
                 continue;
             }
+            TokenCategory::Indentation=>{
+                continue;
+            }
+            TokenCategory::WhiteSpace=>{
+                continue;
+            }
             _=>{
                 result.push(token.clone());
             }

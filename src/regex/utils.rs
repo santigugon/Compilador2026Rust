@@ -51,9 +51,12 @@ fn regex_list() -> Vec<TokenStruct> {
         TokenStruct { word: String::from("|"), rule: Some(Regex::new(r"\|").unwrap()), category: TokenCategory::Delimiter },
         TokenStruct { word: String::from("^"), rule: Some(Regex::new(r"\^").unwrap()), category: TokenCategory::Delimiter },
 
+        TokenStruct { word: String::from("\\n"), rule: Some(Regex::new(r"\b \b").unwrap()), category: TokenCategory::WhiteSpace },
         TokenStruct { word: String::from("\\n"), rule: Some(Regex::new(r"\n").unwrap()), category: TokenCategory::Indentation },
         TokenStruct { word: String::from("indent"), rule: Some(Regex::new(r"^[ \t]+").unwrap()), category: TokenCategory::Indentation },
         TokenStruct { word: String::from("dedent"), rule: Some(Regex::new(r"$^").unwrap()), category: TokenCategory::Indentation },
+
+
     ]
 }
 
