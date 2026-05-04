@@ -29,13 +29,13 @@ fn regex_list() -> Vec<TokenStruct> {
         TokenStruct { word: String::from("-="), rule: Some(Regex::new(r"-=").unwrap()), category: TokenCategory::Operator },
         TokenStruct { word: String::from("*="), rule: Some(Regex::new(r"\*=").unwrap()), category: TokenCategory::Operator },
         TokenStruct { word: String::from("/="), rule: Some(Regex::new(r"/=").unwrap()), category: TokenCategory::Operator },
+        TokenStruct { word: String::from("->"), rule: Some(Regex::new(r"->").unwrap()), category: TokenCategory::Delimiter },
+        TokenStruct { word: String::from("<<"), rule: Some(Regex::new(r"<<").unwrap()), category: TokenCategory::Delimiter },
+        TokenStruct { word: String::from(">>"), rule: Some(Regex::new(r">>").unwrap()), category: TokenCategory::Delimiter },
         TokenStruct { word: String::from("<"), rule: Some(Regex::new(r"<").unwrap()), category: TokenCategory::Operator },
         TokenStruct { word: String::from(">"), rule: Some(Regex::new(r">").unwrap()), category: TokenCategory::Operator },
         TokenStruct { word: String::from("="), rule: Some(Regex::new(r"=").unwrap()), category: TokenCategory::Operator },
 
-        TokenStruct { word: String::from("->"), rule: Some(Regex::new(r"->").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from("<<"), rule: Some(Regex::new(r"<<").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from(">>"), rule: Some(Regex::new(r">>").unwrap()), category: TokenCategory::Delimiter },
         TokenStruct { word: String::from("("), rule: Some(Regex::new(r"\(").unwrap()), category: TokenCategory::Delimiter },
         TokenStruct { word: String::from(")"), rule: Some(Regex::new(r"\)").unwrap()), category: TokenCategory::Delimiter },
         TokenStruct { word: String::from("["), rule: Some(Regex::new(r"\[").unwrap()), category: TokenCategory::Delimiter },
@@ -70,16 +70,20 @@ pub fn regex_match(input:String)->Vec<TokenStruct>{
 
     let regexes= regex_list();
     let mut token_references= vec![unknown_token;input.len()];
-    let mut counter=1;
-    
+    let mut occupied_positions = vec![false; input.len()];
     for rule in regexes {
         match rule.rule {
             Some(ref regex) => {
                 for m in regex.find_iter(&input) {
-                    println!("Hello the result is, {}:{}", m.start(), m.end());
-                    token_references[m.start()] = rule.clone();
-                    println!("count {}", counter);
-                    counter += 1;
+                    if occupied_positions[m.start()..m.end()].iter().any(|occupied| *occupied) {
+                        continue;
+                    }
+
+                    for position in m.start()..m.end() {
+                        token_references[position] = rule.clone();
+                        occupied_positions[position] = true;
+                    }
+                    // println!("count {}", counter);
                 }
             }
             None => {

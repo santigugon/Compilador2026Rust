@@ -1,7 +1,7 @@
 use strum_macros::Display;
 
-#[derive(Display, Clone)]
-pub enum TokenCategory{
+#[derive(Display, Clone, PartialEq, Eq)]
+pub enum TokenCategory {
     Keyword,
     Identifier,
     Integer,
