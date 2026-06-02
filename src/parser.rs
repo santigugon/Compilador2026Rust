@@ -80,6 +80,15 @@ impl Parser {
     pub fn parse_program(&mut self) -> Result<AstNode, ParseError> {
         self.parse_decorator()?;
         let kernel = self.parse_kernel()?;
+        if self.pos < self.tokens.len() - 1 {
+            let tok = self.peek();
+            return Err(ParseError {
+                message: format!(
+                    "Se encontraron tokens extra después del único kernel permitido: '{}' ({})",
+                    tok.word, tok.category
+                ),
+            });
+        }
         Ok(AstNode::Program {
             kernel: Box::new(kernel),
         })
