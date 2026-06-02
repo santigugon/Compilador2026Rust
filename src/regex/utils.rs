@@ -1,72 +1,117 @@
 use regex::Regex;
 
-use crate::models::token_model::TokenStruct;
 use crate::enums::token_category::TokenCategory;
-
+use crate::models::token_model::TokenStruct;
 
 fn regex_list() -> Vec<TokenStruct> {
     return vec![
-        TokenStruct { word: String::from("def"), rule: Some(Regex::new(r"\bdef\b").unwrap()), category: TokenCategory::Keyword },
-        TokenStruct { word: String::from("return"), rule: Some(Regex::new(r"\breturn\b").unwrap()), category: TokenCategory::Keyword },
-        TokenStruct { word: String::from("for"), rule: Some(Regex::new(r"\bfor\b").unwrap()), category: TokenCategory::Keyword },
-        TokenStruct { word: String::from("in"), rule: Some(Regex::new(r"\bin\b").unwrap()), category: TokenCategory::Keyword },
-        TokenStruct { word: String::from("is"), rule: Some(Regex::new(r"\bis\b").unwrap()), category: TokenCategory::Keyword },
-        TokenStruct { word: String::from("and"), rule: Some(Regex::new(r"\band\b").unwrap()), category: TokenCategory::Keyword },
-        TokenStruct { word: String::from("or"), rule: Some(Regex::new(r"\bor\b").unwrap()), category: TokenCategory::Keyword },
-        TokenStruct { word: String::from("not"), rule: Some(Regex::new(r"\bnot\b").unwrap()), category: TokenCategory::Keyword },
-        TokenStruct { word: String::from("True"), rule: Some(Regex::new(r"\bTrue\b").unwrap()), category: TokenCategory::Keyword },
-        TokenStruct { word: String::from("False"), rule: Some(Regex::new(r"\bFalse\b").unwrap()), category: TokenCategory::Keyword },
-        TokenStruct { word: String::from("None"), rule: Some(Regex::new(r"\bNone\b").unwrap()), category: TokenCategory::Keyword },
-        TokenStruct { word: String::from("pass"), rule: Some(Regex::new(r"\bpass\b").unwrap()), category: TokenCategory::Keyword },
-        TokenStruct { word: String::from("break"), rule: Some(Regex::new(r"\bbreak\b").unwrap()), category: TokenCategory::Keyword },
-        TokenStruct { word: String::from("continue"), rule: Some(Regex::new(r"\bcontinue\b").unwrap()), category: TokenCategory::Keyword },
-
-        TokenStruct { word: String::from("<="), rule: Some(Regex::new(r"<=").unwrap()), category: TokenCategory::Operator },
-        TokenStruct { word: String::from(">="), rule: Some(Regex::new(r">=").unwrap()), category: TokenCategory::Operator },
-        TokenStruct { word: String::from("=="), rule: Some(Regex::new(r"==").unwrap()), category: TokenCategory::Operator },
-        TokenStruct { word: String::from("!="), rule: Some(Regex::new(r"!=").unwrap()), category: TokenCategory::Operator },
-        TokenStruct { word: String::from("+="), rule: Some(Regex::new(r"\+=").unwrap()), category: TokenCategory::Operator },
-        TokenStruct { word: String::from("-="), rule: Some(Regex::new(r"-=").unwrap()), category: TokenCategory::Operator },
-        TokenStruct { word: String::from("*="), rule: Some(Regex::new(r"\*=").unwrap()), category: TokenCategory::Operator },
-        TokenStruct { word: String::from("/="), rule: Some(Regex::new(r"/=").unwrap()), category: TokenCategory::Operator },
-        TokenStruct { word: String::from("->"), rule: Some(Regex::new(r"->").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from("<<"), rule: Some(Regex::new(r"<<").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from(">>"), rule: Some(Regex::new(r">>").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from("<"), rule: Some(Regex::new(r"<").unwrap()), category: TokenCategory::Operator },
-        TokenStruct { word: String::from(">"), rule: Some(Regex::new(r">").unwrap()), category: TokenCategory::Operator },
-        TokenStruct { word: String::from("="), rule: Some(Regex::new(r"=").unwrap()), category: TokenCategory::Assign },
-
-        TokenStruct { word: String::from("("), rule: Some(Regex::new(r"\(").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from(")"), rule: Some(Regex::new(r"\)").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from("["), rule: Some(Regex::new(r"\[").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from("]"), rule: Some(Regex::new(r"\]").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from("{"), rule: Some(Regex::new(r"\{").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from("}"), rule: Some(Regex::new(r"\}").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from(","), rule: Some(Regex::new(r",").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from(":"), rule: Some(Regex::new(r":").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from(";"), rule: Some(Regex::new(r";").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from("."), rule: Some(Regex::new(r"\.").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from("@"), rule: Some(Regex::new(r"@").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from("~"), rule: Some(Regex::new(r"~").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from("&"), rule: Some(Regex::new(r"&").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from("|"), rule: Some(Regex::new(r"\|").unwrap()), category: TokenCategory::Delimiter },
-        TokenStruct { word: String::from("^"), rule: Some(Regex::new(r"\^").unwrap()), category: TokenCategory::Delimiter },
-
-        TokenStruct { 
-            word: String::from("id"), 
-            rule: Some(Regex::new(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b").unwrap()), 
-            category: TokenCategory::Identifier 
-        },
-    ]
+        TokenStruct::pattern(
+            "def",
+            Regex::new(r"\bdef\b").unwrap(),
+            TokenCategory::Keyword,
+        ),
+        TokenStruct::pattern(
+            "return",
+            Regex::new(r"\breturn\b").unwrap(),
+            TokenCategory::Keyword,
+        ),
+        TokenStruct::pattern(
+            "for",
+            Regex::new(r"\bfor\b").unwrap(),
+            TokenCategory::Keyword,
+        ),
+        TokenStruct::pattern("in", Regex::new(r"\bin\b").unwrap(), TokenCategory::Keyword),
+        TokenStruct::pattern("is", Regex::new(r"\bis\b").unwrap(), TokenCategory::Keyword),
+        TokenStruct::pattern(
+            "and",
+            Regex::new(r"\band\b").unwrap(),
+            TokenCategory::Keyword,
+        ),
+        TokenStruct::pattern("or", Regex::new(r"\bor\b").unwrap(), TokenCategory::Keyword),
+        TokenStruct::pattern(
+            "not",
+            Regex::new(r"\bnot\b").unwrap(),
+            TokenCategory::Keyword,
+        ),
+        TokenStruct::pattern(
+            "True",
+            Regex::new(r"\bTrue\b").unwrap(),
+            TokenCategory::Keyword,
+        ),
+        TokenStruct::pattern(
+            "False",
+            Regex::new(r"\bFalse\b").unwrap(),
+            TokenCategory::Keyword,
+        ),
+        TokenStruct::pattern(
+            "None",
+            Regex::new(r"\bNone\b").unwrap(),
+            TokenCategory::Keyword,
+        ),
+        TokenStruct::pattern(
+            "pass",
+            Regex::new(r"\bpass\b").unwrap(),
+            TokenCategory::Keyword,
+        ),
+        TokenStruct::pattern(
+            "break",
+            Regex::new(r"\bbreak\b").unwrap(),
+            TokenCategory::Keyword,
+        ),
+        TokenStruct::pattern(
+            "continue",
+            Regex::new(r"\bcontinue\b").unwrap(),
+            TokenCategory::Keyword,
+        ),
+        TokenStruct::pattern(
+            "float",
+            Regex::new(r"\b[0-9]+\.[0-9]+\b").unwrap(),
+            TokenCategory::Float,
+        ),
+        TokenStruct::pattern(
+            "int",
+            Regex::new(r"\b[0-9]+\b").unwrap(),
+            TokenCategory::Integer,
+        ),
+        TokenStruct::pattern("<=", Regex::new(r"<=").unwrap(), TokenCategory::Operator),
+        TokenStruct::pattern(">=", Regex::new(r">=").unwrap(), TokenCategory::Operator),
+        TokenStruct::pattern("==", Regex::new(r"==").unwrap(), TokenCategory::Operator),
+        TokenStruct::pattern("!=", Regex::new(r"!=").unwrap(), TokenCategory::Operator),
+        TokenStruct::pattern("+=", Regex::new(r"\+=").unwrap(), TokenCategory::Operator),
+        TokenStruct::pattern("-=", Regex::new(r"-=").unwrap(), TokenCategory::Operator),
+        TokenStruct::pattern("*=", Regex::new(r"\*=").unwrap(), TokenCategory::Operator),
+        TokenStruct::pattern("/=", Regex::new(r"/=").unwrap(), TokenCategory::Operator),
+        TokenStruct::pattern("->", Regex::new(r"->").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern("<<", Regex::new(r"<<").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern(">>", Regex::new(r">>").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern("<", Regex::new(r"<").unwrap(), TokenCategory::Operator),
+        TokenStruct::pattern(">", Regex::new(r">").unwrap(), TokenCategory::Operator),
+        TokenStruct::pattern("=", Regex::new(r"=").unwrap(), TokenCategory::Assign),
+        TokenStruct::pattern("(", Regex::new(r"\(").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern(")", Regex::new(r"\)").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern("[", Regex::new(r"\[").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern("]", Regex::new(r"\]").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern("{", Regex::new(r"\{").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern("}", Regex::new(r"\}").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern(",", Regex::new(r",").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern(":", Regex::new(r":").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern(";", Regex::new(r";").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern(".", Regex::new(r"\.").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern("@", Regex::new(r"@").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern("~", Regex::new(r"~").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern("&", Regex::new(r"&").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern("|", Regex::new(r"\|").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern("^", Regex::new(r"\^").unwrap(), TokenCategory::Delimiter),
+        TokenStruct::pattern(
+            "id",
+            Regex::new(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b").unwrap(),
+            TokenCategory::Identifier,
+        ),
+    ];
 }
 
 pub fn regex_match(input: String) -> Vec<TokenStruct> {
-    let unknown_token = TokenStruct {
-        word: String::from("unknown"),
-        rule: None,
-        category: TokenCategory::Unknown,
-    };
-
+    let unknown_token = TokenStruct::unknown();
     let regexes = regex_list();
     let mut token_references = vec![unknown_token; input.len()];
     let mut occupied_positions = vec![false; input.len()];
@@ -81,11 +126,11 @@ pub fn regex_match(input: String) -> Vec<TokenStruct> {
                     let matched_text = m.as_str().to_string();
 
                     for position in m.start()..m.end() {
-                        token_references[position] = TokenStruct {
-                            word: matched_text.clone(),
-                            rule: None,
-                            category: rule.category.clone(),
-                        };
+                        token_references[position] = TokenStruct::recognized(
+                            matched_text.clone(),
+                            rule.category.clone(),
+                            m.start(),
+                        );
                         occupied_positions[position] = true;
                     }
                 }

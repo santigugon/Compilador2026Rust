@@ -1,26 +1,26 @@
+use crate::enums::token_category::TokenCategory;
 use crate::enums::transition_tables::MachineStates;
 use crate::enums::transition_tables::States;
-use crate::enums::token_category::TokenCategory;
 use crate::models::lexical_issue::LexicalIssue;
 use crate::models::token_model::TokenStruct;
 
-fn state_match(c:char, current_state:States)->States{
-    match (c,current_state){
+fn state_match(c: char, current_state: States) -> States {
+    match (c, current_state) {
         // WHILE
-        ('w',States::Q0)=>States::Q1,
-        ('h',States::Q1)=>States::Q2,
-        ('i',States::Q2)=>States::Q3,
-        ('l',States::Q3)=>States::Q4,
-        ('e',States::Q4)=>States::Q5_WHILE,
+        ('w', States::Q0) => States::Q1,
+        ('h', States::Q1) => States::Q2,
+        ('i', States::Q2) => States::Q3,
+        ('l', States::Q3) => States::Q4,
+        ('e', States::Q4) => States::Q5_WHILE,
         // IF,ELSE ELIF
-        ('i',States::Q0)=>States::Q9,
-        ('f',States::Q9)=>States::Q10_IF,
-        ('e',States::Q0)=>States::Q11,
-        ('l',States::Q11)=>States::Q12,
-        ('s',States::Q12)=>States::Q13,
-        ('e',States::Q13)=>States::Q14_ELSE,
-        ('i',States::Q12)=>States::Q15,
-        ('f',States::Q15)=>States::Q16_ELIF,
+        ('i', States::Q0) => States::Q9,
+        ('f', States::Q9) => States::Q10_IF,
+        ('e', States::Q0) => States::Q11,
+        ('l', States::Q11) => States::Q12,
+        ('s', States::Q12) => States::Q13,
+        ('e', States::Q13) => States::Q14_ELSE,
+        ('i', States::Q12) => States::Q15,
+        ('f', States::Q15) => States::Q16_ELIF,
         // INT
         ('0'..='9', States::Q0) => States::Q7_INT,
         ('0'..='9', States::Q7_INT) => States::Q7_INT,
@@ -28,15 +28,15 @@ fn state_match(c:char, current_state:States)->States{
         // FLOAT
         ('.', States::Q7_INT) => States::Q8_FLOAT,
         ('0'..='9', States::Q8_FLOAT) => States::Q8_FLOAT,
-        
+
         // OPERATORS
-        ('-',States::Q0)=>States::Q17_MINUS,
-        ('+',States::Q0)=>States::Q18_PLUS,
-        ('*',States::Q0)=>States::Q21_PROD,
-        ('*',States::Q21_PROD)=>States::Q22_POW,
-        ('/',States::Q0)=>States::Q23_DIV,
-        ('/',States::Q23_DIV)=>States::Q24_FLOORDIV,
-        ('%',States::Q0)=>States::Q25_MOD,
+        ('-', States::Q0) => States::Q17_MINUS,
+        ('+', States::Q0) => States::Q18_PLUS,
+        ('*', States::Q0) => States::Q21_PROD,
+        ('*', States::Q21_PROD) => States::Q22_POW,
+        ('/', States::Q0) => States::Q23_DIV,
+        ('/', States::Q23_DIV) => States::Q24_FLOORDIV,
+        ('%', States::Q0) => States::Q25_MOD,
 
         // OPEN PAREN (delimiter)
         ('(', States::Q0) => States::Q6_OPEN_PAR,
@@ -50,10 +50,10 @@ fn state_match(c:char, current_state:States)->States{
         ('(', States::Q6_OPEN_PAR) => States::Q6_OPEN_PAR,
 
         // STRING
-        ('"',States::Q0)=>States::Q26,
-        ('\n',States::Q26)=>States::Q19_DEADSTATE,
-        ('"',States::Q26)=>States::Q27_STR,
-        (_,States::Q26)=>States::Q26,
+        ('"', States::Q0) => States::Q26,
+        ('\n', States::Q26) => States::Q19_DEADSTATE,
+        ('"', States::Q26) => States::Q27_STR,
+        (_, States::Q26) => States::Q26,
 
         // VAR
         (c, States::Q0) if c.is_alphabetic() || c == '_' => States::Q20_VAR,
@@ -75,45 +75,45 @@ fn state_match(c:char, current_state:States)->States{
         (c, States::Q16_ELIF) if c.is_alphanumeric() || c == '_' => States::Q20_VAR,
 
         // Any transition with white space or new line resets the state to 0
-        (' ', _)=>States::Q0,
-        ('\n', _)=>States::Q0,
+        (' ', _) => States::Q0,
+        ('\n', _) => States::Q0,
 
         // Any non explicit transition goes to death state
-        (_,_)=>States::Q19_DEADSTATE
+        (_, _) => States::Q19_DEADSTATE,
     }
 }
 
-fn transform_to_machine_state(state:States) ->MachineStates{
+fn transform_to_machine_state(state: States) -> MachineStates {
     match state {
-        States::Q1=>MachineStates::FINALSTATE,
-        States::Q2=>MachineStates::FINALSTATE,
-        States::Q3=>MachineStates::FINALSTATE,
-        States::Q4=>MachineStates::FINALSTATE,
-        States::Q5_WHILE=>MachineStates::FINALSTATE,
-        States::Q6_OPEN_PAR=>MachineStates::FINALSTATE,
-        States::Q7_INT=>MachineStates::FINALSTATE,
-        States::Q8_FLOAT=>MachineStates::FINALSTATE,
-        States::Q9=>MachineStates::FINALSTATE,
-        States::Q10_IF=>MachineStates::FINALSTATE,
-        States::Q11=>MachineStates::FINALSTATE,
-        States::Q12=>MachineStates::FINALSTATE,
-        States::Q13=>MachineStates::FINALSTATE,
-        States::Q14_ELSE=>MachineStates::FINALSTATE,
-        States::Q15=>MachineStates::FINALSTATE,
-        States::Q16_ELIF=>MachineStates::FINALSTATE,
-        States::Q17_MINUS=>MachineStates::FINALSTATE,
-        States::Q18_PLUS=>MachineStates::FINALSTATE,
-        States::Q20_VAR=>MachineStates::FINALSTATE,
-        States::Q21_PROD=>MachineStates::FINALSTATE,
-        States::Q22_POW=>MachineStates::FINALSTATE,
-        States::Q23_DIV=>MachineStates::FINALSTATE,
-        States::Q24_FLOORDIV=>MachineStates::FINALSTATE,
-        States::Q25_MOD=>MachineStates::FINALSTATE,
-        States::Q27_STR=>MachineStates::FINALSTATE,
+        States::Q1 => MachineStates::FINALSTATE,
+        States::Q2 => MachineStates::FINALSTATE,
+        States::Q3 => MachineStates::FINALSTATE,
+        States::Q4 => MachineStates::FINALSTATE,
+        States::Q5_WHILE => MachineStates::FINALSTATE,
+        States::Q6_OPEN_PAR => MachineStates::FINALSTATE,
+        States::Q7_INT => MachineStates::FINALSTATE,
+        States::Q8_FLOAT => MachineStates::FINALSTATE,
+        States::Q9 => MachineStates::FINALSTATE,
+        States::Q10_IF => MachineStates::FINALSTATE,
+        States::Q11 => MachineStates::FINALSTATE,
+        States::Q12 => MachineStates::FINALSTATE,
+        States::Q13 => MachineStates::FINALSTATE,
+        States::Q14_ELSE => MachineStates::FINALSTATE,
+        States::Q15 => MachineStates::FINALSTATE,
+        States::Q16_ELIF => MachineStates::FINALSTATE,
+        States::Q17_MINUS => MachineStates::FINALSTATE,
+        States::Q18_PLUS => MachineStates::FINALSTATE,
+        States::Q20_VAR => MachineStates::FINALSTATE,
+        States::Q21_PROD => MachineStates::FINALSTATE,
+        States::Q22_POW => MachineStates::FINALSTATE,
+        States::Q23_DIV => MachineStates::FINALSTATE,
+        States::Q24_FLOORDIV => MachineStates::FINALSTATE,
+        States::Q25_MOD => MachineStates::FINALSTATE,
+        States::Q27_STR => MachineStates::FINALSTATE,
 
-        States::Q19_DEADSTATE=>MachineStates::DEADSTATE,
+        States::Q19_DEADSTATE => MachineStates::DEADSTATE,
 
-        _=>MachineStates::NONFINAL
+        _ => MachineStates::NONFINAL,
     }
 }
 
@@ -146,29 +146,29 @@ fn lookahead_makes_final_state_valid(next_c: char, current_state: States) -> boo
     }
 }
 
-fn requires_lookeahead(current_state:States)->bool{
+fn requires_lookeahead(current_state: States) -> bool {
     match current_state {
-        States::Q5_WHILE=>true,
-        States::Q10_IF=>true,
-        States::Q14_ELSE=>true,
-        States::Q16_ELIF=>true,
+        States::Q5_WHILE => true,
+        States::Q10_IF => true,
+        States::Q14_ELSE => true,
+        States::Q16_ELIF => true,
 
-        States::Q21_PROD=>true,
-        States::Q23_DIV=>true,
-        _=>false
+        States::Q21_PROD => true,
+        States::Q23_DIV => true,
+        _ => false,
     }
 }
 
-fn is_operator(current_state:States)->bool{
+fn is_operator(current_state: States) -> bool {
     match current_state {
-        States::Q17_MINUS=>true,
-        States::Q18_PLUS=>true,
-        States::Q21_PROD=>true,
-        States::Q22_POW=>true,
-        States::Q23_DIV=>true,
-        States::Q24_FLOORDIV=>true,
-        States::Q25_MOD=>true,
-        _=>false
+        States::Q17_MINUS => true,
+        States::Q18_PLUS => true,
+        States::Q21_PROD => true,
+        States::Q22_POW => true,
+        States::Q23_DIV => true,
+        States::Q24_FLOORDIV => true,
+        States::Q25_MOD => true,
+        _ => false,
     }
 }
 
@@ -182,7 +182,12 @@ fn is_next_token_boundary(next_c: char, current_state: States) -> bool {
     }
 }
 
-fn dead_state_issue(before_state: States, lexeme: &str, offending: char, at: usize) -> LexicalIssue {
+fn dead_state_issue(
+    before_state: States,
+    lexeme: &str,
+    offending: char,
+    at: usize,
+) -> LexicalIssue {
     let display_lexeme = if lexeme.is_empty() {
         offending.to_string()
     } else {
@@ -203,7 +208,7 @@ fn dead_state_issue(before_state: States, lexeme: &str, offending: char, at: usi
             } else {
                 "invalid character inside string literal".to_string()
             }
-        },
+        }
         States::Q1 | States::Q2 | States::Q3 | States::Q4 => {
             "invalid character while scanning keyword 'while'".to_string()
         }
@@ -244,74 +249,54 @@ fn eof_tail_issue(state: States, lexeme: &str) -> Option<LexicalIssue> {
     if matches!(transform_to_machine_state(state), MachineStates::NONFINAL) && !lexeme.is_empty() {
         return Some(LexicalIssue {
             lexeme: lexeme.to_string(),
-            message: format!("unexpected end of input (incomplete token, state {})", state),
+            message: format!(
+                "unexpected end of input (incomplete token, state {})",
+                state
+            ),
             char_index: None,
         });
     }
     None
 }
 
-fn state_category_matching(state:States)->TokenCategory{
+fn state_category_matching(state: States) -> TokenCategory {
     match state {
-        States::Q1=>TokenCategory::Identifier,
-        States::Q2=>TokenCategory::Identifier,
-        States::Q3=>TokenCategory::Identifier,
-        States::Q4=>TokenCategory::Identifier,
-        States::Q5_WHILE=>TokenCategory::Keyword,
-        States::Q6_OPEN_PAR=>TokenCategory::Delimiter,
-        States::Q7_INT=>TokenCategory::Integer,
-        States::Q8_FLOAT=>TokenCategory::Float,
-        States::Q9=>TokenCategory::Identifier,
-        States::Q10_IF=>TokenCategory::Keyword,
-        States::Q11=>TokenCategory::Identifier,
-        States::Q12=>TokenCategory::Identifier,
-        States::Q13=>TokenCategory::Identifier,
-        States::Q14_ELSE=>TokenCategory::Keyword,
-        States::Q15=>TokenCategory::Identifier,
-        States::Q16_ELIF=>TokenCategory::Keyword,
-        States::Q17_MINUS=>TokenCategory::Operator,
-        States::Q18_PLUS=>TokenCategory::Operator,
-        States::Q20_VAR=>TokenCategory::Identifier,
-        States::Q21_PROD=>TokenCategory::Operator,
-        States::Q22_POW=>TokenCategory::Operator,
-        States::Q23_DIV=>TokenCategory::Operator,
-        States::Q24_FLOORDIV=>TokenCategory::Operator,
-        States::Q25_MOD=>TokenCategory::Operator,
-        States::Q27_STR=>TokenCategory::StringToken,
-        States::Q19_DEADSTATE=>TokenCategory::Unknown,
+        States::Q1 => TokenCategory::Identifier,
+        States::Q2 => TokenCategory::Identifier,
+        States::Q3 => TokenCategory::Identifier,
+        States::Q4 => TokenCategory::Identifier,
+        States::Q5_WHILE => TokenCategory::Keyword,
+        States::Q6_OPEN_PAR => TokenCategory::Delimiter,
+        States::Q7_INT => TokenCategory::Integer,
+        States::Q8_FLOAT => TokenCategory::Float,
+        States::Q9 => TokenCategory::Identifier,
+        States::Q10_IF => TokenCategory::Keyword,
+        States::Q11 => TokenCategory::Identifier,
+        States::Q12 => TokenCategory::Identifier,
+        States::Q13 => TokenCategory::Identifier,
+        States::Q14_ELSE => TokenCategory::Keyword,
+        States::Q15 => TokenCategory::Identifier,
+        States::Q16_ELIF => TokenCategory::Keyword,
+        States::Q17_MINUS => TokenCategory::Operator,
+        States::Q18_PLUS => TokenCategory::Operator,
+        States::Q20_VAR => TokenCategory::Identifier,
+        States::Q21_PROD => TokenCategory::Operator,
+        States::Q22_POW => TokenCategory::Operator,
+        States::Q23_DIV => TokenCategory::Operator,
+        States::Q24_FLOORDIV => TokenCategory::Operator,
+        States::Q25_MOD => TokenCategory::Operator,
+        States::Q27_STR => TokenCategory::StringToken,
+        States::Q19_DEADSTATE => TokenCategory::Unknown,
 
-        _=>TokenCategory::Unknown
+        _ => TokenCategory::Unknown,
     }
 }
 
-pub fn return_used_positions(tokens: &Vec<TokenStruct>)->Vec<bool>{
-    let mut result =vec![false; tokens.len()];
-    let last_ind =tokens.len()-1;
-    let mut fill_with_true_till=last_ind;
-
-    for i in 0..=last_ind{
-        let iterator= last_ind-i;
-        let token = &tokens[iterator];
-
-        if fill_with_true_till <= iterator {
-            result[iterator]=true;
-            continue;
-        }
-
-        match token.category {
-            TokenCategory::Unknown=>{
-                continue;
-            }
-            _=>{
-                let word_len = token.word.len();
-
-                fill_with_true_till = iterator.saturating_sub(word_len - 1);
-                result[iterator]=true;
-            }
-        }
-    }
-    return result;
-
+pub fn return_used_positions(tokens: &Vec<TokenStruct>) -> Vec<bool> {
+    tokens
+        .iter()
+        .map(|token| !matches!(token.category, TokenCategory::Unknown))
+        .collect()
 }
 
 fn consume_transition_step(
@@ -341,14 +326,11 @@ fn consume_transition_step(
 
     match machine_state_enum {
         MachineStates::FINALSTATE if token_finalization => {
-            let new_token = TokenStruct {
-                word: token_word.clone(),
-                rule: None,
-                category: current_category.clone(),
-            };
             let end = past_char_index;
             let span = token_word.len().max(1);
             let start = end.saturating_sub(span.saturating_sub(1));
+            let new_token =
+                TokenStruct::recognized(token_word.clone(), current_category.clone(), start);
             for idx in start..=end {
                 if idx < token_references.len() {
                     token_references[idx] = new_token.clone();
@@ -375,11 +357,7 @@ pub fn match_transitions(input: &String) -> (Vec<TokenStruct>, Vec<LexicalIssue>
     let mut issues = Vec::new();
     let mut current_state = States::Q0;
 
-    let unknown_token = TokenStruct {
-        word: String::from("unknown"),
-        rule: None,
-        category: TokenCategory::Unknown,
-    };
+    let unknown_token = TokenStruct::unknown();
 
     let mut token_references = vec![unknown_token; input.len()];
     let mut first_iteration = true;
@@ -428,4 +406,19 @@ pub fn match_transitions(input: &String) -> (Vec<TokenStruct>, Vec<LexicalIssue>
     }
 
     (token_references, issues)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::return_used_positions;
+    use crate::enums::token_category::TokenCategory;
+    use crate::models::token_model::TokenStruct;
+
+    #[test]
+    fn marks_every_character_of_a_recognized_token_as_used() {
+        let token = TokenStruct::recognized("123".to_string(), TokenCategory::Integer, 0);
+        let tokens = vec![token.clone(), token.clone(), token];
+
+        assert_eq!(return_used_positions(&tokens), vec![true, true, true]);
+    }
 }

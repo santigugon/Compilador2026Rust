@@ -2,10 +2,9 @@ use crate::enums::token_category::TokenCategory;
 use crate::models::lexical_issue::LexicalIssue;
 use crate::models::token_model::TokenStruct;
 
-
 const RESERVED_AS_KEYWORD: &[&str] = &[
-    "and", "break", "continue", "def", "elif", "else", "False", "for", "if", "in", "is",
-    "None", "not", "or", "pass", "return", "True", "while",
+    "and", "break", "continue", "def", "elif", "else", "False", "for", "if", "in", "is", "None",
+    "not", "or", "pass", "return", "True", "while",
 ];
 
 fn is_reserved_identifier_lexeme(word: &str) -> bool {
@@ -14,7 +13,8 @@ fn is_reserved_identifier_lexeme(word: &str) -> bool {
 
 fn reclassify_reserved_identifiers(mut tokens: Vec<TokenStruct>) -> Vec<TokenStruct> {
     for t in &mut tokens {
-        if matches!(&t.category, TokenCategory::Identifier) && is_reserved_identifier_lexeme(&t.word)
+        if matches!(&t.category, TokenCategory::Identifier)
+            && is_reserved_identifier_lexeme(&t.word)
         {
             t.category = TokenCategory::Keyword;
         }
@@ -34,7 +34,10 @@ pub fn filter_unknowns(final_list: &Vec<TokenStruct>) -> Vec<TokenStruct> {
                 if let Some(last) = result.last() {
                     if last.word == token.word
                         && last.category == token.category
-                        && !matches!(token.category, TokenCategory::Delimiter | TokenCategory::Operator)
+                        && !matches!(
+                            token.category,
+                            TokenCategory::Delimiter | TokenCategory::Operator
+                        )
                     {
                         continue;
                     }
@@ -101,18 +104,15 @@ pub fn automata_regex_match(
     regex_list: &Vec<TokenStruct>,
     input: &str,
 ) -> (Vec<TokenStruct>, Vec<LexicalIssue>, Vec<TokenStruct>) {
-    let unknown_token = TokenStruct {
-        word: String::from("unknown"),
-        rule: None,
-        category: TokenCategory::Unknown,
-    };
+    let unknown_token = TokenStruct::unknown();
 
     let mut result = vec![unknown_token.clone(); automata_list.len()];
     let mut iterator = 0;
 
     for position in positions_list {
-        let regex_has_longer_token = !matches!(regex_list[iterator].category, TokenCategory::Unknown)
-            && regex_list[iterator].word.len() > automata_list[iterator].word.len();
+        let regex_has_longer_token =
+            !matches!(regex_list[iterator].category, TokenCategory::Unknown)
+                && regex_list[iterator].word.len() > automata_list[iterator].word.len();
 
         if *position && !regex_has_longer_token {
             let au = &automata_list[iterator];

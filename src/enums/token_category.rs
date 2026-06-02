@@ -12,5 +12,5 @@ pub enum TokenCategory {
     Indentation,
     WhiteSpace,
     StringToken,
-    Unknown
+    Unknown,
 }

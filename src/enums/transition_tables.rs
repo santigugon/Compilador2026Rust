@@ -34,8 +34,8 @@ pub enum States {
 }
 
 #[derive(Display)]
-pub enum MachineStates{
+pub enum MachineStates {
     NONFINAL,
     FINALSTATE,
-    DEADSTATE
+    DEADSTATE,
 }

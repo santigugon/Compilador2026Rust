@@ -1,22 +1,23 @@
+mod ast;
+mod enums;
+mod lexical_diagnostics;
+mod models;
+mod parser;
 mod read_file;
 mod regex;
-mod enums;
-mod models;
-mod transition_matching;
-mod smash;
 mod semantic_analysis;
-mod lexical_diagnostics;
-mod parser;
-mod ast;
+mod smash;
+mod transition_matching;
 
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use regex::utils;
-use transition_matching::automata;
-use smash::merge_lists;
 use models::token_model::TokenStruct;
 use parser::Parser;
+use regex::utils;
+use smash::merge_lists;
+use transition_matching::automata;
 
 const LEXEME_COLUMN_WIDTH: usize = 32;
 
@@ -25,6 +26,10 @@ struct TestCase {
     expected_valid: bool,
 }
 
+struct RunSummary {
+    actual_valid: bool,
+    matches_expectation: Option<bool>,
+}
 
 fn print_tokens(tokens: &[TokenStruct]) {
     println!();
@@ -53,11 +58,15 @@ fn status_label(is_valid: bool) -> &'static str {
     if is_valid { "VALIDO" } else { "INVALIDO" }
 }
 
+fn format_char_position(position: Option<usize>) -> String {
+    match position {
+        Some(index) => format!(" [char {}]", index),
+        None => String::new(),
+    }
+}
+
 fn read_case_input(path: &Path) -> String {
-    let mut contents = fs::read_to_string(path)
-        .unwrap_or_else(|_| panic!("Should have been able to read {}", path.display()));
-    contents.push(' ');
-    contents
+    read_file::read_input(path)
 }
 
 fn collect_test_cases() -> Vec<TestCase> {
@@ -74,7 +83,10 @@ fn collect_test_cases() -> Vec<TestCase> {
             .filter_map(|entry| {
                 let path = entry.ok()?.path();
                 if path.is_file() {
-                    Some(TestCase { path, expected_valid })
+                    Some(TestCase {
+                        path,
+                        expected_valid,
+                    })
                 } else {
                     None
                 }
@@ -88,7 +100,7 @@ fn collect_test_cases() -> Vec<TestCase> {
     cases
 }
 
-fn run_case(case_name: &str, expected_valid: bool, input: String) -> bool {
+fn run_case(case_name: &str, expected_valid: Option<bool>, input: String) -> RunSummary {
     let (automata_tokens, automata_issues) = automata::match_transitions(&input);
     let used_positions = automata::return_used_positions(&automata_tokens);
     let regex_list = utils::regex_match(input.clone());
@@ -106,7 +118,9 @@ fn run_case(case_name: &str, expected_valid: bool, input: String) -> bool {
     println!();
     println!("{}", "=".repeat(80));
     println!("Caso: {case_name}");
-    println!("Esperado: {}", status_label(expected_valid));
+    if let Some(expected_valid) = expected_valid {
+        println!("Esperado: {}", status_label(expected_valid));
+    }
 
     let semantic_ok = match semantic_analysis::validate_operator_operands(&smashed_list) {
         Ok(()) => {
@@ -125,7 +139,12 @@ fn run_case(case_name: &str, expected_valid: bool, input: String) -> bool {
     if !lexical_issues.is_empty() {
         eprintln!("Lexical analysis: failed.");
         for issue in &lexical_issues {
-            eprintln!("  '{}' — {}", issue.lexeme, issue.message);
+            eprintln!(
+                "  '{}'{} — {}",
+                issue.lexeme,
+                format_char_position(issue.char_index),
+                issue.message
+            );
         }
     } else {
         print_tokens(&smashed_list);
@@ -146,22 +165,68 @@ fn run_case(case_name: &str, expected_valid: bool, input: String) -> bool {
     };
 
     let actual_valid = semantic_ok && lexical_issues.is_empty() && parse_ok;
-    let matches_expectation = actual_valid == expected_valid;
     println!("Resultado final: {}", status_label(actual_valid));
-    println!(
-        "Coincide con lo esperado: {}",
-        if matches_expectation { "SI" } else { "NO" }
-    );
+    let matches_expectation = expected_valid.map(|expected| actual_valid == expected);
+    if let Some(matches_expectation) = matches_expectation {
+        println!(
+            "Coincide con lo esperado: {}",
+            if matches_expectation { "SI" } else { "NO" }
+        );
+    }
 
-    matches_expectation
+    RunSummary {
+        actual_valid,
+        matches_expectation,
+    }
 }
 
 fn main() {
-    let test_cases = collect_test_cases();
+    let args: Vec<String> = env::args().skip(1).collect();
 
+    if let Some(first_arg) = args.first() {
+        if first_arg == "--run-tests" {
+            let test_cases = collect_test_cases();
+            if test_cases.is_empty() {
+                eprintln!("No se encontraron casos en test_inputs/.");
+                return;
+            }
+
+            let mut matching_cases = 0;
+            let total_cases = test_cases.len();
+
+            for case in test_cases {
+                let case_name = case.path.display().to_string();
+                let input = read_case_input(&case.path);
+                let summary = run_case(&case_name, Some(case.expected_valid), input);
+                if summary.matches_expectation == Some(true) {
+                    matching_cases += 1;
+                }
+            }
+
+            println!();
+            println!("{}", "=".repeat(80));
+            println!(
+                "Resumen: {matching_cases}/{total_cases} casos coincidieron con el resultado esperado."
+            );
+            return;
+        }
+
+        let path = Path::new(first_arg);
+        let input = read_case_input(path);
+        let summary = run_case(&path.display().to_string(), None, input);
+        std::process::exit(if summary.actual_valid { 0 } else { 1 });
+    }
+
+    let default_input = Path::new("input.txt");
+    if default_input.exists() {
+        let input = read_case_input(default_input);
+        let summary = run_case("input.txt", None, input);
+        std::process::exit(if summary.actual_valid { 0 } else { 1 });
+    }
+
+    let test_cases = collect_test_cases();
     if test_cases.is_empty() {
-        let input: String = read_file::read_input();
-        let _ = run_case("input.txt", true, input);
+        eprintln!("Uso: mini_triton_parser <archivo.mt> o mini_triton_parser --run-tests");
         return;
     }
 
@@ -171,7 +236,8 @@ fn main() {
     for case in test_cases {
         let case_name = case.path.display().to_string();
         let input = read_case_input(&case.path);
-        if run_case(&case_name, case.expected_valid, input) {
+        let summary = run_case(&case_name, Some(case.expected_valid), input);
+        if summary.matches_expectation == Some(true) {
             matching_cases += 1;
         }
     }

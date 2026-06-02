@@ -78,7 +78,12 @@ impl AstNode {
                 format!("{}ExprStmt({})", pad, expr.pretty(0))
             }
             AstNode::BinaryOp { op, left, right } => {
-                format!("BinaryOp(\"{}\", {}, {})", op, left.pretty(0), right.pretty(0))
+                format!(
+                    "BinaryOp(\"{}\", {}, {})",
+                    op,
+                    left.pretty(0),
+                    right.pretty(0)
+                )
             }
             AstNode::Call { callee, args } => {
                 let args_str = args

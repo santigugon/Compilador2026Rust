@@ -1,4 +1,3 @@
-
 use crate::enums::token_category::TokenCategory;
 use crate::models::lexical_issue::LexicalIssue;
 use crate::models::token_model::TokenStruct;

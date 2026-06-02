@@ -3,6 +3,10 @@ name = "lexical-analyzer"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "mini_triton_parser"
+path = "src/main.rs"
+
 [dependencies]
 regex = "1.12.3"
 strum = "0.28.0"

@@ -1,9 +1,10 @@
 use std::fs;
+use std::path::Path;
 
-pub fn read_input()->String{
-    let file_path="input.txt";
-    let mut contents = fs::read_to_string(file_path).expect("Should have been able to read file");
+pub fn read_input(path: &Path) -> String {
+    let mut contents = fs::read_to_string(path)
+        .unwrap_or_else(|_| panic!("Should have been able to read file {}", path.display()));
     contents.push(' ');
 
-    return contents;
+    contents
 }

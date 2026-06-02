@@ -1,15 +1,19 @@
+use crate::ast::AstNode;
 use crate::enums::token_category::TokenCategory;
 use crate::models::token_model::TokenStruct;
-use crate::ast::AstNode;
 
 #[derive(Debug)]
 pub struct ParseError {
     pub message: String,
+    pub position: Option<usize>,
 }
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "[ParseError] {}", self.message)
+        match self.position {
+            Some(position) => write!(f, "[ParseError at char {}] {}", position, self.message),
+            None => write!(f, "[ParseError] {}", self.message),
+        }
     }
 }
 
@@ -20,6 +24,16 @@ pub struct Parser {
 
 impl Parser {
     pub fn new(tokens: Vec<TokenStruct>) -> Self {
+        let tokens = if tokens.is_empty() {
+            vec![TokenStruct::recognized(
+                "<EOF>".to_string(),
+                TokenCategory::Unknown,
+                0,
+            )]
+        } else {
+            tokens
+        };
+
         Parser { tokens, pos: 0 }
     }
 
@@ -55,6 +69,7 @@ impl Parser {
                     "Se esperaba '{}' pero llegó '{}' ({})",
                     expected_word, tok.word, tok.category
                 ),
+                position: tok.position,
             })
         }
     }
@@ -71,6 +86,7 @@ impl Parser {
                     "Se esperaba '{}' pero llegó '{}' ({})",
                     expected, tok.category, tok.word
                 ),
+                position: tok.position,
             })
         }
     }
@@ -87,6 +103,7 @@ impl Parser {
                     "Se encontraron tokens extra después del único kernel permitido: '{}' ({})",
                     tok.word, tok.category
                 ),
+                position: tok.position,
             });
         }
         Ok(AstNode::Program {
@@ -139,12 +156,12 @@ impl Parser {
         let name = self.expect_category(&TokenCategory::Identifier)?;
         if self.peek().word == ":" {
             self.advance();
-            let ns = self.expect_category(&TokenCategory::Identifier)?;  // tl
+            self.expect_word("tl")?;
             self.expect_word(".")?;
-            let ann = self.expect_category(&TokenCategory::Identifier)?; // constexpr
+            self.expect_word("constexpr")?;
             return Ok(AstNode::Param {
                 name,
-                annotation: Some(format!("{}.{}", ns, ann)),
+                annotation: Some("tl.constexpr".to_string()),
             });
         }
         Ok(AstNode::Param {
@@ -241,9 +258,7 @@ impl Parser {
             let node = self.parse_expr()?;
             self.expect_word(")")?;
             Ok(node)
-        } else if tok.category == TokenCategory::Integer
-            || tok.category == TokenCategory::Float
-        {
+        } else if tok.category == TokenCategory::Integer || tok.category == TokenCategory::Float {
             let value = self.advance().word.clone();
             Ok(AstNode::Number { value })
         } else if tok.category == TokenCategory::Identifier {
@@ -254,6 +269,7 @@ impl Parser {
                     "Se esperaba una expresión pero llegó '{}' ({})",
                     tok.word, tok.category
                 ),
+                position: tok.position,
             })
         }
     }
@@ -295,6 +311,7 @@ impl Parser {
                     "Argumentos nombrados no están soportados en Mini-Triton (cerca de '{}=')",
                     self.peek().word
                 ),
+                position: self.peek().position,
             });
         }
         let mut args = vec![self.parse_expr()?];
@@ -303,5 +320,52 @@ impl Parser {
             args.push(self.parse_expr()?);
         }
         Ok(args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Parser;
+    use crate::enums::token_category::TokenCategory;
+    use crate::models::token_model::TokenStruct;
+
+    fn token(word: &str, category: TokenCategory, position: usize) -> TokenStruct {
+        TokenStruct::recognized(word.to_string(), category, position)
+    }
+
+    #[test]
+    fn rejects_non_constexpr_annotation() {
+        let tokens = vec![
+            token("@", TokenCategory::Delimiter, 0),
+            token("triton", TokenCategory::Identifier, 1),
+            token(".", TokenCategory::Delimiter, 7),
+            token("jit", TokenCategory::Identifier, 8),
+            token("def", TokenCategory::Keyword, 12),
+            token("typed", TokenCategory::Identifier, 16),
+            token("(", TokenCategory::Delimiter, 21),
+            token("x", TokenCategory::Identifier, 22),
+            token(":", TokenCategory::Delimiter, 23),
+            token("foo", TokenCategory::Identifier, 25),
+            token(".", TokenCategory::Delimiter, 28),
+            token("bar", TokenCategory::Identifier, 29),
+            token(")", TokenCategory::Delimiter, 32),
+            token(":", TokenCategory::Delimiter, 33),
+            token("{", TokenCategory::Delimiter, 35),
+            token("y", TokenCategory::Identifier, 39),
+            token("=", TokenCategory::Assign, 41),
+            token("x", TokenCategory::Identifier, 43),
+            token(";", TokenCategory::Delimiter, 44),
+            token("}", TokenCategory::Delimiter, 46),
+        ];
+
+        let error = Parser::new(tokens).parse_program().unwrap_err();
+        assert!(error.message.contains("tl"));
+        assert_eq!(error.position, Some(25));
+    }
+
+    #[test]
+    fn empty_input_returns_parse_error_instead_of_panicking() {
+        let error = Parser::new(vec![]).parse_program().unwrap_err();
+        assert!(error.message.contains("@"));
     }
 }
