@@ -34,7 +34,7 @@ fn regex_list() -> Vec<TokenStruct> {
         TokenStruct { word: String::from(">>"), rule: Some(Regex::new(r">>").unwrap()), category: TokenCategory::Delimiter },
         TokenStruct { word: String::from("<"), rule: Some(Regex::new(r"<").unwrap()), category: TokenCategory::Operator },
         TokenStruct { word: String::from(">"), rule: Some(Regex::new(r">").unwrap()), category: TokenCategory::Operator },
-        TokenStruct { word: String::from("="), rule: Some(Regex::new(r"=").unwrap()), category: TokenCategory::Operator },
+        TokenStruct { word: String::from("="), rule: Some(Regex::new(r"=").unwrap()), category: TokenCategory::Assign },
 
         TokenStruct { word: String::from("("), rule: Some(Regex::new(r"\(").unwrap()), category: TokenCategory::Delimiter },
         TokenStruct { word: String::from(")"), rule: Some(Regex::new(r"\)").unwrap()), category: TokenCategory::Delimiter },
@@ -44,6 +44,7 @@ fn regex_list() -> Vec<TokenStruct> {
         TokenStruct { word: String::from("}"), rule: Some(Regex::new(r"\}").unwrap()), category: TokenCategory::Delimiter },
         TokenStruct { word: String::from(","), rule: Some(Regex::new(r",").unwrap()), category: TokenCategory::Delimiter },
         TokenStruct { word: String::from(":"), rule: Some(Regex::new(r":").unwrap()), category: TokenCategory::Delimiter },
+        TokenStruct { word: String::from(";"), rule: Some(Regex::new(r";").unwrap()), category: TokenCategory::Delimiter },
         TokenStruct { word: String::from("."), rule: Some(Regex::new(r"\.").unwrap()), category: TokenCategory::Delimiter },
         TokenStruct { word: String::from("@"), rule: Some(Regex::new(r"@").unwrap()), category: TokenCategory::Delimiter },
         TokenStruct { word: String::from("~"), rule: Some(Regex::new(r"~").unwrap()), category: TokenCategory::Delimiter },
@@ -51,39 +52,42 @@ fn regex_list() -> Vec<TokenStruct> {
         TokenStruct { word: String::from("|"), rule: Some(Regex::new(r"\|").unwrap()), category: TokenCategory::Delimiter },
         TokenStruct { word: String::from("^"), rule: Some(Regex::new(r"\^").unwrap()), category: TokenCategory::Delimiter },
 
-        TokenStruct { word: String::from("\\n"), rule: Some(Regex::new(r"\b \b").unwrap()), category: TokenCategory::WhiteSpace },
-        TokenStruct { word: String::from("\\n"), rule: Some(Regex::new(r"\n").unwrap()), category: TokenCategory::Indentation },
-        TokenStruct { word: String::from("indent"), rule: Some(Regex::new(r"^[ \t]+").unwrap()), category: TokenCategory::Indentation },
-        TokenStruct { word: String::from("dedent"), rule: Some(Regex::new(r"$^").unwrap()), category: TokenCategory::Indentation },
-
-
+        TokenStruct { 
+            word: String::from("id"), 
+            rule: Some(Regex::new(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b").unwrap()), 
+            category: TokenCategory::Identifier 
+        },
     ]
 }
 
-pub fn regex_match(input:String)->Vec<TokenStruct>{
-
-    let unknown_token= TokenStruct{
-        word:String::from("unknown"),
-        rule:None,
-        category: TokenCategory::Unknown
+pub fn regex_match(input: String) -> Vec<TokenStruct> {
+    let unknown_token = TokenStruct {
+        word: String::from("unknown"),
+        rule: None,
+        category: TokenCategory::Unknown,
     };
 
-    let regexes= regex_list();
-    let mut token_references= vec![unknown_token;input.len()];
+    let regexes = regex_list();
+    let mut token_references = vec![unknown_token; input.len()];
     let mut occupied_positions = vec![false; input.len()];
+
     for rule in regexes {
         match rule.rule {
             Some(ref regex) => {
                 for m in regex.find_iter(&input) {
-                    if occupied_positions[m.start()..m.end()].iter().any(|occupied| *occupied) {
+                    if occupied_positions[m.start()..m.end()].iter().any(|o| *o) {
                         continue;
                     }
+                    let matched_text = m.as_str().to_string();
 
                     for position in m.start()..m.end() {
-                        token_references[position] = rule.clone();
+                        token_references[position] = TokenStruct {
+                            word: matched_text.clone(),
+                            rule: None,
+                            category: rule.category.clone(),
+                        };
                         occupied_positions[position] = true;
                     }
-                    // println!("count {}", counter);
                 }
             }
             None => {
@@ -92,6 +96,5 @@ pub fn regex_match(input:String)->Vec<TokenStruct>{
         }
     }
 
-    return token_references;
-
+    token_references
 }

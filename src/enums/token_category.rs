@@ -7,6 +7,7 @@ pub enum TokenCategory {
     Integer,
     Float,
     Operator,
+    Assign,
     Delimiter,
     Indentation,
     WhiteSpace,

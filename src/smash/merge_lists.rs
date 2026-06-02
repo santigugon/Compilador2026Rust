@@ -32,7 +32,10 @@ pub fn filter_unknowns(final_list: &Vec<TokenStruct>) -> Vec<TokenStruct> {
             }
             _ => {
                 if let Some(last) = result.last() {
-                    if last.word == token.word && last.category == token.category {
+                    if last.word == token.word
+                        && last.category == token.category
+                        && !matches!(token.category, TokenCategory::Delimiter | TokenCategory::Operator)
+                    {
                         continue;
                     }
                 }
