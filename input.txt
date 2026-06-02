@@ -1,9 +1,6 @@
-def bad_lex(x):
-    a = 1 + 2
-    b = x * 3
-    c = "invalido
-    d = 4
-    e = money$here
-    f = 3otrosimbolo
-    g = $invalido
-    return a
+@triton.jit
+def k(x, out, BS: tl.constexpr): {
+  pid = tl.program_id(0);
+  offs = pid * BS + tl.arange(0, BS);
+  tl.store(out + offs, tl.load(x + offs));
+}

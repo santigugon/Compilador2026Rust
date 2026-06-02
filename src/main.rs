@@ -6,11 +6,14 @@ mod transition_matching;
 mod smash;
 mod semantic_analysis;
 mod lexical_diagnostics;
+mod parser;
+mod ast;
 
 use regex::utils;
 use transition_matching::automata;
 use smash::merge_lists;
 use models::token_model::TokenStruct;
+use parser::Parser;
 
 const LEXEME_COLUMN_WIDTH: usize = 32;
 
@@ -45,6 +48,7 @@ fn main() {
     let (automata_tokens, automata_issues) = automata::match_transitions(&input);
     let used_positions = automata::return_used_positions(&automata_tokens);
     let regex_list = utils::regex_match(input.clone());
+    
 
     let (smashed_list, merge_issues, raw_merged) =
         merge_lists::automata_regex_match(&automata_tokens, &used_positions, &regex_list, &input);
@@ -73,6 +77,18 @@ fn main() {
         }
     } else {
         print_tokens(&smashed_list);
+    }
+
+    let mut p = Parser::new(smashed_list.clone());
+    match p.parse_program() {
+        Ok(ast) => {
+            println!("VALIDO");
+            println!("{}", ast.pretty(0));
+        }
+        Err(e) => {
+            println!("INVALIDO");
+            eprintln!("{}", e);
+        }
     }
 
     //  for i in 0..(used_position.len()-1){
