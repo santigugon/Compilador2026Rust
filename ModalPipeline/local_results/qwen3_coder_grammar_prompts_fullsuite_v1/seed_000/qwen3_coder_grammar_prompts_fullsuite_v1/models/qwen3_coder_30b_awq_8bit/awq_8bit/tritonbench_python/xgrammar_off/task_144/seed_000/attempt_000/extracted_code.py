@@ -1,0 +1,83 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _matrix_multiply_and_row_dot_kernel(
+    A_ptr, B_ptr, C_ptr,
+    n, m, p,
+    alpha, beta,
+    stride_a_row, stride_a_col,
+    stride_b_row, stride_b_col,
+    stride_c_row, stride_c_col,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    
+    A = tl.load(A_ptr + offs_m[:, None] * stride_a_row + offs_k[None, :] * stride_a_col)
+    B = tl.load(B_ptr + offs_k[:, None] * stride_b_row + offs_n[None, :] * stride_b_col)
+    
+    out = tl.dot(A, B)
+    out = alpha * out
+    
+    C = tl.load(C_ptr + offs_m[:, None] * stride_c_row + offs_n[None, :] * stride_c_col)
+    out = out + beta * C
+    
+    tl.store(C_ptr + offs_m[:, None] * stride_c_row + offs_n[None, :] * stride_c_col, out)
+    
+    # Compute dot product of first two rows
+    if pid_m == 0 and pid_n == 0:
+        row0 = tl.load(C_ptr + 0 * stride_c_row + offs_n[None, :] * stride_c_col)
+        row1 = tl.load(C_ptr + 1 * stride_c_row + offs_n[None, :] * stride_c_col)
+        dot_product = tl.sum(row0 * row1)
+        tl.store(C_ptr + 0 * stride_c_row + 0 * stride_c_col, dot_product)
+
+def matrix_multiply_and_row_dot(A: torch.Tensor, B: torch.Tensor, alpha: float, beta: float, C: torch.Tensor) -> torch.Tensor:
+    assert A.shape[1] == B.shape[0], "Matrix dimensions incompatible for multiplication"
+    assert A.shape[0] >= 2, "Matrix A must have at least 2 rows for dot product computation"
+    
+    n, m = A.shape
+    m_, p = B.shape
+    assert m == m_, "Matrix dimensions incompatible for multiplication"
+    assert C.shape == (n, p), "Matrix C must have shape (n, p)"
+    
+    # Ensure tensors are on CUDA
+    if not A.is_cuda:
+        A = A.cuda()
+    if not B.is_cuda:
+        B = B.cuda()
+    if not C.is_cuda:
+        C = C.cuda()
+    
+    # Create a copy of C to avoid modifying the original
+    C = C.clone()
+    
+    # Define block sizes
+    BLOCK_SIZE_M = 16
+    BLOCK_SIZE_N = 16
+    BLOCK_SIZE_K = 16
+    
+    # Launch kernel
+    grid = (
+        triton.cdiv(n, BLOCK_SIZE_M),
+        triton.cdiv(p, BLOCK_SIZE_N)
+    )
+    
+    _matrix_multiply_and_row_dot_kernel[grid](
+        A, B, C,
+        n, m, p,
+        alpha, beta,
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1),
+        C.stride(0), C.stride(1),
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
+    )
+    
+    return C

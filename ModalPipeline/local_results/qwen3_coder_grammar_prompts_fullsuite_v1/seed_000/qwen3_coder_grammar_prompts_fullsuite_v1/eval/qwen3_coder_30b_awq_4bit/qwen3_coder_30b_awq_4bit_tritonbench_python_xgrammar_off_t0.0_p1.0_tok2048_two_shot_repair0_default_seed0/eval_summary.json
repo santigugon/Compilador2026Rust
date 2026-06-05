@@ -1,0 +1,357 @@
+{
+  "total_predictions": 166,
+  "phase1_call_acc": {
+    "passed": 84,
+    "rate": 50.6,
+    "duration_ms": 518473.5154110001
+  },
+  "phase2_exec_acc": {
+    "passed": 84,
+    "rate": 50.6
+  },
+  "phase3_efficiency": {
+    "speedup_vs_pytorch": 1.32,
+    "raw_output_tail": "\nifftshift.json: 0.5974\ninvert_matrix_lu.json: 2.8515\nldl_factor.json failed\nleaky_relu.json: 0.96\nlog.json: 0.9526\nlog1p.json: 0.9561\nlog_tanh.json: 2.9665\nlogit.json: 0.8372\nlogsumexp.json: 0.9637\nlow_rank_svd_approximation.json failed\nlu.py.json: 0.9402\nmatrix_multiply_and_row_dot.json: 0.9439\nmatrix_multiply_symmetric.json: 0.597\nmul_relu.json: 1.5627\nnormalize_pairwise_distance.json failed\nnormalized_cosine_similarity.json: 0.4324\nones_like.json: 1.6\npermute_copy.json failed\npixel_shuffle_conv2d.json: 1.0974\npolygamma.json: 0.6824\npseudoinverse_svd.json: 0.9708\nrad2deg_sqrt.json: 1.1879\nrand.json: 0.944\nreciprocal.json: 0.9543\nrelu.json: 0.9578\nrelu_batch_norm_conv2d.json: 0.8939\nrelu_conv2d.json: 0.9289\nrelu_sqrt.json: 1.8465\nrsqrt.json: 3.9485\nscaled_add_norm.json: 1.101\nselu.json: 7.9187\nsigmoid.json: 0.9528\nsigmoid_argmax.json: 0.9518\nsoftmax_log.json: 0.9501\nsoftmax_mul.json: 2.0859\nsoftplus_linear.json failed\nsolve_multiple_lu.json: 0.9639\nspectral_norm_eig.json failed\nsqrt.json: 0.9571\nsqrt_exp.json: 1.8418\nsqrt_tanh.json: 3.4612\nstd.json: 0.6617\nsum.json: 0.9891\nsum_std.json: 1.3905\nsymmetric_mm_and_abs_sum.json: 1.1095\ntanh.json: 0.9514\ntensordot.json: 0.8672\ntensordot_rsqrt.json: 1.005\ntrunc.json: 0.955\n[0.9585, 0.9557, 0.9923, 0.1059, 3.599, 0.9547, 0.1948, 0.9103, 0.9986, 1.5023, 2.3516, 0.9567, 0.9539, 0.9565, 1.8376, 0.9611, 0.886, 0.6827, 2.7462, 0.7557, 0.9509, 0.1305, 1.1436, 1.0961, 0.932, 3.5526, 0.7337, 0.9851, 0.9683, 0.9972, 0.5974, 2.8515, 0.96, 0.9526, 0.9561, 2.9665, 0.8372, 0.9637, 0.9402, 0.9439, 0.597, 1.5627, 0.4324, 1.6, 1.0974, 0.6824, 0.9708, 1.1879, 0.944, 0.9543, 0.9578, 0.8939, 0.9289, 1.8465, 3.9485, 1.101, 7.9187, 0.9528, 0.9518, 0.9501, 2.0859, 0.9639, 0.9571, 1.8418, 3.4612, 0.6617, 0.9891, 1.3905, 1.1095, 0.9514, 0.8672, 1.005, 0.955]\n\nperf_results\nspeed up: 1.32\n================================================================================================================================================================\n",
+    "duration_ms": 220.2449730002627
+  },
+  "per_op": {
+    "abs.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "add.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "add_gelu.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "addmm.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "argmax.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "autocast.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "bessel_j1.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "bitwise_and.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "broadcast_tensors.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "chebyshev_polynomial_t.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "cos.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "cos_signbit.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "determinant_via_qr.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "digamma.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "div.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "erf.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "exp.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "exp_sqrt.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fftn.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_bmm_rmsnorm_gelu_dropout_sub.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_cosine_embedding_loss_with_normalization.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_cross_entropy_log_softmax.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_cross_entropy_softmax_layernorm.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_fractional_max_pool2d_with_relu.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_gather_masked_fill.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_hstack_div.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_index_select_eq.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_lu_solve.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_pairwise_distance_adaptive_avg_pool2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_qr_solve.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_repeat_interleave_log_softmax.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_svd_reconstruct.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_transformer_block.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "gammaln.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "ifftshift.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "invert_matrix_lu.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "ldl_factor.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "leaky_relu.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "log.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "log1p.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "log_tanh.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "logit.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "logsumexp.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "low_rank_svd_approximation.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "lu.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "matrix_multiply_and_row_dot.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "matrix_multiply_symmetric.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "mul_relu.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "normalize_pairwise_distance.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "normalized_cosine_similarity.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "ones_like.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "permute_copy.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "pixel_shuffle_conv2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "polygamma.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "pseudoinverse_svd.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "rad2deg_sqrt.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "rand.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "reciprocal.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "relu.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "relu_batch_norm_conv2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "relu_conv2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "relu_sqrt.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "rsqrt.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "scaled_add_norm.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "selu.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "sigmoid.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "sigmoid_argmax.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "softmax_log.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "softmax_mul.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "softplus_linear.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "solve_multiple_lu.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "spectral_norm_eig.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "sqrt.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "sqrt_exp.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "sqrt_tanh.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "std.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "sum.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "sum_std.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "symmetric_mm_and_abs_sum.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "tanh.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "tensordot.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "tensordot_rsqrt.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "tril_mm_and_scale.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "trunc.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    }
+  },
+  "call_acc_dir": "/results/qwen3_coder_grammar_prompts_fullsuite_v1/eval/qwen3_coder_30b_awq_4bit/qwen3_coder_30b_awq_4bit_tritonbench_python_xgrammar_off_t0.0_p1.0_tok2048_two_shot_repair0_default_seed0/call_acc",
+  "perf_results_dir": "/results/qwen3_coder_grammar_prompts_fullsuite_v1/eval/qwen3_coder_30b_awq_4bit/qwen3_coder_30b_awq_4bit_tritonbench_python_xgrammar_off_t0.0_p1.0_tok2048_two_shot_repair0_default_seed0/perf_results"
+}

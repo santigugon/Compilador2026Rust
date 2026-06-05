@@ -1,0 +1,20 @@
+{
+  "total_predictions": 5,
+  "phase1_call_acc": {
+    "passed": 0,
+    "rate": 0.0,
+    "duration_ms": 18175.19716800001
+  },
+  "phase2_exec_acc": {
+    "passed": 0,
+    "rate": 0.0
+  },
+  "phase3_efficiency": {
+    "speedup_vs_pytorch": null,
+    "raw_output_tail": "skipped",
+    "duration_ms": 0.0
+  },
+  "per_op": {},
+  "call_acc_dir": "/results/qwen3_coder_tb_v1/eval/qwen3_coder_30b_gptq_4bit/qwen3_coder_30b_gptq_4bit_tritonbench_python_xgrammar_off_t0.0_p1.0_tok2048_minimal_repair0_default_seed0/call_acc",
+  "perf_results_dir": "/results/qwen3_coder_tb_v1/eval/qwen3_coder_30b_gptq_4bit/qwen3_coder_30b_gptq_4bit_tritonbench_python_xgrammar_off_t0.0_p1.0_tok2048_minimal_repair0_default_seed0/perf_results"
+}

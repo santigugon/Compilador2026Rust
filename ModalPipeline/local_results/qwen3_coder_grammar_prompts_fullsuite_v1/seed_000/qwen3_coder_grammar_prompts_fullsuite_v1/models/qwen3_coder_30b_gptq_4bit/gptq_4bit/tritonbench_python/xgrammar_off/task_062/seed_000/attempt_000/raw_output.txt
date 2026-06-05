@@ -1,0 +1,46 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def scaled_add_dot_kernel(
+    y_ptr, x_ptr, output_ptr,
+    n,
+    alpha,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offset = pid * BLOCK_SIZE
+    x_block = tl.load(x_ptr + offset, mask=offset + tl.arange(0, BLOCK_SIZE) < n)
+    y_block = tl.load(y_ptr + offset, mask=offset + tl.arange(0, BLOCK_SIZE) < n)
+    
+    y_block = y_block + alpha * x_block
+    
+    tl.store(y_ptr + offset, y_block, mask=offset + tl.arange(0, BLOCK_SIZE) < n)
+    
+    # Compute dot product of modified y with itself
+    dot_product = tl.sum(y_block * y_block)
+    tl.store(output_ptr + pid, dot_product, mask=pid < (n + BLOCK_SIZE - 1) // BLOCK_SIZE)
+
+def scaled_add_dot(y: torch.Tensor, x: torch.Tensor, alpha: float) -> torch.Tensor:
+    assert y.shape == x.shape, "y and x must have the same shape"
+    n = y.shape[0]
+    
+    # Create output tensor for the dot product
+    output = torch.empty((n + 256 - 1) // 256, dtype=torch.float32, device=y.device)
+    
+    # Launch kernel
+    grid = (triton.cdiv(n, 256),)
+    scaled_add_dot_kernel[grid](
+        y_ptr=y.data_ptr(),
+        x_ptr=x.data_ptr(),
+        output_ptr=output.data_ptr(),
+        n=n,
+        alpha=alpha,
+        BLOCK_SIZE=256
+    )
+    
+    # Sum up all partial dot products
+    return torch.sum(output)
+```

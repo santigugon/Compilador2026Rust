@@ -1,0 +1,104 @@
+import torch
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def _determinant_lu_kernel(A_ptr, out_ptr, batch_size: tl.constexpr, n: tl.constexpr, pivot: tl.constexpr, BLOCK: tl.constexpr):
+    batch_idx = tl.program_id(0)
+    
+    # Load matrix A for this batch
+    A_block = tl.zeros((BLOCK, BLOCK), dtype=tl.float32)
+    for i in range(n):
+        for j in range(n):
+            if i < n and j < n:
+                A_block[i, j] = tl.load(A_ptr + batch_idx * n * n + i * n + j)
+    
+    # Initialize output
+    det = tl.full([], 1.0, dtype=tl.float32)
+    sign = tl.full([], 1.0, dtype=tl.float32)
+    
+    # Perform LU decomposition with partial pivoting
+    for k in range(n):
+        # Find pivot
+        if pivot:
+            max_val = tl.abs(A_block[k, k])
+            pivot_row = k
+            for i in range(k + 1, n):
+                if tl.abs(A_block[i, k]) > max_val:
+                    max_val = tl.abs(A_block[i, k])
+                    pivot_row = i
+            
+            # Swap rows if needed
+            if pivot_row != k:
+                for j in range(n):
+                    temp = A_block[k, j]
+                    A_block[k, j] = A_block[pivot_row, j]
+                    A_block[pivot_row, j] = temp
+                sign = -sign
+        
+        # Check for zero pivot
+        if A_block[k, k] == 0.0:
+            det = 0.0
+            break
+        
+        # Update determinant
+        det = det * A_block[k, k]
+        
+        # Perform elimination
+        for i in range(k + 1, n):
+            if A_block[k, k] != 0.0:
+                factor = A_block[i, k] / A_block[k, k]
+                for j in range(k + 1, n):
+                    A_block[i, j] = A_block[i, j] - factor * A_block[k, j]
+    
+    # Store result
+    tl.store(out_ptr + batch_idx, det * sign)
+
+def determinant_lu(A, *, pivot=True, out=None):
+    # Handle scalar case
+    if A.dim() < 2:
+        raise ValueError("Input tensor must have at least 2 dimensions")
+    
+    # Get batch dimensions and matrix size
+    batch_dims = A.shape[:-2]
+    n = A.shape[-1]
+    
+    # Handle batch dimensions
+    if len(batch_dims) == 0:
+        batch_size = 1
+    else:
+        batch_size = 1
+        for dim in batch_dims:
+            batch_size *= dim
+    
+    # Create output tensor
+    if out is None:
+        out = torch.empty(batch_dims, dtype=A.dtype, device=A.device)
+    else:
+        if out.shape != batch_dims or out.dtype != A.dtype or out.device != A.device:
+            raise ValueError("Output tensor must have the same shape, dtype, and device as the input")
+    
+    # For small matrices, use direct computation
+    if n <= 3:
+        if batch_size == 1:
+            return torch.det(A)
+        else:
+            return torch.stack([torch.det(A[i]) for i in range(batch_size)])
+    
+    # For larger matrices, use Triton kernel
+    block = 256
+    grid = (batch_size,)
+    
+    # Create a temporary tensor for the kernel
+    A_flat = A.view(-1, n, n)
+    out_flat = out.view(-1)
+    
+    # Launch kernel
+    _determinant_lu_kernel[grid](A_flat, out_flat, batch_size, n, pivot, BLOCK=block)
+    
+    # Reshape output if needed
+    if len(batch_dims) == 0:
+        return out_flat[0]
+    else:
+        return out_flat.view(batch_dims)

@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are an expert Triton programmer.\n\nGenerate ONLY a single valid Python module.\nNo explanations.\nNo prose.\nNo markdown outside the code block.\nNo tests.\nNo example calls.\n\nThe module must contain:\n- imports\n- Triton kernels\n- wrapper function\n\nThe wrapper function must exactly match the required signature.\n\nWrap the entire response in ONE ```python``` block.\n"
+  },
+  {
+    "role": "user",
+    "content": "You are an expert in Trion programming, capable of writing corresponding Triton kernels and wrapper functions based on functional descriptions and function parameters. Ensure that the wrapper function fully corresponds to the provided function information.\nFunctional Description: Performs a symmetric matrix multiplication by multiplying matrix `A` with its transpose, scales the result by `alpha`, adds it to matrix `C` scaled by `beta`, and returns the sum of the absolute values of the resulting matrix.\nWrapper Entry Information: symmetric_mm_and_abs_sum(A: torch.Tensor, C: torch.Tensor, alpha: float, beta: float) -> torch.Tensor\nArgs:\n    A (Tensor): Input matrix of shape `(n, m)` for which the symmetric product with its transpose is calculated.\n    C (Tensor): Matrix of the same shape as `alpha * torch.mm(A, A.T)` to accumulate the scaled result.\n    alpha (float): Scaling factor for the matrix product.\n    beta (float): Scaling factor for matrix `C`.\nReturns:\n    Tensor: Scalar tensor representing the sum of absolute values of the resulting matrix `C`.\nAfter generation, verify if the Triton wrapper aligns with the provided func_inputs. If not, regenerate."
+  }
+]

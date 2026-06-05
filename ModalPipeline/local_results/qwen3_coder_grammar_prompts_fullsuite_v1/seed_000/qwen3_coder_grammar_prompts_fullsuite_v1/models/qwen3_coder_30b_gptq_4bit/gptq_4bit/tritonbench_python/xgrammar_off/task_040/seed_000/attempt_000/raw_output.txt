@@ -1,0 +1,98 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def sigmoid_batch_norm_kernel(
+    input_ptr,
+    output_ptr,
+    mean_ptr,
+    var_ptr,
+    weight_ptr,
+    bias_ptr,
+    running_mean_ptr,
+    running_var_ptr,
+    N,
+    C,
+    L,
+    training,
+    momentum,
+    eps,
+    BLOCK_SIZE,
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N * C * L
+
+    # Load input data
+    input = tl.load(input_ptr + offsets, mask=mask)
+    
+    # Reshape for channel-wise operations
+    input = input.reshape(N, C, L)
+    
+    # Normalize
+    mean = tl.load(mean_ptr + tl.arange(0, C))
+    var = tl.load(var_ptr + tl.arange(0, C))
+    
+    # Apply batch norm
+    normalized = (input - mean) / tl.sqrt(var + eps)
+    
+    # Apply scale and shift if provided
+    if weight_ptr is not None and bias_ptr is not None:
+        weight = tl.load(weight_ptr + tl.arange(0, C))
+        bias = tl.load(bias_ptr + tl.arange(0, C))
+        normalized = normalized * weight + bias
+    
+    # Apply sigmoid
+    output = tl.sigmoid(normalized)
+    
+    # Reshape back to original shape
+    output = output.reshape(N * C * L)
+    
+    # Store output
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+def sigmoid_batch_norm(input, running_mean, running_var, weight=None, bias=None, training=False, momentum=0.1, eps=1e-5):
+    # Ensure input is contiguous
+    input = input.contiguous()
+    
+    # Get dimensions
+    N, C = input.shape[0], input.shape[1]
+    L = input.shape[2] if len(input.shape) > 2 else 1
+    
+    # Prepare output tensor
+    output = torch.empty_like(input)
+    
+    # Determine block size
+    BLOCK_SIZE = 1024
+    
+    # Launch kernel
+    grid = (triton.cdiv(N * C * L, BLOCK_SIZE),)
+    
+    # Handle optional parameters
+    weight_ptr = weight.data_ptr() if weight is not None else None
+    bias_ptr = bias.data_ptr() if bias is not None else None
+    
+    # Call kernel
+    sigmoid_batch_norm_kernel[grid](
+        input_ptr=input.data_ptr(),
+        output_ptr=output.data_ptr(),
+        mean_ptr=running_mean.data_ptr(),
+        var_ptr=running_var.data_ptr(),
+        weight_ptr=weight_ptr,
+        bias_ptr=bias_ptr,
+        running_mean_ptr=running_mean.data_ptr(),
+        running_var_ptr=running_var.data_ptr(),
+        N=N,
+        C=C,
+        L=L,
+        training=training,
+        momentum=momentum,
+        eps=eps,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return output
+```

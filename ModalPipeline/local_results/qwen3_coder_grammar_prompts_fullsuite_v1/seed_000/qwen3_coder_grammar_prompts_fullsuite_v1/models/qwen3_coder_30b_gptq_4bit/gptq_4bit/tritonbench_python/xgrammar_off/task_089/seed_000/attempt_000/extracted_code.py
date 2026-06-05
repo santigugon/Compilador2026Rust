@@ -1,0 +1,70 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def cosine_similarity_kernel(
+    x1_ptr, x2_ptr, out_ptr,
+    n_features, n_samples,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offset = pid * BLOCK_SIZE
+    indices = offset + tl.arange(0, BLOCK_SIZE)
+    mask = indices < n_samples
+    
+    x1 = tl.load(x1_ptr + indices, mask=mask)
+    x2 = tl.load(x2_ptr + indices, mask=mask)
+    
+    # Compute dot product
+    dot = x1 * x2
+    dot_sum = tl.sum(dot, axis=0)
+    
+    # Compute norms
+    x1_norm = tl.sum(x1 * x1, axis=0)
+    x2_norm = tl.sum(x2 * x2, axis=0)
+    
+    # Add epsilon for numerical stability
+    eps = 1e-8
+    norm_product = tl.sqrt(x1_norm + eps) * tl.sqrt(x2_norm + eps)
+    
+    # Compute cosine similarity
+    cosine_sim = dot_sum / norm_product
+    
+    tl.store(out_ptr + pid, cosine_sim, mask=mask)
+
+def fused_avg_pool2d_cosine_similarity(x1: torch.Tensor, x2: torch.Tensor, kernel_size: int, stride: int = None, padding: int = 0, eps: float = 1e-8) -> torch.Tensor:
+    if stride is None:
+        stride = kernel_size
+    
+    # Compute cosine similarity along dim=1
+    n_samples, n_features = x1.shape
+    out = torch.empty(n_samples, device=x1.device, dtype=torch.float32)
+    
+    # Launch Triton kernel for cosine similarity
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_samples, BLOCK_SIZE),)
+    
+    # Reshape inputs for the kernel
+    x1_flat = x1.view(-1)
+    x2_flat = x2.view(-1)
+    out_flat = out.view(-1)
+    
+    cosine_similarity_kernel[grid](
+        x1_flat, x2_flat, out_flat,
+        n_features, n_samples,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    # Add singleton dimension
+    out = out.unsqueeze(1)
+    
+    # Apply 2D average pooling
+    out = torch.nn.functional.avg_pool2d(
+        out, 
+        kernel_size=kernel_size, 
+        stride=stride, 
+        padding=padding
+    )
+    
+    return out

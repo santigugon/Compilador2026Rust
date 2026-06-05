@@ -1,0 +1,178 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_bmm_rmsnorm_gelu_dropout_kernel(
+    input1_ptr, input2_ptr, output_ptr, 
+    rms_norm_weight_ptr, dropout_mask_ptr,
+    B, N, M, P, 
+    normalized_shape,
+    dropout_p,
+    eps,
+    training,
+    approximate,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_NORM: tl.constexpr
+):
+    # Get block indices
+    batch_idx = tl.program_id(0)
+    m_idx = tl.program_id(1)
+    n_idx = tl.program_id(2)
+    
+    # Load input1 and input2
+    input1_block_ptr = tl.make_block_ptr(
+        input1_ptr, 
+        shape=(B, N, M), 
+        strides=(N * M, M, 1),
+        offsets=(batch_idx, m_idx * BLOCK_SIZE_M, 0),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+        order=(1, 0)
+    )
+    
+    input2_block_ptr = tl.make_block_ptr(
+        input2_ptr, 
+        shape=(B, M, P), 
+        strides=(M * P, P, 1),
+        offsets=(batch_idx, 0, n_idx * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+        order=(0, 1)
+    )
+    
+    # Compute BMM
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, M, BLOCK_SIZE_K):
+        input1 = tl.load(input1_block_ptr, boundary_check=(0, 1))
+        input2 = tl.load(input2_block_ptr, boundary_check=(0, 1))
+        acc += tl.dot(input1, input2)
+        input1_block_ptr = tl.advance(input1_block_ptr, (0, BLOCK_SIZE_K))
+        input2_block_ptr = tl.advance(input2_block_ptr, (BLOCK_SIZE_K, 0))
+    
+    # Apply RMS normalization
+    # Compute mean of squares
+    norm_block_ptr = tl.make_block_ptr(
+        input1_ptr, 
+        shape=(B, N, M), 
+        strides=(N * M, M, 1),
+        offsets=(batch_idx, m_idx * BLOCK_SIZE_M, 0),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+        order=(1, 0)
+    )
+    
+    # Compute normalization factor
+    norm_sum = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+    for k in range(0, M, BLOCK_SIZE_K):
+        norm_data = tl.load(norm_block_ptr, boundary_check=(0, 1))
+        norm_sum += tl.sum(norm_data * norm_data, axis=1)
+        norm_block_ptr = tl.advance(norm_block_ptr, (0, BLOCK_SIZE_K))
+    
+    # Normalize
+    norm_factor = tl.rsqrt(norm_sum / M + eps)
+    
+    # Apply normalization weight
+    weight_block_ptr = tl.make_block_ptr(
+        rms_norm_weight_ptr,
+        shape=(normalized_shape,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK_SIZE_NORM,),
+        order=(0,)
+    )
+    
+    # Apply GELU
+    gelu_input = acc * norm_factor[:, None]
+    
+    # Apply GELU approximation
+    if approximate == "tanh":
+        gelu_output = 0.5 * gelu_input * (1 + tl.tanh(0.7978845608028654 * (gelu_input + 0.044715 * gelu_input * gelu_input)))
+    else:
+        gelu_output = 0.5 * gelu_input * (1 + tl.erf(gelu_input / tl.sqrt(2.0)))
+    
+    # Apply dropout
+    if training:
+        # Generate random mask
+        mask_block_ptr = tl.make_block_ptr(
+            dropout_mask_ptr,
+            shape=(B, N, P),
+            strides=(N * P, P, 1),
+            offsets=(batch_idx, m_idx * BLOCK_SIZE_M, n_idx * BLOCK_SIZE_N),
+            block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+            order=(1, 0)
+        )
+        mask = tl.load(mask_block_ptr, boundary_check=(0, 1))
+        gelu_output = gelu_output * mask / (1.0 - dropout_p)
+    
+    # Store output
+    output_block_ptr = tl.make_block_ptr(
+        output_ptr,
+        shape=(B, N, P),
+        strides=(N * P, P, 1),
+        offsets=(batch_idx, m_idx * BLOCK_SIZE_M, n_idx * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+        order=(1, 0)
+    )
+    tl.store(output_block_ptr, gelu_output, boundary_check=(0, 1))
+
+def fused_bmm_rmsnorm_gelu_dropout(
+    input1, 
+    input2, 
+    normalized_shape, 
+    dropout_p=0.1, 
+    eps=1e-5, 
+    training=True, 
+    approximate='none', 
+    *, 
+    out=None
+):
+    # Validate inputs
+    assert input1.dim() == 3 and input2.dim() == 3
+    assert input1.shape[0] == input2.shape[0]  # batch size
+    assert input1.shape[2] == input2.shape[1]  # inner dimension
+    
+    B, N, M = input1.shape
+    _, _, P = input2.shape
+    
+    # Create output tensor
+    if out is None:
+        out = torch.empty(B, N, P, dtype=input1.dtype, device=input1.device)
+    
+    # Create RMS norm weight tensor
+    if isinstance(normalized_shape, int):
+        rms_norm_weight = torch.ones(normalized_shape, dtype=input1.dtype, device=input1.device)
+    else:
+        rms_norm_weight = torch.ones(normalized_shape, dtype=input1.dtype, device=input1.device)
+    
+    # Create dropout mask if needed
+    if training:
+        dropout_mask = torch.rand(B, N, P, dtype=torch.float32, device=input1.device)
+        dropout_mask = (dropout_mask > dropout_p).to(torch.float32)
+    else:
+        dropout_mask = torch.ones(B, N, P, dtype=torch.float32, device=input1.device)
+    
+    # Launch kernel
+    grid = (B, triton.cdiv(N, 128), triton.cdiv(P, 128))
+    
+    # Define block sizes
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 128
+    BLOCK_SIZE_NORM = 128
+    
+    fused_bmm_rmsnorm_gelu_dropout_kernel[grid](
+        input1, input2, out,
+        rms_norm_weight, dropout_mask,
+        B, N, M, P,
+        normalized_shape,
+        dropout_p,
+        eps,
+        training,
+        approximate,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        BLOCK_SIZE_NORM=BLOCK_SIZE_NORM
+    )
+    
+    return out

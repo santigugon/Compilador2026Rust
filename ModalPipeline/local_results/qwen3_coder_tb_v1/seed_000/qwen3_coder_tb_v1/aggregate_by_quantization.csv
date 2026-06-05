@@ -1,0 +1,5 @@
+quantization,attempts,overall_pass_rate,compile_rate,correctness_rate,mean_gen_latency_ms
+awq_4bit,5,1.0,1.0,1.0,4879.146976800001
+awq_8bit,5,0.0,0.0,0.0,6590.237229000003
+bf16_or_fp16,5,0.0,0.0,0.0,6271.0781849999985
+gptq_4bit,5,0.0,0.0,0.0,5604.091816799996

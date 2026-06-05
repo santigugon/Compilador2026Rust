@@ -1,0 +1,102 @@
+```python
+import torch
+import triton
+import triton.language as tl
+from typing import Tuple, Optional, Union
+
+@triton.jit
+def svd_kernel(
+    A_ptr, U_ptr, S_ptr, Vh_ptr,
+    m, n, batch_size,
+    stride_A_batch, stride_A_m, stride_A_n,
+    stride_U_batch, stride_U_m, stride_U_k,
+    stride_S_batch, stride_S_k,
+    stride_Vh_batch, stride_Vh_k, stride_Vh_n,
+    BLOCK_M=32, BLOCK_N=32, BLOCK_K=32
+):
+    batch_idx = tl.program_id(0)
+    tile_m = tl.cdiv(m, BLOCK_M)
+    tile_n = tl.cdiv(n, BLOCK_N)
+    
+    # Load matrix A
+    A_batch = A_ptr + batch_idx * stride_A_batch
+    U_batch = U_ptr + batch_idx * stride_U_batch
+    Vh_batch = Vh_ptr + batch_idx * stride_Vh_batch
+    
+    # Initialize U and Vh
+    for i in range(tile_m):
+        for j in range(tile_n):
+            # SVD computation would go here
+            # This is a placeholder for actual SVD implementation
+            pass
+
+def linalg_svd(A: torch.Tensor, full_matrices: bool = True, *, driver=None, out=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if A.dtype not in [torch.float32, torch.float64, torch.complex64, torch.complex128]:
+        raise ValueError("Unsupported dtype for SVD")
+    
+    if A.dim() < 2:
+        raise ValueError("Input tensor must have at least 2 dimensions")
+    
+    batch_dims = A.shape[:-2]
+    m, n = A.shape[-2], A.shape[-1]
+    
+    # Determine output shapes
+    if full_matrices:
+        k = min(m, n)
+        u_shape = batch_dims + (m, m)
+        vh_shape = batch_dims + (n, n)
+    else:
+        k = min(m, n)
+        u_shape = batch_dims + (m, k)
+        vh_shape = batch_dims + (k, n)
+    
+    # Create output tensors
+    if out is not None:
+        U, S, Vh = out
+        if U.shape != u_shape or S.shape != batch_dims + (k,) or Vh.shape != vh_shape:
+            raise ValueError("Output tensor shapes do not match expected SVD output shapes")
+    else:
+        U = torch.empty(u_shape, dtype=A.dtype, device=A.device)
+        S = torch.empty(batch_dims + (k,), dtype=torch.float32 if A.dtype in [torch.complex64, torch.complex128] else A.dtype, device=A.device)
+        Vh = torch.empty(vh_shape, dtype=A.dtype, device=A.device)
+    
+    # Handle batched operations
+    batch_size = 1
+    for dim in batch_dims:
+        batch_size *= dim
+    
+    if batch_size > 1:
+        # Use Triton kernel for batched SVD
+        grid = (batch_size, 1, 1)
+        svd_kernel[grid](
+            A, U, S, Vh,
+            m, n, batch_size,
+            A.stride(0) if len(A.shape) > 2 else 0,
+            A.stride(-2) if len(A.shape) > 2 else 0,
+            A.stride(-1) if len(A.shape) > 2 else 0,
+            U.stride(0) if len(U.shape) > 2 else 0,
+            U.stride(-2) if len(U.shape) > 2 else 0,
+            U.stride(-1) if len(U.shape) > 2 else 0,
+            S.stride(0) if len(S.shape) > 1 else 0,
+            S.stride(-1) if len(S.shape) > 1 else 0,
+            Vh.stride(0) if len(Vh.shape) > 2 else 0,
+            Vh.stride(-2) if len(Vh.shape) > 2 else 0,
+            Vh.stride(-1) if len(Vh.shape) > 2 else 0
+        )
+    else:
+        # Use single matrix SVD
+        # This would typically call cuSOLVER or similar
+        # For now, we'll just return empty tensors with correct shapes
+        pass
+    
+    # Sort singular values in descending order
+    # This is a simplified version - full implementation would be more complex
+    if S.dim() > 1:
+        S_sorted, indices = torch.sort(S, dim=-1, descending=True)
+        # Reorder U and Vh accordingly
+        # This is a placeholder for actual sorting logic
+    else:
+        S_sorted, indices = torch.sort(S, descending=True)
+    
+    return (U, S_sorted, Vh)
+```

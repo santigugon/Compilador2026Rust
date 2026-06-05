@@ -1,0 +1,113 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def normalize_kernel(
+    x_ptr, 
+    output_ptr, 
+    n_elements, 
+    BLOCK_SIZE: tl.constexpr,
+    p_norm: tl.constexpr,
+    eps_norm: tl.constexpr
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    # Compute Lp norm
+    abs_x = tl.abs(x)
+    if p_norm == 2.0:
+        norm = tl.sqrt(tl.sum(abs_x * abs_x) + eps_norm)
+    elif p_norm == 1.0:
+        norm = tl.sum(abs_x) + eps_norm
+    else:
+        norm = tl.pow(tl.sum(tl.pow(abs_x, p_norm)) + eps_norm, 1.0 / p_norm)
+    # Normalize
+    output = x / norm
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+@triton.jit
+def pairwise_distance_kernel(
+    x1_ptr, 
+    x2_ptr, 
+    output_ptr, 
+    n1, 
+    n2, 
+    n_features, 
+    BLOCK_SIZE: tl.constexpr,
+    eps_distance: tl.constexpr
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n1 * n2
+    x1_offsets = (offsets // n2) % n1
+    x2_offsets = offsets % n2
+    x1 = tl.load(x1_ptr + x1_offsets * n_features + tl.arange(0, n_features), mask=tl.arange(0, n_features) < n_features)
+    x2 = tl.load(x2_ptr + x2_offsets * n_features + tl.arange(0, n_features), mask=tl.arange(0, n_features) < n_features)
+    diff = x1 - x2
+    squared_diff = diff * diff
+    sum_squared_diff = tl.sum(squared_diff)
+    distance = tl.sqrt(sum_squared_diff + eps_distance)
+    tl.store(output_ptr + offsets, distance, mask=mask)
+
+def fused_pairwise_distance_normalize(
+    x1: torch.Tensor, 
+    x2: torch.Tensor, 
+    p_norm: float = 2.0, 
+    eps_norm: float = 1e-12, 
+    eps_distance: float = 1e-6, 
+    keepdim: bool = False
+) -> torch.Tensor:
+    # Normalize x1 and x2
+    x1_normalized = x1.clone()
+    x2_normalized = x2.clone()
+    
+    # Normalize along the last dimension
+    n_features = x1.shape[-1]
+    n1 = x1.shape[0]
+    n2 = x2.shape[0]
+    
+    # Use Triton kernel for normalization
+    grid = (triton.cdiv(n1 * n_features, 1024),)
+    normalize_kernel[grid](
+        x1_normalized, 
+        x1_normalized, 
+        n1 * n_features, 
+        BLOCK_SIZE=1024, 
+        p_norm=p_norm, 
+        eps_norm=eps_norm
+    )
+    
+    grid = (triton.cdiv(n2 * n_features, 1024),)
+    normalize_kernel[grid](
+        x2_normalized, 
+        x2_normalized, 
+        n2 * n_features, 
+        BLOCK_SIZE=1024, 
+        p_norm=p_norm, 
+        eps_norm=eps_norm
+    )
+    
+    # Compute pairwise distances
+    output = torch.empty(n1, n2, device=x1.device, dtype=torch.float32)
+    grid = (triton.cdiv(n1 * n2, 1024),)
+    pairwise_distance_kernel[grid](
+        x1_normalized, 
+        x2_normalized, 
+        output, 
+        n1, 
+        n2, 
+        n_features, 
+        BLOCK_SIZE=1024, 
+        eps_distance=eps_distance
+    )
+    
+    if keepdim:
+        output = output.unsqueeze(-1)
+    
+    return output
+```

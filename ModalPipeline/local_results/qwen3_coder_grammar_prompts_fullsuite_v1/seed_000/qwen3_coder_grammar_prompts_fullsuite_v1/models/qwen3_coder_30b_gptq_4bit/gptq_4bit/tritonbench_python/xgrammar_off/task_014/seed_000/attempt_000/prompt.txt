@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are an expert Triton programmer.\n\nGenerate ONLY a single valid Python module.\nNo explanations.\nNo prose.\nNo markdown outside the code block.\nNo tests.\nNo example calls.\n\nThe module must contain:\n- imports\n- Triton kernels\n- wrapper function\n\nThe wrapper function must exactly match the required signature.\n\nWrap the entire response in ONE ```python``` block.\n"
+  },
+  {
+    "role": "user",
+    "content": "You are an expert in Trion programming, capable of writing corresponding Triton kernels and wrapper functions based on functional descriptions and function parameters. Ensure that the wrapper function fully corresponds to the provided function information.\nFunctional Description: Performs a fused operation combining matrix-vector multiplication, log-softmax activation, and dropout. The function first performs matrix-vector multiplication on the input matrix and vector. The result is then passed through a log-softmax activation function along the specified dimension. Finally, dropout is applied to the output of the log-softmax operation.\nWrapper Entry Information: fused_mv_logsoftmax_dropout(input, vec, p=0.5, training=True, inplace=False, dim=0, *, out=None) -> Tensor\nAfter generation, verify if the Triton wrapper aligns with the provided func_inputs. If not, regenerate."
+  }
+]

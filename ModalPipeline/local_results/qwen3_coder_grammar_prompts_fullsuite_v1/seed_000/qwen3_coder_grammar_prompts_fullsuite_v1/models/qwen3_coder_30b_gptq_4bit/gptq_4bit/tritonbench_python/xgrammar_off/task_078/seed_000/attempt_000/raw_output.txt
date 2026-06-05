@@ -1,0 +1,126 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fused_cross_entropy_log_softmax_kernel(
+    input_ptr,
+    target_ptr,
+    weight_ptr,
+    output_ptr,
+    loss_ptr,
+    n_cols,
+    n_rows,
+    dim,
+    ignore_index,
+    reduction,
+    label_smoothing,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row = pid
+    if row >= n_rows:
+        return
+    
+    input_row = input_ptr + row * n_cols
+    target_val = tl.load(target_ptr + row)
+    
+    if target_val == ignore_index:
+        tl.store(output_ptr + row, 0.0)
+        if reduction != 'none':
+            tl.store(loss_ptr + row, 0.0)
+        return
+    
+    # Compute log softmax
+    max_val = tl.load(input_row + 0)
+    for i in range(1, n_cols):
+        max_val = tl.maximum(max_val, tl.load(input_row + i))
+    
+    sum_val = 0.0
+    for i in range(n_cols):
+        sum_val += tl.exp(tl.load(input_row + i) - max_val)
+    
+    log_sum_exp = tl.log(sum_val)
+    
+    # Apply label smoothing
+    if label_smoothing > 0:
+        smooth_val = label_smoothing / (n_cols - 1)
+        target_prob = 1.0 - label_smoothing
+        if target_val >= 0 and target_val < n_cols:
+            # Apply smoothing to target
+            target_prob = 1.0 - label_smoothing + smooth_val
+        else:
+            target_prob = 1.0 - label_smoothing
+            
+        # Compute cross entropy with smoothing
+        log_softmax_val = tl.load(input_row + target_val) - max_val - log_sum_exp
+        loss_val = -log_softmax_val * target_prob
+        if weight_ptr is not None:
+            weight_val = tl.load(weight_ptr + target_val)
+            loss_val *= weight_val
+    else:
+        # Standard cross entropy
+        log_softmax_val = tl.load(input_row + target_val) - max_val - log_sum_exp
+        loss_val = -log_softmax_val
+        if weight_ptr is not None:
+            weight_val = tl.load(weight_ptr + target_val)
+            loss_val *= weight_val
+    
+    tl.store(output_ptr + row, loss_val)
+    if reduction != 'none':
+        tl.store(loss_ptr + row, loss_val)
+
+def fused_cross_entropy_log_softmax(input: torch.Tensor, target: torch.Tensor, dim: int = 1, weight: torch.Tensor = None, ignore_index: int = -100, reduction: str = 'mean', label_smoothing: float = 0.0) -> torch.Tensor:
+    assert input.dim() == 2, "input must be 2D"
+    assert target.dim() == 1, "target must be 1D"
+    assert input.size(0) == target.size(0), "input and target must have same batch size"
+    assert dim == 1, "only dim=1 is supported"
+    assert reduction in ['none', 'mean', 'sum'], "reduction must be 'none', 'mean', or 'sum'"
+    assert 0 <= label_smoothing <= 1, "label_smoothing must be between 0 and 1"
+    
+    n_rows, n_cols = input.size()
+    
+    # Prepare output tensor
+    if reduction == 'none':
+        output = torch.empty(n_rows, dtype=torch.float32, device=input.device)
+    else:
+        output = torch.empty(1, dtype=torch.float32, device=input.device)
+    
+    # Prepare loss tensor for reduction
+    if reduction != 'none':
+        loss = torch.empty(n_rows, dtype=torch.float32, device=input.device)
+    else:
+        loss = None
+    
+    # Launch kernel
+    BLOCK_SIZE = 1024
+    grid = (n_rows,)
+    
+    # Handle weight tensor
+    weight_ptr = weight.data_ptr() if weight is not None else None
+    
+    # Launch kernel
+    _fused_cross_entropy_log_softmax_kernel[grid](
+        input_ptr=input.data_ptr(),
+        target_ptr=target.data_ptr(),
+        weight_ptr=weight_ptr,
+        output_ptr=output.data_ptr(),
+        loss_ptr=loss.data_ptr() if loss is not None else None,
+        n_cols=n_cols,
+        n_rows=n_rows,
+        dim=dim,
+        ignore_index=ignore_index,
+        reduction=reduction,
+        label_smoothing=label_smoothing,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    # Apply reduction if needed
+    if reduction == 'mean':
+        return output.sum() / (n_rows - (target == ignore_index).sum())
+    elif reduction == 'sum':
+        return output.sum()
+    else:
+        return output
+```

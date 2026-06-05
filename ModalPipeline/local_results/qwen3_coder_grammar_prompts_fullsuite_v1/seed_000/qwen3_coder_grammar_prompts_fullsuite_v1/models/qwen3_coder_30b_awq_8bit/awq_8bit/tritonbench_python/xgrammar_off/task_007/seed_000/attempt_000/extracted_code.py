@@ -1,0 +1,47 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _sigmoid_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = 1.0 / (1.0 + tl.exp(-x))
+    tl.store(out_ptr + offsets, y, mask=mask)
+
+@triton.jit
+def _argmax_kernel(x_ptr, out_ptr, n: tl.constexpr, dim_size: tl.constexpr, stride: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=-float('inf'))
+    
+    # For argmax, we need to find the maximum value and its index
+    # This is a simplified version that works for the flattened case
+    # In a real implementation, we'd need to handle the dimension properly
+    max_val = tl.max(x)
+    max_idx = tl.argmin(tl.where(x == max_val, 0, 1))
+    tl.store(out_ptr, max_idx, mask=mask)
+
+def sigmoid_argmax(input, dim=None, keepdim=False):
+    # Apply sigmoid to input
+    sigmoid_input = torch.empty_like(input)
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _sigmoid_kernel[grid](input, sigmoid_input, n, BLOCK=block)
+    
+    # Compute argmax
+    if dim is None:
+        # Flatten the tensor and find argmax
+        flat_sigmoid = sigmoid_input.flatten()
+        argmax_idx = torch.argmax(flat_sigmoid)
+        if keepdim:
+            return argmax_idx.view(1)
+        return argmax_idx
+    else:
+        # Find argmax along specified dimension
+        argmax_result = torch.argmax(sigmoid_input, dim=dim, keepdim=keepdim)
+        return argmax_result

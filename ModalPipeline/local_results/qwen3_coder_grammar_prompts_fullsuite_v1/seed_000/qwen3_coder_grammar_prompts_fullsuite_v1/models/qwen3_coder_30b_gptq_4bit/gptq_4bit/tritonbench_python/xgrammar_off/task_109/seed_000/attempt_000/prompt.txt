@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are an expert Triton programmer.\n\nGenerate ONLY a single valid Python module.\nNo explanations.\nNo prose.\nNo markdown outside the code block.\nNo tests.\nNo example calls.\n\nThe module must contain:\n- imports\n- Triton kernels\n- wrapper function\n\nThe wrapper function must exactly match the required signature.\n\nWrap the entire response in ONE ```python``` block.\n"
+  },
+  {
+    "role": "user",
+    "content": "You are an expert in Trion programming, capable of writing corresponding Triton kernels and wrapper functions based on functional descriptions and function parameters. Ensure that the wrapper function fully corresponds to the provided function information.\nFunctional Description: Computes the Moore-Penrose pseudoinverse of a matrix using Singular Value Decomposition (SVD). It decomposes the input matrix A into its singular value components, inverts the non-zero singular values above a certain threshold to avoid numerical instability, and reconstructs the pseudoinverse using these components. Supports input of float, double, cfloat, and cdouble dtypes, and can handle batches of matrices.\nWrapper Entry Information: def pseudoinverse_svd(A, *, full_matrices=True, rcond=1e-15, out=None) -> Tensor\n\nArgs:\n    A (Tensor): Input tensor of shape `(*, m, n)` where `*` is zero or more batch dimensions.\n\nKeyword args:\n    full_matrices (bool, optional): If `True` (default), compute the full SVD. If `False`, compute the reduced SVD.\n    rcond (float, optional): Relative condition number threshold. Singular values smaller than `rcond * largest_singular_value` are set to zero. Default: `1e-15`.\n    out (Tensor, optional): Output tensor. Ignored if `None`. Default: `None`.\nAfter generation, verify if the Triton wrapper aligns with the provided func_inputs. If not, regenerate."
+  }
+]

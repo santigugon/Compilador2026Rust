@@ -1,0 +1,81 @@
+```python
+import torch
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def gelu_min_kernel(
+    input_ptr,
+    output_ptr,
+    min_indices_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    APPROXIMATE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    
+    # Compute GELU
+    if APPROXIMATE == 0:  # exact
+        sqrt_2 = 1.4142135623730951
+        gelu_input = input * (1.0 / sqrt_2)
+        gelu = 0.5 * input * (1.0 + tl.erf(gelu_input))
+    else:  # tanh approximation
+        gelu = 0.5 * input * (1.0 + tl.tanh(input * (math.sqrt(2.0) / math.pi) * (1.0 + 0.044715 * input * input)))
+    
+    # Compute minimum
+    min_val = tl.minimum(gelu, tl.load(output_ptr, mask=mask))
+    tl.store(output_ptr + offsets, min_val, mask=mask)
+    
+    # Store indices for minimum (simplified)
+    tl.store(min_indices_ptr + offsets, offsets, mask=mask)
+
+def gelu_min(input, approximate='none', dim=None, keepdim=False, out=None):
+    if out is not None:
+        raise NotImplementedError("out parameter is not supported")
+    
+    if approximate not in ['none', 'tanh']:
+        raise ValueError("approximate must be 'none' or 'tanh'")
+    
+    input = input.contiguous()
+    shape = input.shape
+    n_elements = input.numel()
+    
+    # Determine approximate method
+    approximate_val = 0 if approximate == 'none' else 1
+    
+    # Create output tensor
+    output = torch.empty_like(input)
+    min_indices = torch.empty_like(input, dtype=torch.long)
+    
+    # Launch kernel
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    gelu_min_kernel[grid](
+        input_ptr=input.data_ptr(),
+        output_ptr=output.data_ptr(),
+        min_indices_ptr=min_indices.data_ptr(),
+        n_elements=n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        APPROXIMATE=approximate_val
+    )
+    
+    # Handle dimension selection
+    if dim is not None:
+        if dim < 0:
+            dim = len(shape) + dim
+        output = torch.min(output, dim=dim, keepdim=keepdim)
+        min_indices = torch.min(min_indices, dim=dim, keepdim=keepdim)
+    else:
+        output = torch.min(output)
+        min_indices = torch.min(min_indices)
+    
+    if keepdim:
+        return (output, min_indices)
+    else:
+        return (output, min_indices)
+```

@@ -1,0 +1,146 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _grid_sample_kernel(
+    input_ptr, grid_ptr, output_ptr,
+    input_shape0, input_shape1, input_shape2, input_shape3,
+    grid_shape0, grid_shape1, grid_shape2,
+    output_shape0, output_shape1, output_shape2,
+    mode: tl.constexpr,
+    padding_mode: tl.constexpr,
+    align_corners: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < output_shape0 * output_shape1 * output_shape2
+    
+    # Compute output indices
+    out_idx = offsets
+    out_h = out_idx // (output_shape2 * output_shape1)
+    out_w = (out_idx // output_shape2) % output_shape1
+    out_c = out_idx % output_shape2
+    
+    # Load grid coordinates
+    grid_idx = out_h * grid_shape2 + out_w
+    grid_x = tl.load(grid_ptr + grid_idx, mask=mask, other=0.0)
+    grid_y = tl.load(grid_ptr + grid_idx + grid_shape0 * grid_shape1, mask=mask, other=0.0)
+    
+    # Normalize grid coordinates
+    if align_corners:
+        x = (grid_x + 1.0) * (input_shape3 - 1) / 2.0
+        y = (grid_y + 1.0) * (input_shape2 - 1) / 2.0
+    else:
+        x = (grid_x + 1.0) * input_shape3 / 2.0 - 0.5
+        y = (grid_y + 1.0) * input_shape2 / 2.0 - 0.5
+    
+    # Clamp coordinates to valid range
+    x = tl.maximum(0.0, tl.minimum(x, input_shape3 - 1.0))
+    y = tl.maximum(0.0, tl.minimum(y, input_shape2 - 1.0))
+    
+    # Handle padding modes
+    if padding_mode == "zeros":
+        # Check if coordinates are valid
+        valid = (x >= 0) & (x < input_shape3) & (y >= 0) & (y < input_shape2)
+        x = tl.where(valid, x, 0.0)
+        y = tl.where(valid, y, 0.0)
+    elif padding_mode == "border":
+        x = tl.clamp(x, 0.0, input_shape3 - 1.0)
+        y = tl.clamp(y, 0.0, input_shape2 - 1.0)
+    elif padding_mode == "reflection":
+        # Handle reflection padding
+        x = tl.where(x < 0, -x, x)
+        y = tl.where(y < 0, -y, y)
+        x = tl.where(x >= input_shape3, 2 * input_shape3 - 2 - x, x)
+        y = tl.where(y >= input_shape2, 2 * input_shape2 - 2 - y, y)
+        x = tl.clamp(x, 0.0, input_shape3 - 1.0)
+        y = tl.clamp(y, 0.0, input_shape2 - 1.0)
+    
+    # Bilinear interpolation
+    if mode == "bilinear":
+        x0 = tl.floor(x).to(tl.int32)
+        y0 = tl.floor(y).to(tl.int32)
+        x1 = x0 + 1
+        y1 = y0 + 1
+        
+        # Clamp to valid range
+        x1 = tl.minimum(x1, input_shape3 - 1)
+        y1 = tl.minimum(y1, input_shape2 - 1)
+        
+        # Compute weights
+        wx = x - x0
+        wy = y - y0
+        
+        # Load four corner values
+        val00 = tl.load(input_ptr + out_c + y0 * input_shape3 + x0 * input_shape1 * input_shape2, mask=mask, other=0.0)
+        val01 = tl.load(input_ptr + out_c + y0 * input_shape3 + x1 * input_shape1 * input_shape2, mask=mask, other=0.0)
+        val10 = tl.load(input_ptr + out_c + y1 * input_shape3 + x0 * input_shape1 * input_shape2, mask=mask, other=0.0)
+        val11 = tl.load(input_ptr + out_c + y1 * input_shape3 + x1 * input_shape1 * input_shape2, mask=mask, other=0.0)
+        
+        # Interpolate
+        val0 = val00 * (1 - wx) + val01 * wx
+        val1 = val10 * (1 - wx) + val11 * wx
+        result = val0 * (1 - wy) + val1 * wy
+    else:  # mode == "nearest"
+        x = tl.round(x).to(tl.int32)
+        y = tl.round(y).to(tl.int32)
+        x = tl.clamp(x, 0, input_shape3 - 1)
+        y = tl.clamp(y, 0, input_shape2 - 1)
+        result = tl.load(input_ptr + out_c + y * input_shape3 + x * input_shape1 * input_shape2, mask=mask, other=0.0)
+    
+    tl.store(output_ptr + offsets, result, mask=mask)
+
+def grid_sample(input, grid, mode='bilinear', padding_mode='zeros', align_corners=False):
+    # Validate inputs
+    if input.dim() not in [4, 5]:
+        raise ValueError("input must be 4D or 5D")
+    if grid.dim() != 4:
+        raise ValueError("grid must be 4D")
+    
+    # Extract shapes
+    batch_size = input.shape[0]
+    channels = input.shape[1]
+    height = input.shape[2]
+    width = input.shape[3]
+    
+    grid_batch_size = grid.shape[0]
+    grid_height = grid.shape[1]
+    grid_width = grid.shape[2]
+    
+    if batch_size != grid_batch_size:
+        raise ValueError("input and grid must have the same batch size")
+    
+    # Create output tensor
+    output = torch.empty(batch_size, channels, grid_height, grid_width, device=input.device, dtype=input.dtype)
+    
+    # Flatten output for kernel processing
+    output_flat = output.view(-1)
+    
+    # Set up kernel launch parameters
+    block_size = 256
+    total_elements = output_flat.numel()
+    grid_size = triton.cdiv(total_elements, block_size)
+    
+    # Prepare input and grid pointers
+    input_ptr = input.data_ptr()
+    grid_ptr = grid.data_ptr()
+    output_ptr = output_flat.data_ptr()
+    
+    # Launch kernel
+    _grid_sample_kernel[grid_size](
+        input_ptr, grid_ptr, output_ptr,
+        batch_size, channels, height, width,
+        grid_batch_size, grid_height, grid_width,
+        batch_size, grid_height, grid_width,
+        mode,
+        padding_mode,
+        align_corners,
+        BLOCK_SIZE=block_size
+    )
+    
+    return output
+```

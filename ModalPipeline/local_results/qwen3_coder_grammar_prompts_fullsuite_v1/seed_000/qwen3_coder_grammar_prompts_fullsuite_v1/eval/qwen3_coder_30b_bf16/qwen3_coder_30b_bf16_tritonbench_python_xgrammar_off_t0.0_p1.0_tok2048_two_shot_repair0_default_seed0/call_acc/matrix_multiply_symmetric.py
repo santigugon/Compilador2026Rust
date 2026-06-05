@@ -1,0 +1,166 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _matmul_kernel(A_ptr, B_ptr, C_ptr, out_ptr, 
+                   n: tl.constexpr, m: tl.constexpr, p: tl.constexpr,
+                   alpha: tl.constexpr, beta: tl.constexpr,
+                   A_stride_0: tl.constexpr, A_stride_1: tl.constexpr,
+                   B_stride_0: tl.constexpr, B_stride_1: tl.constexpr,
+                   C_stride_0: tl.constexpr, C_stride_1: tl.constexpr,
+                   out_stride_0: tl.constexpr, out_stride_1: tl.constexpr,
+                   BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Compute block offsets
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    
+    # Load A and B tiles
+    a_ptrs = A_ptr + (offs_m[:, None] * A_stride_0 + offs_k[None, :] * A_stride_1)
+    b_ptrs = B_ptr + (offs_k[:, None] * B_stride_0 + offs_n[None, :] * B_stride_1)
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    # Compute matrix multiplication
+    for k in range(0, m, BLOCK_SIZE_K):
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < n) & (offs_k[None, :] < m - k))
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] < m - k) & (offs_n[None, :] < p))
+        acc += tl.dot(a, b)
+        
+        # Advance pointers
+        a_ptrs += BLOCK_SIZE_K * A_stride_1
+        b_ptrs += BLOCK_SIZE_K * B_stride_0
+    
+    # Scale and add to C
+    c_ptrs = C_ptr + (offs_m[:, None] * C_stride_0 + offs_n[None, :] * C_stride_1)
+    out_ptrs = out_ptr + (offs_m[:, None] * out_stride_0 + offs_n[None, :] * out_stride_1)
+    
+    c = tl.load(c_ptrs, mask=(offs_m[:, None] < n) & (offs_n[None, :] < p))
+    out = alpha * acc + beta * c
+    tl.store(out_ptrs, out, mask=(offs_m[:, None] < n) & (offs_n[None, :] < p))
+
+@triton.jit
+def _symmetric_update_kernel(C_ptr, out_ptr, 
+                            n: tl.constexpr, p: tl.constexpr,
+                            alpha: tl.constexpr, beta: tl.constexpr,
+                            C_stride_0: tl.constexpr, C_stride_1: tl.constexpr,
+                            out_stride_0: tl.constexpr, out_stride_1: tl.constexpr,
+                            BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Compute block offsets
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    
+    # Load C tile
+    c_ptrs = C_ptr + (offs_m[:, None] * C_stride_0 + offs_k[None, :] * C_stride_1)
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    # Compute matrix multiplication C * C.T
+    for k in range(0, p, BLOCK_SIZE_K):
+        c = tl.load(c_ptrs, mask=(offs_m[:, None] < n) & (offs_k[None, :] < p - k))
+        c_t = tl.load(C_ptr + (offs_k[:, None] * C_stride_0 + offs_n[None, :] * C_stride_1), 
+                      mask=(offs_k[:, None] < p - k) & (offs_n[None, :] < p))
+        acc += tl.dot(c, c_t)
+        
+        # Advance pointers
+        c_ptrs += BLOCK_SIZE_K * C_stride_1
+    
+    # Scale and add to C
+    out_ptrs = out_ptr + (offs_m[:, None] * out_stride_0 + offs_n[None, :] * out_stride_1)
+    c = tl.load(out_ptrs, mask=(offs_m[:, None] < n) & (offs_n[None, :] < p))
+    out = alpha * acc + beta * c
+    tl.store(out_ptrs, out, mask=(offs_m[:, None] < n) & (offs_n[None, :] < p))
+
+def matrix_multiply_symmetric(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
+    # First operation: C = alpha * torch.mm(A, B) + beta * C
+    n, m = A.shape
+    m2, p = B.shape
+    assert m == m2, "Matrix dimensions incompatible for multiplication"
+    assert C.shape == (n, p), "C matrix has incorrect shape"
+    
+    # Create intermediate tensor for first operation
+    C_intermediate = torch.empty_like(C)
+    
+    # Launch first kernel
+    BLOCK_SIZE_M = 16
+    BLOCK_SIZE_N = 16
+    BLOCK_SIZE_K = 16
+    
+    grid_m = triton.cdiv(n, BLOCK_SIZE_M)
+    grid_n = triton.cdiv(p, BLOCK_SIZE_N)
+    grid = (grid_m, grid_n)
+    
+    _matmul_kernel[grid](
+        A, B, C, C_intermediate,
+        n, m, p,
+        alpha, beta,
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1),
+        C.stride(0), C.stride(1),
+        C_intermediate.stride(0), C_intermediate.stride(1),
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
+    )
+    
+    # Second operation: C = alpha * torch.mm(C_intermediate, C_intermediate.T) + beta * C
+    # We reuse C_intermediate as input and store result in C
+    _symmetric_update_kernel[grid](
+        C_intermediate, C,
+        n, p,
+        alpha, beta,
+        C_intermediate.stride(0), C_intermediate.stride(1),
+        C.stride(0), C.stride(1),
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
+    )
+    
+    return C
+
+##################################################################################################################################################
+
+
+
+import torch
+
+def test_matrix_multiply_symmetric():
+    results = {}
+
+    # Test Case 1: Basic test with 2x2 matrices
+    A = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device='cuda')
+    B = torch.tensor([[0.5, -1.0], [1.5, 2.0]], device='cuda')
+    C = torch.tensor([[1.0, 0.0], [0.0, 1.0]], device='cuda')
+    alpha, beta = 2.0, 0.5
+    results["test_case_1"] = matrix_multiply_symmetric(A, B, C, alpha, beta)
+
+    # Test Case 2: Test with identity matrices
+    A = torch.eye(3, device='cuda')
+    B = torch.eye(3, device='cuda')
+    C = torch.eye(3, device='cuda')
+    alpha, beta = 1.0, 1.0
+    results["test_case_2"] = matrix_multiply_symmetric(A, B, C, alpha, beta)
+
+    # Test Case 3: Test with zero matrices
+    A = torch.zeros((2, 2), device='cuda')
+    B = torch.zeros((2, 2), device='cuda')
+    C = torch.zeros((2, 2), device='cuda')
+    alpha, beta = 1.0, 1.0
+    results["test_case_3"] = matrix_multiply_symmetric(A, B, C, alpha, beta)
+
+    # Test Case 4: Test with different alpha and beta
+    A = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device='cuda')
+    B = torch.tensor([[0.5, -1.0], [1.5, 2.0]], device='cuda')
+    C = torch.tensor([[1.0, 0.0], [0.0, 1.0]], device='cuda')
+    alpha, beta = 0.5, 2.0
+    results["test_case_4"] = matrix_multiply_symmetric(A, B, C, alpha, beta)
+
+    return results
+
+test_results = test_matrix_multiply_symmetric()

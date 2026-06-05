@@ -1,0 +1,65 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def mul_relu_kernel(
+    input_ptr,
+    other_ptr,
+    output_ptr,
+    n_elements,
+    inplace: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    other = tl.load(other_ptr + offsets, mask=mask)
+    result = input * other
+    result = tl.where(result > 0, result, 0)
+    if inplace:
+        tl.store(input_ptr + offsets, result, mask=mask)
+    else:
+        tl.store(output_ptr + offsets, result, mask=mask)
+
+def mul_relu(input, other, inplace=False, out=None):
+    if inplace and not input.is_contiguous():
+        raise ValueError("Inplace operation requires input to be contiguous")
+    
+    if isinstance(other, (int, float)):
+        other = torch.tensor(other, dtype=input.dtype, device=input.device)
+    
+    if other.shape != input.shape:
+        if other.dim() == 0:
+            other = other.expand_as(input)
+        else:
+            raise ValueError("Shape mismatch between input and other")
+    
+    if out is None:
+        out = torch.empty_like(input)
+    
+    n_elements = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    if inplace:
+        mul_relu_kernel[grid](
+            input_ptr=input.data_ptr(),
+            other_ptr=other.data_ptr(),
+            output_ptr=None,
+            n_elements=n_elements,
+            inplace=True,
+            BLOCK_SIZE=BLOCK_SIZE
+        )
+        return input
+    else:
+        mul_relu_kernel[grid](
+            input_ptr=input.data_ptr(),
+            other_ptr=other.data_ptr(),
+            output_ptr=out.data_ptr(),
+            n_elements=n_elements,
+            inplace=False,
+            BLOCK_SIZE=BLOCK_SIZE
+        )
+        return out

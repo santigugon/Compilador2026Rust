@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are an expert Triton programmer.\n\nGenerate ONLY a single valid Python module.\nNo explanations.\nNo prose.\nNo markdown outside the code block.\nNo tests.\nNo example calls.\n\nThe module must contain:\n- imports\n- Triton kernels\n- wrapper function\n\nThe wrapper function must exactly match the required signature.\n\nWrap the entire response in ONE ```python``` block.\n"
+  },
+  {
+    "role": "user",
+    "content": "You are an expert in Trion programming, capable of writing corresponding Triton kernels and wrapper functions based on functional descriptions and function parameters. Ensure that the wrapper function fully corresponds to the provided function information.\nFunctional Description: Computes the bitwise AND operation between two tensors and then applies a Binomial distribution sampling based on the resulting tensor's values. First, it computes the bitwise AND of `input` and `other`. Then, the result is used as input for the Binomial distribution, with each element representing the number of trials with the probability specified in `probs` or `logits`.\nWrapper Entry Information: def bitwise_and_binomial(input: torch.Tensor, other: torch.Tensor, total_count: torch.Tensor, probs: torch.Tensor = None, logits: torch.Tensor = None) -> torch.Tensor: input (Tensor): The first input tensor of integral or Boolean type. other (Tensor): The second input tensor of integral or Boolean type. total_count (Tensor): Number of Bernoulli trials, must be broadcastable with `probs` or `logits`. probs (Tensor, optional): Event probabilities. Only one of `probs` or `logits` should be provided. logits (Tensor, optional): Event log-odds.\nAfter generation, verify if the Triton wrapper aligns with the provided func_inputs. If not, regenerate."
+  }
+]

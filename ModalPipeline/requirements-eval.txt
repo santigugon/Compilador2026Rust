@@ -1,0 +1,9 @@
+torch>=2.5.0
+triton
+numpy<2
+pandas
+pyarrow
+tqdm
+pyyaml
+jsonschema
+huggingface_hub

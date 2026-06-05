@@ -1,0 +1,4 @@
+quantization,correctness_rate,peak_gpu_memory_mb,mean_latency_ms
+awq_4bit,0.0,,3364.701174000004
+awq_8bit,0.0,,2394.8883950000095
+gptq_4bit,0.0,,3264.036223000062

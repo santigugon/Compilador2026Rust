@@ -1,0 +1,104 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _softplus_linear_kernel(
+    input_ptr, weight_ptr, bias_ptr, out_ptr,
+    n_rows: tl.constexpr, n_cols: tl.constexpr, n_features: tl.constexpr,
+    beta: tl.constexpr, threshold: tl.constexpr,
+    input_stride_row: tl.constexpr, input_stride_col: tl.constexpr,
+    weight_stride_row: tl.constexpr, weight_stride_col: tl.constexpr,
+    bias_stride: tl.constexpr,
+    out_stride_row: tl.constexpr, out_stride_col: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    row = pid
+    if row >= n_rows:
+        return
+    
+    # Load input row
+    input_offsets = row * input_stride_row + tl.arange(0, BLOCK_SIZE)
+    input_block = tl.load(input_ptr + input_offsets, mask=input_offsets < n_features, other=0.0)
+    
+    # Compute linear transformation: input @ weight.T + bias
+    out_offsets = row * out_stride_row + tl.arange(0, BLOCK_SIZE)
+    out_block = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    
+    # Accumulate linear transformation
+    for i in range(0, n_features, BLOCK_SIZE):
+        # Load weight column (transposed)
+        weight_offsets = i + tl.arange(0, BLOCK_SIZE)
+        weight_block = tl.load(weight_ptr + weight_offsets * weight_stride_col, mask=weight_offsets < n_features, other=0.0)
+        
+        # Load input element
+        input_val = tl.load(input_ptr + row * input_stride_row + i, mask=i < n_features, other=0.0)
+        
+        # Compute dot product
+        out_block += input_val * weight_block
+    
+    # Add bias if provided
+    if bias_ptr is not None:
+        bias_offsets = tl.arange(0, BLOCK_SIZE)
+        bias_block = tl.load(bias_ptr + bias_offsets, mask=bias_offsets < n_cols, other=0.0)
+        out_block += bias_block
+    
+    # Apply softplus activation
+    # Softplus(x) = (1/beta) * log(1 + exp(beta * x))
+    # For numerical stability, when x > threshold, we use x instead of softplus(x)
+    out_block = tl.where(
+        out_block > threshold,
+        out_block,
+        (1.0 / beta) * tl.log(1.0 + tl.exp(beta * out_block))
+    )
+    
+    # Store result
+    tl.store(out_ptr + out_offsets, out_block, mask=out_offsets < n_cols)
+
+def softplus_linear(input, weight, bias=None, beta=1, threshold=20):
+    # Validate inputs
+    if input.dim() != 2:
+        raise ValueError("input must be a 2D tensor")
+    if weight.dim() != 2:
+        raise ValueError("weight must be a 2D tensor")
+    if input.size(1) != weight.size(1):
+        raise ValueError("input size(1) must match weight size(1)")
+    if bias is not None and bias.size(0) != weight.size(0):
+        raise ValueError("bias size(0) must match weight size(0)")
+    
+    # Prepare output tensor
+    n_rows, n_features = input.shape
+    n_cols = weight.size(0)
+    out = torch.empty(n_rows, n_cols, dtype=input.dtype, device=input.device)
+    
+    # Set up kernel launch parameters
+    BLOCK_SIZE = 256
+    grid_size = triton.cdiv(n_rows, 1)
+    
+    # Launch kernel
+    if bias is not None:
+        _softplus_linear_kernel[grid_size](
+            input, weight, bias, out,
+            n_rows, n_cols, n_features,
+            beta, threshold,
+            input.stride(0), input.stride(1),
+            weight.stride(0), weight.stride(1),
+            bias.stride(0),
+            out.stride(0), out.stride(1),
+            BLOCK_SIZE
+        )
+    else:
+        # For bias=None, we pass a null pointer
+        _softplus_linear_kernel[grid_size](
+            input, weight, tl.tensor(0, dtype=tl.int64), out,
+            n_rows, n_cols, n_features,
+            beta, threshold,
+            input.stride(0), input.stride(1),
+            weight.stride(0), weight.stride(1),
+            0,  # bias_stride
+            out.stride(0), out.stride(1),
+            BLOCK_SIZE
+        )
+    
+    return out

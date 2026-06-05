@@ -1,0 +1,127 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fused_hardsigmoid_batch_norm_kernel(
+    x_ptr, 
+    running_mean_ptr, 
+    running_var_ptr, 
+    weight_ptr, 
+    bias_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    channels: tl.constexpr,
+    training: tl.constexpr,
+    momentum: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    # Get the program ID
+    pid = tl.program_id(0)
+    
+    # Each program handles one channel
+    channel = pid
+    
+    # Check if channel is valid
+    if channel >= channels:
+        return
+    
+    # Load running mean and variance for this channel
+    mean = tl.load(running_mean_ptr + channel)
+    var = tl.load(running_var_ptr + channel)
+    
+    # Calculate batch statistics if in training mode
+    if training:
+        # Compute mean and variance for this channel
+        channel_offsets = channel + tl.arange(0, BLOCK_SIZE) * channels
+        mask = channel_offsets < n_elements
+        
+        # Load input values for this channel
+        x_vals = tl.load(x_ptr + channel_offsets, mask=mask, other=0.0)
+        
+        # Compute mean
+        mean = tl.sum(x_vals) / BLOCK_SIZE
+        
+        # Compute variance
+        var = tl.sum((x_vals - mean) * (x_vals - mean)) / BLOCK_SIZE
+        
+        # Update running statistics
+        new_mean = (1 - momentum) * mean + momentum * mean
+        new_var = (1 - momentum) * var + momentum * var
+        
+        tl.store(running_mean_ptr + channel, new_mean)
+        tl.store(running_var_ptr + channel, new_var)
+    
+    # Normalize input
+    x_normalized = (x_ptr + channel_offsets) - mean
+    x_normalized = x_normalized / tl.sqrt(var + eps)
+    
+    # Apply weight and bias if provided
+    if weight_ptr is not None and bias_ptr is not None:
+        weight = tl.load(weight_ptr + channel)
+        bias = tl.load(bias_ptr + channel)
+        x_normalized = x_normalized * weight + bias
+    
+    # Apply Hardsigmoid activation
+    # Hardsigmoid: min(max(0, x + 3) / 6, 1)
+    hardsigmoid = tl.minimum(tl.maximum(x_normalized + 3.0, 0.0) / 6.0, 1.0)
+    
+    # Store result
+    tl.store(output_ptr + channel_offsets, hardsigmoid, mask=mask)
+
+def fused_hardsigmoid_batch_norm(
+    x: torch.Tensor,
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    weight: torch.Tensor = None,
+    bias: torch.Tensor = None,
+    training: bool = False,
+    momentum: float = 0.1,
+    eps: float = 1e-5,
+    inplace: bool = False
+) -> torch.Tensor:
+    # Handle scalar inputs
+    if x.dim() == 0:
+        x = x.unsqueeze(0)
+    
+    # Get input shape
+    batch_size = x.size(0)
+    channels = x.size(1)
+    spatial_size = x.numel() // (batch_size * channels)
+    
+    # Create output tensor
+    if inplace:
+        out = x
+    else:
+        out = torch.empty_like(x)
+    
+    # Flatten input for processing
+    x_flat = x.view(-1)
+    out_flat = out.view(-1)
+    
+    # Set up kernel launch parameters
+    n_elements = x_flat.numel()
+    BLOCK_SIZE = 256
+    grid = (channels,)
+    
+    # Launch kernel
+    _fused_hardsigmoid_batch_norm_kernel[grid](
+        x_flat,
+        running_mean,
+        running_var,
+        weight,
+        bias,
+        out_flat,
+        n_elements,
+        channels,
+        training,
+        momentum,
+        eps,
+        BLOCK_SIZE
+    )
+    
+    # Reshape output back to original shape
+    return out.view(x.shape)
+```

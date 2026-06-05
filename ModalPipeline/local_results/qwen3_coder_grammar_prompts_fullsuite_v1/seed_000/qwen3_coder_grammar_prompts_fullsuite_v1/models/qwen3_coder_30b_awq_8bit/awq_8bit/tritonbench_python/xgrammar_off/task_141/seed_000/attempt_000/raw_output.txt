@@ -1,0 +1,128 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _solve_kernel(A_ptr, B_ptr, out_ptr, n, batch_size, stride_a, stride_b, stride_out, BLOCK_SIZE: tl.constexpr):
+    batch_idx = tl.program_id(0)
+    tile_idx = tl.program_id(1)
+    
+    # Calculate offsets for batch
+    a_batch_offset = batch_idx * stride_a
+    b_batch_offset = batch_idx * stride_b
+    out_batch_offset = batch_idx * stride_out
+    
+    # Each tile processes BLOCK_SIZE rows
+    tile_start = tile_idx * BLOCK_SIZE
+    
+    # Shared memory for the tile
+    a_tile = tl.shared.load(A_ptr + a_batch_offset + tile_start * n + tl.arange(0, BLOCK_SIZE)[:, None] * n + tl.arange(0, BLOCK_SIZE)[None, :])
+    b_tile = tl.shared.load(B_ptr + b_batch_offset + tile_start * n + tl.arange(0, BLOCK_SIZE)[:, None] * n + tl.arange(0, n)[None, :])
+    
+    # Forward elimination
+    for k in range(0, min(BLOCK_SIZE, n - tile_start)):
+        # Find pivot
+        pivot_idx = k
+        pivot_val = a_tile[k, k]
+        for i in range(k + 1, min(BLOCK_SIZE, n - tile_start)):
+            if tl.abs(a_tile[i, k]) > tl.abs(pivot_val):
+                pivot_val = a_tile[i, k]
+                pivot_idx = i
+        
+        # Swap rows if needed
+        if pivot_idx != k:
+            for j in range(0, n):
+                temp = a_tile[k, j]
+                a_tile[k, j] = a_tile[pivot_idx, j]
+                a_tile[pivot_idx, j] = temp
+            for j in range(0, n):
+                temp = b_tile[k, j]
+                b_tile[k, j] = b_tile[pivot_idx, j]
+                b_tile[pivot_idx, j] = temp
+        
+        # Eliminate
+        pivot_inv = 1.0 / a_tile[k, k]
+        for i in range(k + 1, min(BLOCK_SIZE, n - tile_start)):
+            factor = a_tile[i, k] * pivot_inv
+            for j in range(k, n):
+                a_tile[i, j] = a_tile[i, j] - factor * a_tile[k, j]
+            for j in range(0, n):
+                b_tile[i, j] = b_tile[i, j] - factor * b_tile[k, j]
+    
+    # Back substitution
+    for k in range(min(BLOCK_SIZE, n - tile_start) - 1, -1, -1):
+        for i in range(0, k):
+            for j in range(0, n):
+                b_tile[i, j] = b_tile[i, j] - a_tile[i, k] * b_tile[k, j]
+        pivot_inv = 1.0 / a_tile[k, k]
+        for j in range(0, n):
+            b_tile[k, j] = b_tile[k, j] * pivot_inv
+    
+    # Store result
+    for i in range(0, min(BLOCK_SIZE, n - tile_start)):
+        for j in range(0, n):
+            tl.store(out_ptr + out_batch_offset + (tile_start + i) * n + j, b_tile[i, j])
+
+def solve(A, B, *, left=True, out=None):
+    if not left:
+        raise NotImplementedError("Only left solve is supported")
+    
+    if A.dtype not in [torch.float32, torch.float64, torch.complex64, torch.complex128]:
+        raise ValueError("Only float32, float64, complex64, and complex128 are supported")
+    
+    if B.dtype != A.dtype:
+        raise ValueError("A and B must have the same dtype")
+    
+    if A.dim() < 2 or B.dim() < 2:
+        raise ValueError("A and B must have at least 2 dimensions")
+    
+    if A.shape[-2] != A.shape[-1]:
+        raise ValueError("A must be square")
+    
+    if A.shape[-1] != B.shape[-2]:
+        raise ValueError("A and B dimensions do not match for matrix multiplication")
+    
+    # Handle batch dimensions
+    batch_dims_A = A.shape[:-2]
+    batch_dims_B = B.shape[:-2]
+    
+    if batch_dims_A != batch_dims_B:
+        raise ValueError("Batch dimensions of A and B must match")
+    
+    batch_size = 1
+    for dim in batch_dims_A:
+        batch_size *= dim
+    
+    n = A.shape[-1]
+    
+    # Prepare output tensor
+    if out is None:
+        out = torch.empty_like(B)
+    else:
+        if out.shape != B.shape:
+            raise ValueError("Output tensor must have the same shape as B")
+    
+    # Launch kernel
+    BLOCK_SIZE = 32
+    grid = (batch_size, (n + BLOCK_SIZE - 1) // BLOCK_SIZE)
+    
+    # Get pointers
+    A_ptr = A.data_ptr()
+    B_ptr = B.data_ptr()
+    out_ptr = out.data_ptr()
+    
+    # Get strides
+    stride_a = A.stride(-2) * A.shape[-2] if A.shape[-2] > 0 else 0
+    stride_b = B.stride(-2) * B.shape[-2] if B.shape[-2] > 0 else 0
+    stride_out = out.stride(-2) * out.shape[-2] if out.shape[-2] > 0 else 0
+    
+    # Launch kernel
+    _solve_kernel[grid](
+        A_ptr, B_ptr, out_ptr, n, batch_size, 
+        stride_a, stride_b, stride_out, 
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return out
+```

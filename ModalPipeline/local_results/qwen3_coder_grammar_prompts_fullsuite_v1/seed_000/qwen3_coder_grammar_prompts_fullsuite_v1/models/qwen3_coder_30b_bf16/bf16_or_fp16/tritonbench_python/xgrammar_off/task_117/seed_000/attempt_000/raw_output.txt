@@ -1,0 +1,69 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _logspace_kernel(start_ptr, end_ptr, out_ptr, steps: tl.constexpr, base: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < steps
+    
+    # Load start and end values (they are scalars, so we broadcast them)
+    start_val = tl.load(start_ptr)
+    end_val = tl.load(end_ptr)
+    
+    # Compute the logarithmic spacing
+    # We want: base^(start + i * (end - start) / (steps - 1)) for i in [0, steps-1]
+    # This is equivalent to: base^(start) * base^(i * (end - start) / (steps - 1))
+    # Which can be computed as: base^(start) * (base^(end - start))^(i / (steps - 1))
+    
+    # For each element, compute its index
+    i = offsets
+    
+    # Compute the exponent: start + i * (end - start) / (steps - 1)
+    # Handle the case where steps = 1 to avoid division by zero
+    if steps == 1:
+        exponent = start_val
+    else:
+        exponent = start_val + i * (end_val - start_val) / (steps - 1)
+    
+    # Compute base^exponent
+    result = tl.exp(exponent * tl.log(base))
+    
+    tl.store(out_ptr + offsets, result, mask=mask)
+
+def logspace(start, end, steps, base=10.0, *, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False):
+    # Handle scalar inputs
+    if not torch.is_tensor(start):
+        start = torch.tensor(start, dtype=torch.get_default_dtype())
+    if not torch.is_tensor(end):
+        end = torch.tensor(end, dtype=torch.get_default_dtype())
+    
+    # Validate steps
+    if steps <= 0:
+        raise ValueError("steps must be positive")
+    
+    # Determine output tensor
+    if out is not None:
+        result = out
+    else:
+        # Create output tensor with appropriate dtype and device
+        if dtype is None:
+            dtype = torch.get_default_dtype()
+        result = torch.empty(steps, dtype=dtype, device=device, layout=layout, requires_grad=requires_grad)
+    
+    # Handle special case of steps = 1
+    if steps == 1:
+        with torch.no_grad():
+            result.fill_(torch.pow(base, start.item()))
+        return result
+    
+    # Launch kernel
+    block = 256
+    grid = (triton.cdiv(steps, block),)
+    
+    _logspace_kernel[grid](start, end, result, steps, base, BLOCK=block)
+    
+    return result
+```

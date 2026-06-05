@@ -1,0 +1,67 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def scaled_add_norm_kernel(
+    y_ptr, x_ptr, output_ptr,
+    n,
+    alpha,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offset = pid * BLOCK_SIZE
+    x_block = tl.load(x_ptr + offset, mask=offset + tl.arange(0, BLOCK_SIZE) < n)
+    y_block = tl.load(y_ptr + offset, mask=offset + tl.arange(0, BLOCK_SIZE) < n)
+    
+    y_block = y_block + alpha * x_block
+    tl.store(y_ptr + offset, y_block, mask=offset + tl.arange(0, BLOCK_SIZE) < n)
+    
+    # Compute squared sum for norm
+    square_block = y_block * y_block
+    tl.store(output_ptr + offset, square_block, mask=offset + tl.arange(0, BLOCK_SIZE) < n)
+
+@triton.jit
+def reduce_sum_kernel(
+    input_ptr, output_ptr, n, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offset = pid * BLOCK_SIZE
+    block = tl.load(input_ptr + offset, mask=offset + tl.arange(0, BLOCK_SIZE) < n)
+    sum_block = tl.sum(block, axis=0)
+    tl.store(output_ptr + pid, sum_block)
+
+def scaled_add_norm(y: torch.Tensor, x: torch.Tensor, alpha: float) -> torch.Tensor:
+    assert y.shape == x.shape, "y and x must have the same shape"
+    n = y.shape[0]
+    
+    # Create output tensor for squared values
+    output_squared = torch.empty(n, device=y.device, dtype=torch.float32)
+    
+    # Launch kernel to compute y += alpha * x and store squared values
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n, BLOCK_SIZE),)
+    
+    scaled_add_norm_kernel[grid](
+        y_ptr=y.data_ptr(),
+        x_ptr=x.data_ptr(),
+        output_ptr=output_squared.data_ptr(),
+        n=n,
+        alpha=alpha,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    # Compute sum of squares
+    sum_output = torch.empty(grid[0], device=y.device, dtype=torch.float32)
+    reduce_sum_kernel[grid](
+        input_ptr=output_squared.data_ptr(),
+        output_ptr=sum_output.data_ptr(),
+        n=n,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    # Reduce final sum
+    total_sum = torch.sum(sum_output)
+    
+    # Return sqrt of sum (2-norm)
+    return torch.sqrt(total_sum)

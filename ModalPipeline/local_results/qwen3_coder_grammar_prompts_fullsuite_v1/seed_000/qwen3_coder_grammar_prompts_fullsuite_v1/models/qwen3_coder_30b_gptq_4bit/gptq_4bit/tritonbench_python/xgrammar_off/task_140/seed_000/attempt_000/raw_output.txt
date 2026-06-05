@@ -1,0 +1,89 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def tril_mm_and_scale_kernel(
+    A_ptr, B_ptr, out_ptr,
+    n, p,
+    alpha, beta,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr
+):
+    # Compute output matrix
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    # Loop over k dimension
+    for k in range(0, n, BLOCK_SIZE_K):
+        # Load A tile (lower triangular part)
+        a_tile = tl.load(
+            A_ptr + (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)[:, None]) * n +
+            (k + tl.arange(0, BLOCK_SIZE_K)[None, :]) * 1
+        )
+        # Create lower triangular mask
+        mask = tl.arange(0, BLOCK_SIZE_M)[:, None] >= tl.arange(0, BLOCK_SIZE_K)[None, :]
+        a_tile = tl.where(mask, a_tile, 0.0)
+        
+        # Load B tile
+        b_tile = tl.load(
+            B_ptr + (k + tl.arange(0, BLOCK_SIZE_K)[None, :]) * p +
+            (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)[None, :]) * 1
+        )
+        
+        # Accumulate
+        acc += tl.dot(a_tile, b_tile)
+    
+    # Scale by alpha
+    acc *= alpha
+    
+    # Scale by beta
+    acc *= beta
+    
+    # Write output
+    tl.store(
+        out_ptr + (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)[:, None]) * p +
+        (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)[None, :]) * 1,
+        acc
+    )
+
+def tril_mm_and_scale(A: torch.Tensor, B: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
+    # Ensure inputs are contiguous
+    A = A.contiguous()
+    B = B.contiguous()
+    
+    # Get dimensions
+    n, p = B.shape
+    assert A.shape == (n, n), "Matrix A must be square"
+    
+    # Create output tensor
+    out = torch.empty(n, p, dtype=torch.float32, device=A.device)
+    
+    # Define block sizes
+    BLOCK_SIZE_M = 32
+    BLOCK_SIZE_N = 32
+    BLOCK_SIZE_K = 32
+    
+    # Launch kernel
+    grid = (triton.cdiv(n, BLOCK_SIZE_M), triton.cdiv(p, BLOCK_SIZE_N))
+    
+    tril_mm_and_scale_kernel[grid](
+        A_ptr=A,
+        B_ptr=B,
+        out_ptr=out,
+        n=n,
+        p=p,
+        alpha=alpha,
+        beta=beta,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K
+    )
+    
+    return out
+```

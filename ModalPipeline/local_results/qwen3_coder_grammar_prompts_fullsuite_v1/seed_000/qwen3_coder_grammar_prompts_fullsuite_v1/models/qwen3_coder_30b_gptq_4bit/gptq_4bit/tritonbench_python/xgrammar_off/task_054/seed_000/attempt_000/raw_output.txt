@@ -1,0 +1,158 @@
+```python
+import torch
+import triton
+import triton.language as tl
+from typing import Optional, Union, Tuple
+
+@triton.jit
+def gelu_kernel(
+    input_ptr,
+    weight_ptr,
+    bias_ptr,
+    output_ptr,
+    iH,
+    iW,
+    oH,
+    oW,
+    in_channels,
+    out_channels,
+    kH,
+    kW,
+    stride_h,
+    stride_w,
+    pad_h,
+    pad_w,
+    dilation_h,
+    dilation_w,
+    groups,
+    approximate,
+    BLOCK_SIZE_H,
+    BLOCK_SIZE_W,
+    BLOCK_SIZE_C,
+):
+    pid = tl.program_id(axis=0)
+    tile_id = pid // (BLOCK_SIZE_H * BLOCK_SIZE_W)
+    tile_h = tile_id // BLOCK_SIZE_W
+    tile_w = tile_id % BLOCK_SIZE_W
+    
+    # Compute output indices
+    out_h = tile_h * BLOCK_SIZE_H
+    out_w = tile_w * BLOCK_SIZE_W
+    
+    # Load input tile
+    input_tile = tl.load(input_ptr + out_h * iW + out_w, mask=(out_h < oH) & (out_w < oW))
+    
+    # Perform convolution
+    output = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_W), dtype=tl.float32)
+    for g in range(groups):
+        for oc in range(out_channels // groups):
+            for ic in range(in_channels // groups):
+                for kh in range(kH):
+                    for kw in range(kW):
+                        ih = out_h * stride_h + kh * dilation_h - pad_h
+                        iw = out_w * stride_w + kw * dilation_w - pad_w
+                        if ih >= 0 and ih < iH and iw >= 0 and iw < iW:
+                            input_val = tl.load(input_ptr + ih * iW + iw)
+                            weight_val = tl.load(weight_ptr + oc * (in_channels // groups) + ic + kh * kW + kw)
+                            output += input_val * weight_val
+    
+    # Apply bias if present
+    if bias_ptr is not None:
+        for oc in range(out_channels):
+            output += tl.load(bias_ptr + oc)
+    
+    # Apply GELU activation
+    if approximate == 'tanh':
+        output = 0.5 * output * (1 + tl.tanh(0.7978845608 * (output + 0.044715 * output * output * output)))
+    else:
+        output = 0.5 * output * (1 + tl.erf(output / tl.sqrt(2.0)))
+    
+    # Store result
+    tl.store(output_ptr + out_h * oW + out_w, output, mask=(out_h < oH) & (out_w < oW))
+
+def gelu_conv2d(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    stride: Union[int, Tuple[int, int]] = 1,
+    padding: Union[int, Tuple[int, int], str] = 0,
+    dilation: Union[int, Tuple[int, int]] = 1,
+    groups: int = 1,
+    approximate: str = 'none',
+    out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    # Parse stride
+    if isinstance(stride, int):
+        stride_h = stride_w = stride
+    else:
+        stride_h, stride_w = stride
+    
+    # Parse padding
+    if isinstance(padding, str):
+        if padding == 'valid':
+            pad_h = pad_w = 0
+        elif padding == 'same':
+            pad_h = (weight.shape[2] - 1) * dilation_h // 2
+            pad_w = (weight.shape[3] - 1) * dilation_w // 2
+        else:
+            raise ValueError("Invalid padding string")
+    elif isinstance(padding, int):
+        pad_h = pad_w = padding
+    else:
+        pad_h, pad_w = padding
+    
+    # Parse dilation
+    if isinstance(dilation, int):
+        dilation_h = dilation_w = dilation
+    else:
+        dilation_h, dilation_w = dilation
+    
+    # Get dimensions
+    minibatch, in_channels, iH, iW = input.shape
+    out_channels, _, kH, kW = weight.shape
+    
+    # Compute output dimensions
+    oH = (iH + 2 * pad_h - (dilation_h * (kH - 1) + 1)) // stride_h + 1
+    oW = (iW + 2 * pad_w - (dilation_w * (kW - 1) + 1)) // stride_w + 1
+    
+    # Initialize output tensor
+    if out is None:
+        output = torch.empty(minibatch, out_channels, oH, oW, device=input.device, dtype=input.dtype)
+    else:
+        output = out
+    
+    # Launch kernel
+    BLOCK_SIZE_H = 16
+    BLOCK_SIZE_W = 16
+    BLOCK_SIZE_C = 32
+    
+    grid = (minibatch * out_channels * oH * oW + BLOCK_SIZE_H * BLOCK_SIZE_W - 1) // (BLOCK_SIZE_H * BLOCK_SIZE_W)
+    
+    gelu_kernel[grid](
+        input_ptr=input.data_ptr(),
+        weight_ptr=weight.data_ptr(),
+        bias_ptr=bias.data_ptr() if bias is not None else None,
+        output_ptr=output.data_ptr(),
+        iH=iH,
+        iW=iW,
+        oH=oH,
+        oW=oW,
+        in_channels=in_channels,
+        out_channels=out_channels,
+        kH=kH,
+        kW=kW,
+        stride_h=stride_h,
+        stride_w=stride_w,
+        pad_h=pad_h,
+        pad_w=pad_w,
+        dilation_h=dilation_h,
+        dilation_w=dilation_w,
+        groups=groups,
+        approximate=approximate,
+        BLOCK_SIZE_H=BLOCK_SIZE_H,
+        BLOCK_SIZE_W=BLOCK_SIZE_W,
+        BLOCK_SIZE_C=BLOCK_SIZE_C
+    )
+    
+    return output
+```

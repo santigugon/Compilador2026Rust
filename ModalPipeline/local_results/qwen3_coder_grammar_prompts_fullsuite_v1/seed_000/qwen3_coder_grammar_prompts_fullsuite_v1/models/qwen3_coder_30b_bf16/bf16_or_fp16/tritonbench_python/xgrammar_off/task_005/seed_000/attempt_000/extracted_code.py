@@ -1,0 +1,39 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _relu_sqrt_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    # Apply ReLU: set negative values to zero
+    x = tl.maximum(x, 0.0)
+    # Apply square root
+    y = tl.sqrt(x)
+    tl.store(out_ptr + offsets, y, mask=mask)
+
+def relu_sqrt(input, inplace=False, out=None):
+    if inplace:
+        # For inplace operation, we need to ensure the input is contiguous
+        input = input.contiguous()
+        out = input
+        n = input.numel()
+        block = 256
+        grid = (triton.cdiv(n, block),)
+        _relu_sqrt_kernel[grid](input, out, n, BLOCK=block)
+        return out
+    else:
+        # For non-inplace operation, create a new output tensor
+        if out is not None:
+            # If out is provided, it should have the same shape as input
+            out = torch.empty_like(input)
+        else:
+            out = torch.empty_like(input)
+        
+        n = input.numel()
+        block = 256
+        grid = (triton.cdiv(n, block),)
+        _relu_sqrt_kernel[grid](input, out, n, BLOCK=block)
+        return out

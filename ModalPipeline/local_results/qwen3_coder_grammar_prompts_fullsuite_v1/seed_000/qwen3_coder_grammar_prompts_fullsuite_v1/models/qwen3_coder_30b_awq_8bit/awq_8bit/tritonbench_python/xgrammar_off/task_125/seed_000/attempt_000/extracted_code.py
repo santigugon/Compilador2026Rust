@@ -1,0 +1,27 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def sigmoid_kernel(X, Y, N, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offset < N
+    x = tl.load(X + offset, mask=mask)
+    y = 1.0 / (1.0 + tl.exp(-x))
+    tl.store(Y + offset, y, mask=mask)
+
+def sigmoid(input, *, out=None):
+    if out is None:
+        out = torch.empty_like(input)
+    else:
+        assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
+        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input tensor"
+    
+    N = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(N, BLOCK_SIZE),)
+    
+    sigmoid_kernel[grid](input, out, N, BLOCK_SIZE=BLOCK_SIZE)
+    
+    return out

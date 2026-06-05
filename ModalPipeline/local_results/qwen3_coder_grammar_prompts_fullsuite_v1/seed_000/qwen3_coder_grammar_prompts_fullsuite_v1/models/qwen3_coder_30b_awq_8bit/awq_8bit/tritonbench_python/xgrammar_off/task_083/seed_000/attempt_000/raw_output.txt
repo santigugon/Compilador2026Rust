@@ -1,0 +1,157 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fused_bmm_dropout_gelu_kernel(
+    input1_ptr, input2_ptr, output_ptr, 
+    dropout_mask_ptr,
+    B, N, M, P,
+    p,
+    training,
+    inplace,
+    approximate,
+    stride_input1_b, stride_input1_n, stride_input1_m,
+    stride_input2_b, stride_input2_m, stride_input2_p,
+    stride_output_b, stride_output_n, stride_output_p,
+    stride_mask_b, stride_mask_n, stride_mask_p,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    # Get block indices
+    block_idx = tl.program_id(0)
+    block_idy = tl.program_id(1)
+    block_idz = tl.program_id(2)
+    
+    # Compute batch, row, and column indices
+    batch_idx = block_idz
+    row_idx = block_idx * BLOCK_SIZE_M
+    col_idx = block_idy * BLOCK_SIZE_N
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    # Loop over K dimension
+    for k in range(0, M, BLOCK_SIZE_K):
+        # Load input1 and input2 tiles
+        input1_tile = tl.load(
+            input1_ptr + 
+            batch_idx * stride_input1_b + 
+            row_idx * stride_input1_n + 
+            k * stride_input1_m,
+            mask=(row_idx + tl.arange(0, BLOCK_SIZE_M)[:, None] < N) &
+                 (k + tl.arange(0, BLOCK_SIZE_K)[None, :] < M),
+            other=0.0
+        )
+        input2_tile = tl.load(
+            input2_ptr + 
+            batch_idx * stride_input2_b + 
+            k * stride_input2_m + 
+            col_idx * stride_input2_p,
+            mask=(k + tl.arange(0, BLOCK_SIZE_K)[:, None] < M) &
+                 (col_idx + tl.arange(0, BLOCK_SIZE_N)[None, :] < P),
+            other=0.0
+        )
+        
+        # Matrix multiplication
+        acc += tl.dot(input1_tile, input2_tile)
+    
+    # Apply GELU activation
+    if approximate == "tanh":
+        # Approximate GELU using tanh
+        acc = acc * 0.5 * (1.0 + tl.tanh(0.7978845608028654 * acc * (1.0 + 0.044715 * acc * acc)))
+    else:
+        # Exact GELU
+        acc = acc * 0.5 * (1.0 + tl.erf(acc / tl.sqrt(2.0)))
+    
+    # Apply dropout if training
+    if training:
+        # Generate random mask
+        mask = tl.rand(
+            row_idx + tl.arange(0, BLOCK_SIZE_M)[:, None],
+            col_idx + tl.arange(0, BLOCK_SIZE_N)[None, :]
+        ) > p
+        # Apply mask
+        acc = acc * mask / (1.0 - p)
+    
+    # Store result
+    output_tile = acc.to(tl.float32)
+    tl.store(
+        output_ptr + 
+        batch_idx * stride_output_b + 
+        row_idx * stride_output_n + 
+        col_idx * stride_output_p,
+        output_tile,
+        mask=(row_idx + tl.arange(0, BLOCK_SIZE_M)[:, None] < N) &
+             (col_idx + tl.arange(0, BLOCK_SIZE_N)[None, :] < P)
+    )
+
+def fused_bmm_dropout_gelu(input1, input2, p=0.5, training=True, inplace=False, approximate='none', *, out=None):
+    # Validate inputs
+    assert input1.dim() == 3 and input2.dim() == 3
+    assert input1.size(0) == input2.size(0)  # Batch size must match
+    assert input1.size(2) == input2.size(1)  # Inner dimension must match
+    
+    B, N, M = input1.shape
+    _, _, P = input2.shape
+    
+    # Create output tensor
+    if out is None:
+        out = torch.empty(B, N, P, dtype=input1.dtype, device=input1.device)
+    else:
+        assert out.shape == (B, N, P)
+        assert out.dtype == input1.dtype
+        assert out.device == input1.device
+    
+    # Define block sizes
+    BLOCK_SIZE_M = 16
+    BLOCK_SIZE_N = 16
+    BLOCK_SIZE_K = 32
+    
+    # Launch kernel
+    grid = (
+        triton.cdiv(N, BLOCK_SIZE_M),
+        triton.cdiv(P, BLOCK_SIZE_N),
+        B
+    )
+    
+    # Compute strides
+    stride_input1_b, stride_input1_n, stride_input1_m = input1.stride()
+    stride_input2_b, stride_input2_m, stride_input2_p = input2.stride()
+    stride_output_b, stride_output_n, stride_output_p = out.stride()
+    
+    # Launch kernel
+    _fused_bmm_dropout_gelu_kernel[grid](
+        input1_ptr=input1.data_ptr(),
+        input2_ptr=input2.data_ptr(),
+        output_ptr=out.data_ptr(),
+        dropout_mask_ptr=None,
+        B=B,
+        N=N,
+        M=M,
+        P=P,
+        p=p,
+        training=training,
+        inplace=inplace,
+        approximate=approximate,
+        stride_input1_b=stride_input1_b,
+        stride_input1_n=stride_input1_n,
+        stride_input1_m=stride_input1_m,
+        stride_input2_b=stride_input2_b,
+        stride_input2_m=stride_input2_m,
+        stride_input2_p=stride_input2_p,
+        stride_output_b=stride_output_b,
+        stride_output_n=stride_output_n,
+        stride_output_p=stride_output_p,
+        stride_mask_b=0,
+        stride_mask_n=0,
+        stride_mask_p=0,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K
+    )
+    
+    return out
+```

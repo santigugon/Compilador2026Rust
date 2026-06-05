@@ -1,0 +1,78 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def softmax_log_kernel(
+    input_ptr,
+    output_ptr,
+    n_cols,
+    dim,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row = pid
+    input_row = input_ptr + row * n_cols
+    output_row = output_ptr + row * n_cols
+    
+    # Load input data
+    values = tl.load(input_row + tl.arange(0, BLOCK_SIZE), mask=tl.arange(0, BLOCK_SIZE) < n_cols)
+    
+    # Apply log
+    values = tl.log(values)
+    
+    # Apply softmax
+    # For softmax along a specific dimension, we need to handle the reduction properly
+    # This is a simplified version assuming we're working with a single row
+    # In practice, this would need more complex logic for multi-dimensional cases
+    
+    # Compute max for numerical stability
+    max_val = tl.max(values)
+    # Subtract max for numerical stability
+    values = values - max_val
+    # Compute exp
+    values = tl.exp(values)
+    # Compute sum
+    sum_val = tl.sum(values)
+    # Normalize
+    values = values / sum_val
+    
+    # Store result
+    tl.store(output_row + tl.arange(0, BLOCK_SIZE), values, mask=tl.arange(0, BLOCK_SIZE) < n_cols)
+
+def softmax_log(input, dim=-1, dtype=None):
+    if dtype is not None:
+        input = input.to(dtype)
+    
+    # Ensure input is contiguous
+    input = input.contiguous()
+    
+    # Get output tensor
+    output = torch.empty_like(input)
+    
+    # Handle different dimensions
+    if dim < 0:
+        dim = input.dim() + dim
+    
+    # For simplicity, we'll implement a basic version that works for the last dimension
+    # In a full implementation, we'd need to handle arbitrary dimensions properly
+    if dim == input.dim() - 1:
+        # Get the size of the last dimension
+        n_cols = input.shape[-1]
+        # Calculate grid size
+        grid = (input.shape[0] * input.shape[1] if input.dim() > 2 else input.shape[0],)
+        # Launch kernel
+        softmax_log_kernel[grid](
+            input_ptr=input.data_ptr(),
+            output_ptr=output.data_ptr(),
+            n_cols=n_cols,
+            dim=dim,
+            BLOCK_SIZE=1024
+        )
+    else:
+        # For other dimensions, we need to handle the reduction differently
+        # This is a simplified version that works for the last dimension
+        # A full implementation would require more complex logic
+        raise NotImplementedError("Only last dimension softmax_log is currently supported")
+    
+    return output

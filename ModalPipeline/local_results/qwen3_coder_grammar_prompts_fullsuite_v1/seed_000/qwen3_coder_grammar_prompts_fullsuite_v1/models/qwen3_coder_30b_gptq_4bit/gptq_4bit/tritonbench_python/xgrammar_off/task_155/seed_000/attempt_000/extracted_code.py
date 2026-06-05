@@ -1,0 +1,130 @@
+import torch
+import triton
+import triton.language as tl
+from typing import Union, Tuple, Optional
+
+@triton.jit
+def conv2d_add_kernel(
+    input_ptr, weight_ptr, bias_ptr, other_ptr, output_ptr,
+    iH, iW, oH, oW, in_channels, out_channels, kH, kW,
+    stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w,
+    groups, alpha,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    # Get the block indices
+    block_id_m = tl.program_id(0)
+    block_id_n = tl.program_id(1)
+    block_id_k = tl.program_id(2)
+    
+    # Compute the starting indices for the block
+    start_m = block_id_m * BLOCK_SIZE_M
+    start_n = block_id_n * BLOCK_SIZE_N
+    start_k = block_id_k * BLOCK_SIZE_K
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    # Loop over the k dimension
+    for k in range(0, in_channels * kH * kW // BLOCK_SIZE_K):
+        # Load input and weight
+        input_tile = tl.load(input_ptr + start_m + k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_M), mask=(start_m + tl.arange(0, BLOCK_SIZE_M)) < iH * iW)
+        weight_tile = tl.load(weight_ptr + start_n + k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_N), mask=(start_n + tl.arange(0, BLOCK_SIZE_N)) < kH * kW)
+        
+        # Compute dot product
+        acc += tl.dot(input_tile, weight_tile)
+    
+    # Apply bias if present
+    if bias_ptr is not None:
+        bias_tile = tl.load(bias_ptr + start_n + tl.arange(0, BLOCK_SIZE_N), mask=(start_n + tl.arange(0, BLOCK_SIZE_N)) < out_channels)
+        acc += bias_tile
+    
+    # Apply other tensor if present
+    if other_ptr is not None:
+        other_tile = tl.load(other_ptr + start_m + tl.arange(0, BLOCK_SIZE_M), mask=(start_m + tl.arange(0, BLOCK_SIZE_M)) < iH * iW)
+        acc += alpha * other_tile
+    
+    # Store result
+    tl.store(output_ptr + start_m + tl.arange(0, BLOCK_SIZE_M), acc)
+
+def conv2d_add(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    other: Optional[Union[torch.Tensor, float]] = None,
+    stride: Union[int, Tuple[int, int]] = 1,
+    padding: Union[int, Tuple[int, int], str] = 0,
+    dilation: Union[int, Tuple[int, int]] = 1,
+    groups: int = 1,
+    alpha: float = 1,
+    out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    # Handle stride
+    if isinstance(stride, int):
+        stride_h = stride_w = stride
+    else:
+        stride_h, stride_w = stride
+    
+    # Handle padding
+    if isinstance(padding, str):
+        if padding == 'valid':
+            pad_h = pad_w = 0
+        elif padding == 'same':
+            pad_h = pad_w = 0
+        else:
+            raise ValueError("Padding must be 'valid', 'same', or an integer/tuple")
+    elif isinstance(padding, int):
+        pad_h = pad_w = padding
+    else:
+        pad_h, pad_w = padding
+    
+    # Handle dilation
+    if isinstance(dilation, int):
+        dilation_h = dilation_w = dilation
+    else:
+        dilation_h, dilation_w = dilation
+    
+    # Get dimensions
+    minibatch, in_channels, iH, iW = input.shape
+    out_channels, _, kH, kW = weight.shape
+    
+    # Compute output dimensions
+    oH = (iH + 2 * pad_h - (dilation_h * (kH - 1) + 1)) // stride_h + 1
+    oW = (iW + 2 * pad_w - (dilation_w * (kW - 1) + 1)) // stride_w + 1
+    
+    # Allocate output tensor if not provided
+    if out is None:
+        out = torch.empty((minibatch, out_channels, oH, oW), device=input.device, dtype=input.dtype)
+    
+    # Prepare for kernel launch
+    BLOCK_SIZE_M = 16
+    BLOCK_SIZE_N = 16
+    BLOCK_SIZE_K = 16
+    GROUP_SIZE_M = 8
+    
+    # Launch kernel
+    grid = (
+        triton.cdiv(oH * oW, BLOCK_SIZE_M),
+        triton.cdiv(out_channels, BLOCK_SIZE_N),
+        triton.cdiv(in_channels * kH * kW, BLOCK_SIZE_K)
+    )
+    
+    # Create kernel arguments
+    input_ptr = input.data_ptr()
+    weight_ptr = weight.data_ptr()
+    bias_ptr = bias.data_ptr() if bias is not None else None
+    other_ptr = other.data_ptr() if isinstance(other, torch.Tensor) else None
+    output_ptr = out.data_ptr()
+    
+    # Launch kernel
+    conv2d_add_kernel[grid](
+        input_ptr, weight_ptr, bias_ptr, other_ptr, output_ptr,
+        iH, iW, oH, oW, in_channels, out_channels, kH, kW,
+        stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w,
+        groups, alpha,
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
+    )
+    
+    return out

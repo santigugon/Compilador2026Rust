@@ -1,0 +1,201 @@
+import torch
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def conv2d_kernel(
+    input_ptr, weight_ptr, bias_ptr, output_ptr,
+    input_height, input_width,
+    output_height, output_width,
+    in_channels, out_channels,
+    kernel_height, kernel_width,
+    stride_h, stride_w,
+    padding_h, padding_w,
+    dilation_h, dilation_w,
+    groups,
+    BLOCK_SIZE_H, BLOCK_SIZE_W,
+    NUM_GROUPS
+):
+    # Get thread indices
+    pid_h = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    pid_c = tl.program_id(2)
+    
+    # Calculate output dimensions
+    out_h = output_height
+    out_w = output_width
+    
+    # Shared memory for input tile
+    tile_size_h = BLOCK_SIZE_H + 2 * padding_h + (kernel_height - 1) * dilation_h
+    tile_size_w = BLOCK_SIZE_W + 2 * padding_w + (kernel_width - 1) * dilation_w
+    
+    # Load input tile
+    input_tile = tl.shared.load(input_ptr + pid_h * BLOCK_SIZE_H + pid_w * BLOCK_SIZE_W, 
+                               tile_size_h, tile_size_w)
+    
+    # Load weight and bias
+    weight = tl.load(weight_ptr + pid_c * in_channels * kernel_height * kernel_width)
+    bias = tl.load(bias_ptr + pid_c) if bias_ptr is not None else 0.0
+    
+    # Perform convolution
+    output = 0.0
+    for i in range(kernel_height):
+        for j in range(kernel_width):
+            input_val = input_tile[i * dilation_h + padding_h][j * dilation_w + padding_w]
+            weight_val = weight[i * kernel_width + j]
+            output += input_val * weight_val
+    
+    output += bias
+    
+    # Store result
+    tl.store(output_ptr + pid_h * out_w + pid_w, output)
+
+@triton.jit
+def max_pool2d_kernel(
+    input_ptr, output_ptr,
+    input_height, input_width,
+    output_height, output_width,
+    kernel_h, kernel_w,
+    stride_h, stride_w,
+    padding_h, padding_w,
+    dilation_h, dilation_w,
+    BLOCK_SIZE_H, BLOCK_SIZE_W
+):
+    # Get thread indices
+    pid_h = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    
+    # Calculate output dimensions
+    out_h = output_height
+    out_w = output_width
+    
+    # Load input tile
+    input_tile = tl.shared.load(input_ptr + pid_h * BLOCK_SIZE_H + pid_w * BLOCK_SIZE_W, 
+                               BLOCK_SIZE_H, BLOCK_SIZE_W)
+    
+    # Perform max pooling
+    max_val = -float('inf')
+    for i in range(kernel_h):
+        for j in range(kernel_w):
+            input_val = input_tile[i * dilation_h + padding_h][j * dilation_w + padding_w]
+            max_val = tl.maximum(max_val, input_val)
+    
+    # Store result
+    tl.store(output_ptr + pid_h * out_w + pid_w, max_val)
+
+def relu_max_pool2d_conv2d(
+    input, weight, bias=None, conv_stride=1, conv_padding=0, conv_dilation=1, conv_groups=1,
+    pool_kernel_size=2, pool_stride=None, pool_padding=0, pool_dilation=1, pool_ceil_mode=False, inplace=False
+):
+    # Validate inputs
+    assert input.dim() == 4, "Input must be 4D tensor"
+    assert weight.dim() == 4, "Weight must be 4D tensor"
+    
+    # Get dimensions
+    batch_size, in_channels, iH, iW = input.shape
+    out_channels, _, kH, kW = weight.shape
+    
+    # Handle padding and stride
+    if isinstance(conv_padding, int):
+        conv_padding = (conv_padding, conv_padding)
+    if isinstance(pool_padding, int):
+        pool_padding = (pool_padding, pool_padding)
+    if isinstance(conv_stride, int):
+        conv_stride = (conv_stride, conv_stride)
+    if isinstance(pool_stride, int):
+        pool_stride = (pool_stride, pool_stride)
+    if isinstance(conv_dilation, int):
+        conv_dilation = (conv_dilation, conv_dilation)
+    if isinstance(pool_dilation, int):
+        pool_dilation = (pool_dilation, pool_dilation)
+    
+    # Calculate output dimensions for convolution
+    pad_h, pad_w = conv_padding
+    stride_h, stride_w = conv_stride
+    dilation_h, dilation_w = conv_dilation
+    
+    # Apply ceil mode if needed
+    if pool_ceil_mode:
+        out_h = math.ceil((iH + 2 * pad_h - (kH - 1) * dilation_h - 1) / stride_h + 1)
+        out_w = math.ceil((iW + 2 * pad_w - (kW -1) * dilation_w - 1) / stride_w + 1)
+    else:
+        out_h = (iH + 2 * pad_h - (kH - 1) * dilation_h - 1) // stride_h + 1
+        out_w = (iW + 2 * pad_w - (kW - 1) * dilation_w - 1) // stride_w + 1
+    
+    # Calculate pooling output dimensions
+    pool_stride_h, pool_stride_w = pool_stride if pool_stride else (pool_kernel_size, pool_kernel_size)
+    pool_pad_h, pool_pad_w = pool_padding
+    pool_dilation_h, pool_dilation_w = pool_dilation
+    
+    pool_out_h = (out_h + 2 * pool_pad_h - (pool_kernel_size - 1) * pool_dilation_h - 1) // pool_stride_h + 1
+    pool_out_w = (out_w + 2 * pool_pad_w - (pool_kernel_size - 1) * pool_dilation_w - 1) // pool_stride_w + 1
+    
+    # Allocate output tensor
+    output = torch.empty(batch_size, out_channels, pool_out_h, pool_out_w, device=input.device, dtype=input.dtype)
+    
+    # Perform convolution
+    conv_output = torch.empty(batch_size, out_channels, out_h, out_w, device=input.device, dtype=input.dtype)
+    
+    # Setup kernel launch parameters
+    BLOCK_SIZE_H = 16
+    BLOCK_SIZE_W = 16
+    
+    # Launch convolution kernel
+    grid = (out_h, out_w, out_channels)
+    conv2d_kernel[grid](
+        input_ptr=input.data_ptr(),
+        weight_ptr=weight.data_ptr(),
+        bias_ptr=bias.data_ptr() if bias is not None else None,
+        output_ptr=conv_output.data_ptr(),
+        input_height=iH,
+        input_width=iW,
+        output_height=out_h,
+        output_width=out_w,
+        in_channels=in_channels,
+        out_channels=out_channels,
+        kernel_height=kH,
+        kernel_width=kW,
+        stride_h=stride_h,
+        stride_w=stride_w,
+        padding_h=pad_h,
+        padding_w=pad_w,
+        dilation_h=dilation_h,
+        dilation_w=dilation_w,
+        groups=conv_groups,
+        BLOCK_SIZE_H=BLOCK_SIZE_H,
+        BLOCK_SIZE_W=BLOCK_SIZE_W,
+        NUM_GROUPS=conv_groups
+    )
+    
+    # Perform max pooling
+    pool_output = torch.empty(batch_size, out_channels, pool_out_h, pool_out_w, device=input.device, dtype=input.dtype)
+    
+    # Launch pooling kernel
+    grid = (pool_out_h, pool_out_w, out_channels)
+    max_pool2d_kernel[grid](
+        input_ptr=conv_output.data_ptr(),
+        output_ptr=pool_output.data_ptr(),
+        input_height=out_h,
+        input_width=out_w,
+        output_height=pool_out_h,
+        output_width=pool_out_w,
+        kernel_h=pool_kernel_size,
+        kernel_w=pool_kernel_size,
+        stride_h=pool_stride_h,
+        stride_w=pool_stride_w,
+        padding_h=pool_pad_h,
+        padding_w=pool_pad_w,
+        dilation_h=pool_dilation_h,
+        dilation_w=pool_dilation_w,
+        BLOCK_SIZE_H=BLOCK_SIZE_H,
+        BLOCK_SIZE_W=BLOCK_SIZE_W
+    )
+    
+    # Apply ReLU
+    if inplace:
+        pool_output = torch.relu_(pool_output)
+    else:
+        pool_output = torch.relu(pool_output)
+    
+    return pool_output

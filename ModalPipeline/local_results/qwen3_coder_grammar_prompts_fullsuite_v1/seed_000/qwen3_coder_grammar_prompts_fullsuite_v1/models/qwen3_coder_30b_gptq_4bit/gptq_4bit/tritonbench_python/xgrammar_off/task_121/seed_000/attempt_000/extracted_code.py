@@ -1,0 +1,97 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def gelu_kernel(
+    input_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    APPROXIMATE: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    
+    if APPROXIMATE == "none":
+        # Exact GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
+        sqrt_2 = 1.4142135623730951
+        x_over_sqrt2 = input / sqrt_2
+        erf_x_over_sqrt2 = tl.math.erf(x_over_sqrt2)
+        output = 0.5 * input * (1.0 + erf_x_over_sqrt2)
+    else:
+        # Approximate GELU using tanh
+        # 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        pi = 3.141592653589793
+        sqrt_2_over_pi = 1.4142135623730951 / pi
+        x_cubed = input * input * input
+        tanh_arg = sqrt_2_over_pi * (input + 0.044715 * x_cubed)
+        tanh_value = tl.math.tanh(tanh_arg)
+        output = 0.5 * input * (1.0 + tanh_value)
+    
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+@triton.jit
+def min_kernel(
+    input_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    keepdim: tl.constexpr,
+    dim: tl.constexpr
+):
+    # Simplified min kernel for demonstration
+    # In practice, this would require more complex logic for reduction
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    
+    # This is a placeholder for actual min reduction logic
+    # A full implementation would require proper reduction handling
+    min_val = tl.min(input)
+    tl.store(output_ptr, min_val)
+
+def min_gelu(input, dim=None, keepdim=False, approximate='none', out=None):
+    if out is not None:
+        raise NotImplementedError("out parameter is not supported")
+    
+    # Apply GELU
+    input_flat = input.flatten()
+    n_elements = input_flat.numel()
+    
+    # Determine approximate method
+    approximate_method = "none" if approximate is None else approximate
+    
+    # Launch GELU kernel
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    # Create output tensor for GELU
+    output_gelu = torch.empty_like(input_flat)
+    
+    # Launch GELU kernel
+    gelu_kernel[grid](
+        input_flat,
+        output_gelu,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        APPROXIMATE=approximate_method
+    )
+    
+    # Reshape to original shape
+    output_gelu = output_gelu.view(input.shape)
+    
+    # Compute min
+    if dim is None:
+        # Return min of all elements
+        result = output_gelu.min()
+    else:
+        # Return min along specified dimension
+        result = output_gelu.min(dim=dim, keepdim=keepdim)
+    
+    return result

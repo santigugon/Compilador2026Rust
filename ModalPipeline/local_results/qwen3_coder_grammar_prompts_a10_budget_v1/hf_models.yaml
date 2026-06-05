@@ -1,0 +1,36 @@
+defaults:
+  family: qwen3_coder
+  backend: vllm_cuda
+  base_model: Qwen/Qwen3-Coder-30B-A3B-Instruct
+  benchmark_limit: 1
+  gpu_serve: A10G
+  gpu_eval: A10G
+  enabled: false
+  vllm:
+    tensor_parallel_size: 1
+    enable_expert_parallel: true
+    max_model_len: 1024
+    gpu_memory_utilization: 0.90
+
+models:
+  - name: qwen3_coder_30b_awq_4bit
+    hf_id: cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit
+    quantization: awq_4bit
+    backend: vllm_cuda
+    role: low_precision_candidate
+    enabled: true
+    gpu_serve: A10G
+    gpu_eval: A10G
+    vllm:
+      quantization: compressed-tensors
+
+  - name: qwen3_coder_30b_gptq_4bit
+    hf_id: btbtyler09/Qwen3-Coder-30B-A3B-Instruct-gptq-4bit
+    quantization: gptq_4bit
+    backend: vllm_cuda
+    role: low_precision_candidate_alt
+    enabled: true
+    gpu_serve: A10G
+    gpu_eval: A10G
+    vllm:
+      quantization: gptq

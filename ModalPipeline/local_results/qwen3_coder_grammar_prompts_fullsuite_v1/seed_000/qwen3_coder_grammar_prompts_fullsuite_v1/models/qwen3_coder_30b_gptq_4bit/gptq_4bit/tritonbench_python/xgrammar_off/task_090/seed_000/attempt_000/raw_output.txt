@@ -1,0 +1,62 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_hardshrink_dropout_kernel(
+    input_ptr,
+    output_ptr,
+    n_elements,
+    p,
+    training,
+    inplace,
+    lambd,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    
+    if training:
+        # Generate random mask for dropout
+        rand = tl.random.rand(0)  # This is a simplified approach
+        dropout_mask = rand > p
+        input = tl.where(dropout_mask, input, 0.0)
+    
+    # Apply hard shrinkage
+    output = tl.where(
+        (input > lambd) | (input < -lambd),
+        input,
+        0.0
+    )
+    
+    if inplace:
+        tl.store(input_ptr + offsets, output, mask=mask)
+    else:
+        tl.store(output_ptr + offsets, output, mask=mask)
+
+def fused_hardshrink_dropout(input: torch.Tensor, p: float = 0.5, training: bool = True, inplace: bool = False, lambd: float = 0.5) -> torch.Tensor:
+    assert input.is_contiguous(), "Input tensor must be contiguous"
+    output = torch.empty_like(input)
+    n_elements = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    fused_hardshrink_dropout_kernel[grid](
+        input_ptr=input.data_ptr(),
+        output_ptr=output.data_ptr(),
+        n_elements=n_elements,
+        p=p,
+        training=training,
+        inplace=inplace,
+        lambd=lambd,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    if inplace:
+        return input
+    else:
+        return output
+```

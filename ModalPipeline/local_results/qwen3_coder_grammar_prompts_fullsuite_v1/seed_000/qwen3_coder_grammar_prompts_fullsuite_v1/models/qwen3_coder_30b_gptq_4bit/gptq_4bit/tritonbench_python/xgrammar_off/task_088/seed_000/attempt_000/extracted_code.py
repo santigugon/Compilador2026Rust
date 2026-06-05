@@ -1,0 +1,111 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def matmul_kernel(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    alpha, beta,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+):
+    # Compute first operation: C = alpha * torch.mm(A, B) + beta * C
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        # Load A and B tiles
+        a = tl.load(A_ptr + pid_m * stride_am + k * stride_ak)
+        b = tl.load(B_ptr + k * stride_bk + pid_n * stride_bn)
+        
+        # Perform matrix multiplication
+        acc += tl.dot(a, b)
+    
+    # Scale and add to C
+    c = tl.load(C_ptr + pid_m * stride_cm + pid_n * stride_cn)
+    result = alpha * acc + beta * c
+    
+    # Store result
+    tl.store(C_ptr + pid_m * stride_cm + pid_n * stride_cn, result)
+
+@triton.jit
+def symmetric_kernel(
+    C_ptr, C_t_ptr,
+    M, N,
+    stride_cm, stride_cn,
+    stride_ctn, stride_ctm,
+    alpha, beta,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+):
+    # Compute second operation: C = alpha * torch.mm(C, C.T) + beta * C
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Loop over N dimension for symmetric operation
+    for k in range(0, N, BLOCK_N):
+        # Load C and C.T tiles
+        c = tl.load(C_ptr + pid_m * stride_cm + k * stride_cn)
+        c_t = tl.load(C_t_ptr + k * stride_ctn + pid_n * stride_ctm)
+        
+        # Perform matrix multiplication
+        acc += tl.dot(c, c_t)
+    
+    # Scale and add to C
+    c = tl.load(C_ptr + pid_m * stride_cm + pid_n * stride_cn)
+    result = alpha * acc + beta * c
+    
+    # Store result
+    tl.store(C_ptr + pid_m * stride_cm + pid_n * stride_cn, result)
+
+def matrix_multiply_symmetric(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
+    # Ensure tensors are on the same device and have correct dtype
+    A = A.to(torch.float32)
+    B = B.to(torch.float32)
+    C = C.to(torch.float32)
+    
+    # First operation: C = alpha * torch.mm(A, B) + beta * C
+    m, n = A.shape
+    n2, p = B.shape
+    assert n == n2, "Matrix dimensions mismatch"
+    
+    # Create a temporary tensor for the result of first operation
+    C_temp = torch.empty_like(C)
+    
+    # Launch first kernel
+    grid = (triton.cdiv(m, 16), triton.cdiv(p, 16))
+    matmul_kernel[grid](
+        A, B, C_temp,
+        m, p, n,
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1),
+        C_temp.stride(0), C_temp.stride(1),
+        alpha, beta,
+        BLOCK_M=16, BLOCK_N=16, BLOCK_K=16
+    )
+    
+    # Second operation: C = alpha * torch.mm(C_temp, C_temp.T) + beta * C
+    # Create transpose of C_temp
+    C_temp_t = C_temp.transpose(0, 1)
+    
+    # Launch second kernel
+    grid = (triton.cdiv(m, 16), triton.cdiv(p, 16))
+    symmetric_kernel[grid](
+        C_temp, C_temp_t,
+        m, p,
+        C_temp.stride(0), C_temp.stride(1),
+        C_temp_t.stride(0), C_temp_t.stride(1),
+        alpha, beta,
+        BLOCK_M=16, BLOCK_N=16
+    )
+    
+    return C_temp

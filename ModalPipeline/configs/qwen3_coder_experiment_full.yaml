@@ -1,0 +1,59 @@
+experiment_id: qwen3_coder_tb_full
+mode: full
+
+benchmark:
+  harness: tritonbench4modal
+  dataset: simp
+  limit: 166
+  gpu_eval: T4
+
+matrix:
+  output_profiles:
+    - tritonbench_python
+    - minitriton_json
+  decoding_modes:
+    - xgrammar_on
+    - xgrammar_off
+  sampling:
+    - temperature: 0.0
+      top_p: 1.0
+    - temperature: 0.2
+      top_p: 0.95
+    - temperature: 0.7
+      top_p: 0.8
+  max_output_tokens:
+    - 512
+    - 1024
+    - 2048
+    - 4096
+  prompt_variants:
+    - minimal
+    - full_rules
+    - one_shot
+    - two_shot
+    - repair_compile
+  repair_budgets:
+    - 0
+    - 1
+    - 2
+  runtime_limits:
+    - name: strict
+      compile_timeout_s: 60
+      exec_timeout_s: 120
+      memory_cap_mb: 8192
+    - name: relaxed
+      compile_timeout_s: 300
+      exec_timeout_s: 600
+      memory_cap_mb: null
+
+seeds:
+  - 0
+  - 1
+  - 2
+
+paired_design: true
+grammar_version: "1.0"
+prompt_template_version: "tritonbench_v1"
+
+performance:
+  min_speedup_vs_pytorch: 0.0

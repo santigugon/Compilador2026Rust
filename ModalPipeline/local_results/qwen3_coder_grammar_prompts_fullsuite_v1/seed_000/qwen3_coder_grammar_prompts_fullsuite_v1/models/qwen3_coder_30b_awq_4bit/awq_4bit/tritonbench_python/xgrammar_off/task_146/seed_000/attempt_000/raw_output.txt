@@ -1,0 +1,88 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _elu_linear_kernel(
+    input_ptr, weight_ptr, bias_ptr, output_ptr,
+    input_size: tl.constexpr, weight_size: tl.constexpr, 
+    output_size: tl.constexpr, alpha: tl.constexpr,
+    input_stride: tl.constexpr, weight_stride: tl.constexpr,
+    bias_stride: tl.constexpr, output_stride: tl.constexpr,
+    BLOCK: tl.constexpr
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK
+    offsets = block_start + tl.arange(0, BLOCK)
+    mask = offsets < output_size
+    
+    # Load input and weight
+    input_offsets = offsets % input_size
+    weight_offsets = (offsets // input_size) % weight_size
+    
+    # Compute linear transformation
+    linear_result = tl.zeros((BLOCK,), dtype=tl.float32)
+    
+    for i in range(input_size):
+        input_val = tl.load(input_ptr + input_offsets + i * input_stride, mask=mask, other=0.0)
+        weight_val = tl.load(weight_ptr + weight_offsets + i * weight_stride, mask=mask, other=0.0)
+        linear_result += input_val * weight_val
+    
+    # Add bias if present
+    if bias_ptr is not None:
+        bias_offsets = offsets % weight_size
+        bias_val = tl.load(bias_ptr + bias_offsets * bias_stride, mask=mask, other=0.0)
+        linear_result += bias_val
+    
+    # Apply ELU activation
+    elu_result = tl.where(linear_result > 0, linear_result, alpha * (tl.exp(linear_result) - 1.0))
+    
+    # Store result
+    tl.store(output_ptr + offsets * output_stride, elu_result, mask=mask)
+
+def elu_linear(input, weight, bias=None, alpha=1.0, inplace=False):
+    # Handle scalar alpha
+    if not isinstance(alpha, (int, float)):
+        alpha = alpha.item() if hasattr(alpha, 'item') else float(alpha)
+    
+    # Compute output size
+    output_size = input.shape[0] * weight.shape[0]
+    input_size = input.shape[-1]
+    weight_size = weight.shape[-1]
+    
+    # Create output tensor
+    if inplace:
+        out = input
+    else:
+        out = torch.empty(input.shape[:-1] + (weight.shape[0],), dtype=input.dtype, device=input.device)
+    
+    # Handle bias
+    if bias is not None:
+        bias_ptr = bias.data_ptr()
+        bias_stride = bias.stride(0) if bias.numel() > 0 else 0
+    else:
+        bias_ptr = None
+        bias_stride = 0
+    
+    # Launch kernel
+    block = 256
+    grid = (triton.cdiv(output_size, block),)
+    
+    # Prepare pointers and strides
+    input_ptr = input.data_ptr()
+    weight_ptr = weight.data_ptr()
+    output_ptr = out.data_ptr()
+    input_stride = input.stride(-1) if input.numel() > 0 else 0
+    weight_stride = weight.stride(-1) if weight.numel() > 0 else 0
+    output_stride = out.stride(-1) if out.numel() > 0 else 0
+    
+    _elu_linear_kernel[grid](
+        input_ptr, weight_ptr, bias_ptr, output_ptr,
+        input_size, weight_size, output_size, alpha,
+        input_stride, weight_stride, bias_stride, output_stride,
+        BLOCK=block
+    )
+    
+    return out
+```

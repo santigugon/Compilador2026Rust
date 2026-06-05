@@ -1,0 +1,71 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def elu_linear_kernel(
+    input_ptr, weight_ptr, bias_ptr, output_ptr,
+    input_row_stride, weight_row_stride, weight_col_stride,
+    output_row_stride, output_col_stride,
+    n_cols, alpha, BLOCK_SIZE: tl.constexpr
+):
+    row = tl.program_id(0)
+    input_row = input_ptr + row * input_row_stride
+    weight_row = weight_ptr + row * weight_row_stride
+    output_row = output_ptr + row * output_row_stride
+    
+    for col in range(0, n_cols, BLOCK_SIZE):
+        mask = col + tl.arange(0, BLOCK_SIZE) < n_cols
+        input_vals = tl.load(input_row + col + tl.arange(0, BLOCK_SIZE), mask=mask)
+        weight_vals = tl.load(weight_row + col + tl.arange(0, BLOCK_SIZE), mask=mask)
+        output_vals = tl.load(output_row + col + tl.arange(0, BLOCK_SIZE), mask=mask)
+        
+        # Linear transformation
+        linear_out = tl.sum(input_vals * weight_vals, axis=0)
+        
+        # Add bias if present
+        if bias_ptr is not None:
+            bias_vals = tl.load(bias_ptr + tl.arange(0, BLOCK_SIZE), mask=mask)
+            linear_out += bias_vals
+        
+        # Apply ELU activation
+        elu_out = tl.where(linear_out > 0, linear_out, alpha * tl.exp(linear_out) - alpha)
+        
+        # Store result
+        tl.store(output_row + col + tl.arange(0, BLOCK_SIZE), elu_out, mask=mask)
+
+def elu_linear(input, weight, bias=None, alpha=1.0, inplace=False):
+    assert input.dim() == 2, "Input must be a 2D tensor"
+    assert weight.dim() == 2, "Weight must be a 2D tensor"
+    assert input.size(1) == weight.size(1), "Input and weight dimensions must match"
+    
+    if bias is not None:
+        assert bias.dim() == 1, "Bias must be a 1D tensor"
+        assert bias.size(0) == weight.size(0), "Bias size must match weight output size"
+    
+    output = torch.empty(input.size(0), weight.size(0), dtype=input.dtype, device=input.device)
+    
+    # Determine block size
+    BLOCK_SIZE = 128
+    n_cols = weight.size(1)
+    
+    # Launch kernel
+    grid = (input.size(0),)
+    elu_linear_kernel[grid](
+        input_ptr=input.data_ptr(),
+        weight_ptr=weight.data_ptr(),
+        bias_ptr=bias.data_ptr() if bias is not None else None,
+        output_ptr=output.data_ptr(),
+        input_row_stride=input.stride(0),
+        weight_row_stride=weight.stride(0),
+        weight_col_stride=weight.stride(1),
+        output_row_stride=output.stride(0),
+        output_col_stride=output.stride(1),
+        n_cols=n_cols,
+        alpha=alpha,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return output
+```

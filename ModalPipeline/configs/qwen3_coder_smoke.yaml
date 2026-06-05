@@ -1,0 +1,59 @@
+# Minimal smoke test: 1 model, 1 TritonBench op, 1 condition.
+# Keep the vLLM context short so 30B 4-bit checkpoints can boot on A10G.
+experiment_id: qwen3_coder_smoke_v1
+mode: pilot
+serve_quantized_first: true
+
+vllm:
+  max_model_len: 1024
+  gpu_memory_utilization: 0.90
+
+benchmark:
+  harness: tritonbench4modal
+  dataset: simp
+  limit: 1
+  gpu_eval: T4
+
+matrix:
+  output_profiles:
+    - tritonbench_python
+  decoding_modes:
+    - xgrammar_off
+  sampling:
+    - temperature: 0.0
+      top_p: 1.0
+  max_output_tokens:
+    - 256
+  prompt_variants:
+    - minimal
+  repair_budgets:
+    - 0
+  runtime_limits:
+    - name: default
+      compile_timeout_s: 120
+      exec_timeout_s: 300
+      memory_cap_mb: null
+
+seeds:
+  - 0
+
+paired_design: true
+grammar_version: "1.0"
+prompt_template_version: "tritonbench_v1"
+
+performance:
+  min_speedup_vs_pytorch: 0.0
+
+volumes:
+  model_cache: qwen3-model-cache
+  results: qwen3-coder-results
+
+paths:
+  results_mount: /results
+  model_cache_mount: /models
+
+secrets:
+  modal_secret_name: hf-token
+  env_vars:
+    - HF_TOKEN
+    - HUGGING_FACE_HUB_TOKEN

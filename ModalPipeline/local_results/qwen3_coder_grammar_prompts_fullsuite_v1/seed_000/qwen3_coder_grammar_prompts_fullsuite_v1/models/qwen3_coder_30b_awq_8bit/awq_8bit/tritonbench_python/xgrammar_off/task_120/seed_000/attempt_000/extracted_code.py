@@ -1,0 +1,58 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _matrix_vector_dot_kernel(
+    A_ptr, x_ptr, y_ptr, 
+    out_ptr,
+    n, m,
+    alpha, beta,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    row = pid
+    
+    if row < n:
+        # Compute matrix-vector product for this row
+        acc = tl.zeros((1,), dtype=tl.float32)
+        for col in range(0, m, BLOCK_SIZE):
+            x_vals = tl.load(x_ptr + col + tl.arange(0, BLOCK_SIZE), mask=(col + tl.arange(0, BLOCK_SIZE)) < m)
+            A_vals = tl.load(A_ptr + row * m + col + tl.arange(0, BLOCK_SIZE), mask=(col + tl.arange(0, BLOCK_SIZE)) < m)
+            acc += tl.sum(A_vals * x_vals)
+        
+        # Scale and update y
+        y_val = tl.load(y_ptr + row)
+        y_new = alpha * acc + beta * y_val
+        tl.store(y_ptr + row, y_new)
+        
+        # Compute dot product of updated y and x for this row
+        dot_acc = tl.zeros((1,), dtype=tl.float32)
+        for col in range(0, m, BLOCK_SIZE):
+            x_vals = tl.load(x_ptr + col + tl.arange(0, BLOCK_SIZE), mask=(col + tl.arange(0, BLOCK_SIZE)) < m)
+            y_vals = tl.load(y_ptr + row + tl.arange(0, BLOCK_SIZE) * n, mask=(col + tl.arange(0, BLOCK_SIZE)) < m)
+            dot_acc += tl.sum(y_vals * x_vals)
+        
+        tl.store(out_ptr + row, dot_acc)
+
+def matrix_vector_dot(A: torch.Tensor, x: torch.Tensor, y: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
+    assert A.dim() == 2
+    assert x.dim() == 1
+    assert y.dim() == 1
+    assert A.shape[1] == x.shape[0]
+    assert A.shape[0] == y.shape[0]
+    
+    n, m = A.shape
+    out = torch.empty(n, dtype=torch.float32, device=A.device)
+    
+    # Launch kernel
+    BLOCK_SIZE = 1024
+    grid = (n,)
+    _matrix_vector_dot_kernel[grid](
+        A, x, y, out,
+        n, m,
+        alpha, beta,
+        BLOCK_SIZE
+    )
+    
+    return out.sum()

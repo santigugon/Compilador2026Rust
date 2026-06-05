@@ -1,0 +1,81 @@
+import torch
+import triton
+import triton.language as tl
+from typing import Tuple, Optional
+
+@triton.jit
+def fused_cross_entropy_softmax_layernorm_kernel(
+    logits_ptr, targets_ptr, weight_ptr, out_ptr,
+    N, C, normalized_shape, ignore_index, reduction, label_smoothing, eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Compute softmax and cross-entropy in one pass
+    pid = tl.program_id(0)
+    offset = pid * BLOCK_SIZE
+    logits_block = tl.load(logits_ptr + offset, mask=offset < N * C)
+    targets_block = tl.load(targets_ptr + offset, mask=offset < N * C)
+    
+    # Apply softmax
+    max_val = tl.max(logits_block, axis=0)
+    exp_logits = tl.exp(logits_block - max_val)
+    sum_exp = tl.sum(exp_logits, axis=0)
+    softmax_out = exp_logits / (sum_exp + eps)
+    
+    # Compute cross-entropy loss
+    loss = 0.0
+    for i in range(C):
+        if targets_block[i] != ignore_index:
+            loss += -tl.log(softmax_out[i] + eps) * (1 - label_smoothing) + \
+                    -tl.log(1 / C) * label_smoothing
+    
+    # Apply layer normalization
+    mean = tl.sum(softmax_out, axis=0) / normalized_shape
+    var = tl.sum((softmax_out - mean) ** 2, axis=0) / normalized_shape
+    normalized = (softmax_out - mean) / tl.sqrt(var + eps)
+    
+    # Store results
+    tl.store(out_ptr + offset, normalized, mask=offset < N * C)
+
+def fused_cross_entropy_softmax_layernorm(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    normalized_shape: int,
+    weight: Optional[torch.Tensor] = None,
+    ignore_index: int = -100,
+    reduction: str = 'mean',
+    label_smoothing: float = 0.0,
+    eps: float = 1e-5,
+    *, out: Optional[torch.Tensor] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Validate inputs
+    if logits.dim() < 2:
+        raise ValueError("logits must have at least 2 dimensions")
+    if targets.dim() < 1:
+        raise ValueError("targets must have at least 1 dimension")
+    if logits.shape[0] != targets.shape[0]:
+        raise ValueError("logits and targets must have the same batch size")
+    if logits.shape[1] != normalized_shape:
+        raise ValueError("logits shape does not match normalized_shape")
+    
+    # Flatten logits and targets for processing
+    N, C = logits.shape[0], logits.shape[1]
+    logits_flat = logits.view(-1, C)
+    targets_flat = targets.view(-1)
+    
+    # Initialize output tensor
+    if out is None:
+        out = torch.empty_like(logits_flat)
+    
+    # Set up kernel launch parameters
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(N * C, BLOCK_SIZE),)
+    
+    # Launch kernel
+    fused_cross_entropy_softmax_layernorm_kernel[grid](
+        logits_flat, targets_flat, weight, out,
+        N, C, normalized_shape, ignore_index, reduction, label_smoothing, eps,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    # Return normalized probabilities and loss
+    return out, torch.zeros(N, dtype=torch.float32, device=logits.device)

@@ -1,0 +1,78 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def cosine_embedding_loss_kernel(
+    input1_ptr, input2_ptr, target_ptr, output_ptr,
+    n_dims, margin, reduction,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offset = pid * BLOCK_SIZE
+    indices = offset + tl.arange(0, BLOCK_SIZE)
+    
+    input1 = tl.load(input1_ptr + indices, mask=indices < n_dims)
+    input2 = tl.load(input2_ptr + indices, mask=indices < n_dims)
+    target = tl.load(target_ptr + indices, mask=indices < n_dims)
+    
+    # Compute dot product
+    dot_product = tl.sum(input1 * input2)
+    
+    # Compute norms
+    norm1 = tl.sqrt(tl.sum(input1 * input1))
+    norm2 = tl.sqrt(tl.sum(input2 * input2))
+    
+    # Avoid division by zero
+    eps = 1e-8
+    norm1 = tl.where(norm1 < eps, eps, norm1)
+    norm2 = tl.where(norm2 < eps, eps, norm2)
+    
+    # Compute cosine similarity
+    cos_sim = dot_product / (norm1 * norm2)
+    
+    # Compute loss
+    loss = tl.where(target == 1, 1 - cos_sim, tl.maximum(0, cos_sim - margin))
+    
+    # Store result
+    tl.store(output_ptr + indices, loss, mask=indices < n_dims)
+
+def fused_cosine_embedding_loss_with_normalization(
+    input1: torch.Tensor, 
+    input2: torch.Tensor, 
+    target: torch.Tensor, 
+    margin: float = 0, 
+    reduction: str = 'mean'
+) -> torch.Tensor:
+    # Validate inputs
+    assert input1.shape == input2.shape, "input1 and input2 must have the same shape"
+    assert target.shape == input1.shape, "target must have the same shape as input1"
+    assert reduction in ['none', 'mean', 'sum'], "reduction must be 'none', 'mean', or 'sum'"
+    
+    # Flatten tensors for processing
+    input1_flat = input1.view(-1)
+    input2_flat = input2.view(-1)
+    target_flat = target.view(-1)
+    
+    # Determine block size
+    BLOCK_SIZE = 1024
+    n_dims = input1_flat.shape[0]
+    
+    # Allocate output tensor
+    output = torch.empty_like(target_flat)
+    
+    # Launch kernel
+    grid = (triton.cdiv(n_dims, BLOCK_SIZE),)
+    
+    cosine_embedding_loss_kernel[grid](
+        input1_flat, input2_flat, target_flat, output,
+        n_dims, margin, reduction, BLOCK_SIZE
+    )
+    
+    # Apply reduction
+    if reduction == 'mean':
+        return output.mean()
+    elif reduction == 'sum':
+        return output.sum()
+    else:  # 'none'
+        return output.view(input1.shape)

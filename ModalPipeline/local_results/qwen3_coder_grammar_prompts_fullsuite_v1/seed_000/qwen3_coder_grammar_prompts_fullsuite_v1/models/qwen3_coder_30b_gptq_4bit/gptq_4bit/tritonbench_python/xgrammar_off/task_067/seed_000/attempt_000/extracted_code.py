@@ -1,0 +1,146 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _adaptive_avg_pool2d_kernel(
+    input_ptr, output_ptr, 
+    input_height, input_width,
+    output_height, output_width,
+    stride_h, stride_w,
+    padding_h, padding_w,
+    BLOCK_H, BLOCK_W
+):
+    # Get thread indices
+    pid_h = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    
+    # Calculate output indices
+    out_h = pid_h * BLOCK_H
+    out_w = pid_w * BLOCK_W
+    
+    # Calculate input region bounds
+    in_h_start = out_h * stride_h - padding_h
+    in_w_start = out_w * stride_w - padding_w
+    
+    # Process each output element
+    for h in range(BLOCK_H):
+        for w in range(BLOCK_W):
+            if out_h + h < output_height and out_w + w < output_width:
+                # Calculate input region
+                h_start = max(0, in_h_start + h * stride_h)
+                h_end = min(input_height, in_h_start + (h + 1) * stride_h)
+                w_start = max(0, in_w_start + w * stride_w)
+                w_end = min(input_width, in_w_start + (w + 1) * stride_w)
+                
+                # Compute average
+                count = (h_end - h_start) * (w_end - w_start)
+                if count > 0:
+                    sum_val = 0.0
+                    for ih in range(h_start, h_end):
+                        for iw in range(w_start, w_end):
+                            sum_val += tl.load(input_ptr + ih * input_width + iw)
+                    tl.store(output_ptr + (out_h + h) * output_width + (out_w + w), sum_val / count)
+                else:
+                    tl.store(output_ptr + (out_h + h) * output_width + (out_w + w), 0.0)
+
+@triton.jit
+def _pairwise_distance_kernel(
+    x1_ptr, x2_ptr, output_ptr,
+    size, p, eps,
+    BLOCK_SIZE
+):
+    pid = tl.program_id(0)
+    offset = pid * BLOCK_SIZE
+    
+    # Load data
+    x1 = tl.load(x1_ptr + offset, mask=offset + tl.arange(0, BLOCK_SIZE) < size)
+    x2 = tl.load(x2_ptr + offset, mask=offset + tl.arange(0, BLOCK_SIZE) < size)
+    
+    # Compute distance
+    diff = x1 - x2
+    abs_diff = tl.abs(diff)
+    if p == 1.0:
+        distance = abs_diff
+    elif p == 2.0:
+        distance = abs_diff * abs_diff
+    else:
+        distance = tl.pow(abs_diff, p)
+    
+    # Reduce and store
+    if p == 2.0:
+        result = tl.sum(distance)
+        result = tl.sqrt(result + eps)
+    else:
+        result = tl.sum(distance)
+        result = tl.pow(result + eps, 1.0 / p)
+    
+    tl.store(output_ptr + pid, result)
+
+def fused_pairwise_distance_adaptive_avg_pool2d(
+    x1: torch.Tensor, 
+    x2: torch.Tensor, 
+    output_size: int or tuple, 
+    p: float = 2.0, 
+    eps: float = 1e-6, 
+    keepdim: bool = False
+) -> torch.Tensor:
+    # Handle output_size
+    if isinstance(output_size, int):
+        output_height = output_size
+        output_width = output_size
+    else:
+        output_height, output_width = output_size
+    
+    # Ensure inputs are 4D
+    if x1.dim() == 3:
+        x1 = x1.unsqueeze(0)
+    if x2.dim() == 3:
+        x2 = x2.unsqueeze(0)
+    
+    batch_size, channels, height, width = x1.shape
+    
+    # Calculate stride and padding for adaptive pooling
+    stride_h = height // output_height
+    stride_w = width // output_width
+    padding_h = (stride_h * output_height - height) // 2
+    padding_w = (stride_w * output_width - width) // 2
+    
+    # Apply adaptive average pooling
+    x1_pooled = torch.zeros((batch_size, channels, output_height, output_width), device=x1.device, dtype=x1.dtype)
+    x2_pooled = torch.zeros((batch_size, channels, output_height, output_width), device=x2.device, dtype=x2.dtype)
+    
+    # Use Triton kernel for pooling
+    grid = (triton.cdiv(output_height, 16), triton.cdiv(output_width, 16))
+    _adaptive_avg_pool2d_kernel[grid](
+        x1.data_ptr(), x1_pooled.data_ptr(),
+        height, width, output_height, output_width,
+        stride_h, stride_w, padding_h, padding_w,
+        BLOCK_H=16, BLOCK_W=16
+    )
+    
+    _adaptive_avg_pool2d_kernel[grid](
+        x2.data_ptr(), x2_pooled.data_ptr(),
+        height, width, output_height, output_width,
+        stride_h, stride_w, padding_h, padding_w,
+        BLOCK_H=16, BLOCK_W=16
+    )
+    
+    # Flatten pooled tensors for distance calculation
+    x1_flat = x1_pooled.view(batch_size, -1)
+    x2_flat = x2_pooled.view(batch_size, -1)
+    
+    # Compute pairwise distance
+    output = torch.zeros(batch_size, device=x1.device, dtype=torch.float32)
+    
+    # Use Triton kernel for distance calculation
+    total_elements = x1_flat.shape[1]
+    grid_size = triton.cdiv(total_elements, 256)
+    _pairwise_distance_kernel[grid_size](
+        x1_flat.data_ptr(), x2_flat.data_ptr(), output.data_ptr(),
+        total_elements, p, eps, 256
+    )
+    
+    if keepdim:
+        return output.view(batch_size, 1)
+    return output

@@ -1,0 +1,101 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def rms_norm_kernel(X_ptr, Y_ptr, weight_ptr, eps, N, P, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N * P
+    X = tl.load(X_ptr + offsets, mask=mask)
+    Y = tl.load(Y_ptr + offsets, mask=mask)
+    weight = tl.load(weight_ptr + offsets % P, mask=mask)
+    mean = tl.sum(X * X, axis=0) / P
+    inv_rms = tl.rsqrt(mean + eps)
+    Y = X * inv_rms * weight
+    tl.store(Y_ptr + offsets, Y, mask=mask)
+
+@triton.jit
+def gelu_kernel(X_ptr, Y_ptr, N, P, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N * P
+    X = tl.load(X_ptr + offsets, mask=mask)
+    Y = tl.libdevice.erf(0.5 * X * (1.0 + 0.278 * X + 0.235 * X * X))
+    tl.store(Y_ptr + offsets, Y, mask=mask)
+
+@triton.jit
+def dropout_kernel(X_ptr, Y_ptr, dropout_p, training, N, P, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N * P
+    X = tl.load(X_ptr + offsets, mask=mask)
+    if training:
+        rand = tl.random.rand(0)  # Simplified random generation
+        Y = tl.where(rand > dropout_p, X / (1.0 - dropout_p), 0.0)
+    else:
+        Y = X
+    tl.store(Y_ptr + offsets, Y, mask=mask)
+
+@triton.jit
+def bmm_kernel(A_ptr, B_ptr, C_ptr, B_size, N, P, M, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < B_size * N * P
+    A = tl.load(A_ptr + offsets, mask=mask)
+    B = tl.load(B_ptr + offsets, mask=mask)
+    C = tl.sum(A * B, axis=0)
+    tl.store(C_ptr + offsets, C, mask=mask)
+
+def fused_bmm_rmsnorm_gelu_dropout_sub(input1, input2, other, normalized_shape, dropout_p=0.5, training=True, approximate='none', eps=1e-5, *, out=None):
+    B, N, M = input1.shape
+    _, _, P = input2.shape
+    assert input1.shape == (B, N, M)
+    assert input2.shape == (B, M, P)
+    assert other.shape == (B, N, P) or other.shape == (P,)
+    
+    # Allocate output tensor
+    if out is None:
+        out = torch.empty(B, N, P, dtype=input1.dtype, device=input1.device)
+    
+    # Perform batch matrix multiplication
+    output = torch.empty(B, N, P, dtype=input1.dtype, device=input1.device)
+    # Simple implementation using PyTorch's native operations for BMM
+    output = torch.bmm(input1, input2)
+    
+    # RMS normalization
+    if isinstance(normalized_shape, int):
+        normalized_shape = [normalized_shape]
+    weight = torch.ones(normalized_shape[-1], dtype=input1.dtype, device=input1.device)
+    for i in range(B):
+        for j in range(N):
+            x = output[i, j, :]
+            mean = torch.mean(x * x)
+            inv_rms = 1.0 / torch.sqrt(mean + eps)
+            output[i, j, :] = x * inv_rms * weight
+    
+    # GELU activation
+    if approximate == 'none':
+        output = torch.nn.functional.gelu(output)
+    elif approximate == 'tanh':
+        output = torch.nn.functional.gelu(output, approximate='tanh')
+    else:
+        raise ValueError("approximate must be 'none' or 'tanh'")
+    
+    # Dropout
+    if training:
+        dropout_mask = torch.rand_like(output) > dropout_p
+        output = output * dropout_mask / (1.0 - dropout_p)
+    
+    # Subtraction
+    if other.shape == (P,):
+        other = other.expand(B, N, P)
+    output = output - other
+    
+    return output
+```

@@ -1,0 +1,6 @@
+task_id,attempts,correctness_rate
+tritonbench_t_000,4,0.25
+tritonbench_t_001,4,0.25
+tritonbench_t_002,4,0.25
+tritonbench_t_003,4,0.25
+tritonbench_t_004,4,0.25

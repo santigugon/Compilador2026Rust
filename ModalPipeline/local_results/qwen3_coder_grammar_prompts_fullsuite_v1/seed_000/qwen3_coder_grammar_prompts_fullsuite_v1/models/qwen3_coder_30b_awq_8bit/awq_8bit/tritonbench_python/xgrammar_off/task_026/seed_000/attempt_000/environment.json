@@ -1,0 +1,14 @@
+{
+  "python_version": "3.11.5 (main, Aug 26 2023, 07:22:50) [Clang 16.0.3 ]",
+  "platform": "Linux-4.4.0-x86_64-with-glibc2.35",
+  "hostname": "modal",
+  "modal_app_name": null,
+  "modal_function": "run_generation_condition",
+  "vllm_version": "0.22.0",
+  "torch_version": "2.11.0+cu130",
+  "triton_version": "3.6.0",
+  "xgrammar_version": "unknown",
+  "modal_version": "1.4.3",
+  "cuda_version": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2024 NVIDIA Corporation\nBuilt on Thu_Mar_28_02:18:24_PDT_2024\nCuda compilation tools, release 12.4, V12.4.131\nBuild cuda_12.4.r12.4/compiler.34097967_0",
+  "git_commit": null
+}

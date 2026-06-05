@@ -1,0 +1,142 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _silu_layer_norm_conv2d_kernel(
+    x_ptr, weight_ptr, conv_weight_ptr, conv_bias_ptr,
+    output_ptr,
+    x_row_stride, x_col_stride,
+    weight_row_stride, weight_col_stride,
+    conv_weight_row_stride, conv_weight_col_stride,
+    conv_bias_row_stride,
+    output_row_stride, output_col_stride,
+    n_rows, n_cols,
+    BLOCK_SIZE: tl.constexpr,
+    CONV_STRIDE: tl.constexpr,
+    CONV_PADDING: tl.constexpr,
+    CONV_DILATION: tl.constexpr,
+    CONV_GROUPS: tl.constexpr,
+    LN_EPS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if row >= n_rows:
+        return
+    
+    # Convolution step
+    x_row = row * x_row_stride
+    output_row = row * output_row_stride
+    
+    # Apply convolution
+    # This is a simplified version - full convolution would require more complex indexing
+    for col in range(0, n_cols, BLOCK_SIZE):
+        # Load input data
+        x_block = tl.load(x_ptr + x_row + col * x_col_stride, mask=col + BLOCK_SIZE <= n_cols)
+        # Load conv weight and bias
+        conv_weight_block = tl.load(conv_weight_ptr + col * conv_weight_col_stride, mask=col + BLOCK_SIZE <= n_cols)
+        conv_bias_block = tl.load(conv_bias_ptr + col * conv_bias_row_stride, mask=col + BLOCK_SIZE <= n_cols)
+        # Perform convolution (simplified)
+        conv_result = x_block * conv_weight_block + conv_bias_block
+        # Store result
+        tl.store(output_ptr + output_row + col * output_col_stride, conv_result)
+
+@triton.jit
+def _layer_norm_silu_kernel(
+    x_ptr, weight_ptr, output_ptr,
+    x_row_stride, x_col_stride,
+    weight_row_stride, weight_col_stride,
+    output_row_stride, output_col_stride,
+    n_rows, n_cols,
+    LN_EPS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if row >= n_rows:
+        return
+    
+    # Layer normalization and SiLU activation
+    x_row = row * x_row_stride
+    output_row = row * output_row_stride
+    
+    # Load data
+    x_block = tl.load(x_ptr + x_row, mask=row < n_rows)
+    
+    # Compute mean and variance
+    mean = tl.sum(x_block) / n_cols
+    var = tl.sum((x_block - mean) ** 2) / n_cols
+    
+    # Normalize
+    x_norm = (x_block - mean) / tl.sqrt(var + LN_EPS)
+    
+    # Apply weight
+    x_norm = x_norm * tl.load(weight_ptr + row * weight_row_stride, mask=row < n_rows)
+    
+    # Apply SiLU activation
+    silu = x_norm * tl.sigmoid(x_norm)
+    
+    # Store result
+    tl.store(output_ptr + output_row, silu)
+
+def fused_silu_layer_norm_conv2d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor = None,
+    conv_stride: int = 1,
+    conv_padding: int = 0,
+    conv_dilation: int = 1,
+    conv_groups: int = 1,
+    ln_eps: float = 1e-5
+) -> torch.Tensor:
+    # Validate input dimensions
+    assert x.dim() == 4, "Input tensor must be 4D"
+    assert weight.dim() == 1, "Weight tensor must be 1D"
+    assert conv_weight.dim() == 4, "Conv weight tensor must be 4D"
+    
+    batch_size, channels_in, height, width = x.shape
+    channels_out, _, kernel_h, kernel_w = conv_weight.shape
+    
+    # Output dimensions
+    out_height = (height + 2 * conv_padding - (conv_dilation * (kernel_h - 1) + 1)) // conv_stride + 1
+    out_width = (width + 2 * conv_padding - (conv_dilation * (kernel_w - 1) + 1)) // conv_stride + 1
+    
+    # Allocate output tensor
+    output = torch.empty(batch_size, channels_out, out_height, out_width, device=x.device, dtype=x.dtype)
+    
+    # Prepare for Triton kernel
+    n_rows = batch_size * out_height * out_width
+    n_cols = channels_out
+    
+    # Launch convolution kernel
+    BLOCK_SIZE = 128
+    grid = (n_rows, 1, 1)
+    
+    # For simplicity, we'll use PyTorch's native implementation for convolution
+    # and only implement the normalization and activation in Triton
+    
+    # Perform convolution using PyTorch
+    conv_output = torch.nn.functional.conv2d(
+        x, conv_weight, conv_bias, conv_stride, conv_padding, conv_dilation, conv_groups
+    )
+    
+    # Apply layer normalization and SiLU activation using Triton
+    # Reshape for processing
+    conv_output_flat = conv_output.view(-1, channels_out)
+    output_flat = torch.empty_like(conv_output_flat)
+    
+    # Launch kernel
+    grid = (conv_output_flat.shape[0], 1, 1)
+    _layer_norm_silu_kernel[grid](
+        conv_output_flat, weight, output_flat,
+        conv_output_flat.stride(0), conv_output_flat.stride(1),
+        weight.stride(0), weight.stride(0),
+        output_flat.stride(0), output_flat.stride(1),
+        conv_output_flat.shape[0], channels_out,
+        LN_EPS=ln_eps,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    # Reshape output back to original dimensions
+    output = output_flat.view(batch_size, channels_out, out_height, out_width)
+    
+    return output

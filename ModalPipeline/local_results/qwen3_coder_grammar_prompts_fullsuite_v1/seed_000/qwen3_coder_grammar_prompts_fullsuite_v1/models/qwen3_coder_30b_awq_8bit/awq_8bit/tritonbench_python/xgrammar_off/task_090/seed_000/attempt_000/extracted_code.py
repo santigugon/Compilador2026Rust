@@ -1,0 +1,67 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_hardshrink_dropout_kernel(
+    input_ptr, output_ptr, 
+    p, lambd, 
+    n_elements,
+    training: tl.constexpr,
+    inplace: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    input = tl.load(input_ptr + offsets, mask=mask)
+    
+    # Apply dropout
+    if training:
+        # Generate random numbers for dropout
+        random_val = tl.random.rand(0, BLOCK_SIZE)
+        dropout_mask = random_val > p
+        input = tl.where(dropout_mask, input, 0.0)
+    
+    # Apply hard shrinkage
+    # Hard shrinkage: if |x| <= lambda, then x = 0, else x = x
+    shrinkage_mask = tl.abs(input) > lambd
+    output = tl.where(shrinkage_mask, input, 0.0)
+    
+    # Store result
+    if inplace:
+        tl.store(input_ptr + offsets, output, mask=mask)
+    else:
+        tl.store(output_ptr + offsets, output, mask=mask)
+
+def fused_hardshrink_dropout(input: torch.Tensor, p: float = 0.5, training: bool = True, inplace: bool = False, lambd: float = 0.5) -> torch.Tensor:
+    # Ensure input is contiguous
+    input = input.contiguous()
+    
+    # Create output tensor if not in-place
+    if not inplace:
+        output = torch.empty_like(input)
+    else:
+        output = input
+    
+    # Get total number of elements
+    n_elements = input.numel()
+    
+    # Launch kernel
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    fused_hardshrink_dropout_kernel[grid](
+        input_ptr=input.data_ptr(),
+        output_ptr=output.data_ptr(),
+        p=p,
+        lambd=lambd,
+        n_elements=n_elements,
+        training=training,
+        inplace=inplace,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return output

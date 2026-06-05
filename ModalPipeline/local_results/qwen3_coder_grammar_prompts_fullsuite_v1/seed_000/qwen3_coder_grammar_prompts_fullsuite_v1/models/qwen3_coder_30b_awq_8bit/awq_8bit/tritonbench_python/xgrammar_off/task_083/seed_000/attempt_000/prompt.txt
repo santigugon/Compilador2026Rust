@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are an expert Triton programmer.\n\nGenerate ONLY a single valid Python module.\nNo explanations.\nNo prose.\nNo markdown outside the code block.\nNo tests.\nNo example calls.\n\nThe module must contain:\n- imports\n- Triton kernels\n- wrapper function\n\nThe wrapper function must exactly match the required signature.\n\nWrap the entire response in ONE ```python``` block.\n"
+  },
+  {
+    "role": "user",
+    "content": "You are an expert in Trion programming, capable of writing corresponding Triton kernels and wrapper functions based on functional descriptions and function parameters. Ensure that the wrapper function fully corresponds to the provided function information.\nFunctional Description: Performs a fused operation combining batch matrix multiplication, dropout, and GELU activation. It computes the batch matrix multiplication of two input tensors, applies dropout to the result, and then applies the GELU activation function.\nWrapper Entry Information: fused_bmm_dropout_gelu(input1, input2, p=0.5, training=True, inplace=False, approximate='none', *, out=None) -> Tensor\n- **input1** (Tensor): First input tensor for batch matrix multiplication, of shape (B, N, M), where B is the batch size.\n- **input2** (Tensor): Second input tensor for batch matrix multiplication, of shape (B, M, P).\n- **p** (float, optional): Probability of an element to be zeroed in the dropout layer. Default: `0.5`.\n- **training** (bool, optional): Apply dropout if `True`. Default: `True`.\n- **inplace** (bool, optional): If set to `True`, will perform the dropout operation in-place. Default: `False`.\n- **approximate** (str, optional): Can be `'none'` or `'tanh'`. The approximation to use for GELU. Default: `'none'`.\n- **out** (Tensor, optional): Output tensor. Ignored if `None`. Default: `None`.\nAfter generation, verify if the Triton wrapper aligns with the provided func_inputs. If not, regenerate."
+  }
+]

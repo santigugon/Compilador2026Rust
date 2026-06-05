@@ -1,0 +1,83 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def gelu_kernel(
+    input_ptr,
+    other_ptr,
+    alpha_ptr,
+    output_ptr,
+    n_elements,
+    approximate: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    other = tl.load(other_ptr + offsets, mask=mask)
+    alpha = tl.load(alpha_ptr + offsets, mask=mask)
+    
+    # Subtract other scaled by alpha from input
+    x = input - alpha * other
+    
+    # Apply GELU activation
+    if approximate == "none":
+        # Exact GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
+        sqrt_2 = 1.4142135623730951
+        erf_x = tl.math.erf(x / sqrt_2)
+        gelu_x = 0.5 * x * (1.0 + erf_x)
+    else:
+        # Approximate GELU using tanh
+        # 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        pi = 3.141592653589793
+        sqrt_2_over_pi = 1.4142135623730951 / pi
+        x_cubed = x * x * x
+        tanh_arg = sqrt_2_over_pi * (x + 0.044715 * x_cubed)
+        tanh_x = tl.math.tanh(tanh_arg)
+        gelu_x = 0.5 * x * (1.0 + tanh_x)
+    
+    tl.store(output_ptr + offsets, gelu_x, mask=mask)
+
+def sub_gelu(input, other, alpha=1, approximate='none', out=None):
+    if out is None:
+        out = torch.empty_like(input)
+    
+    # Ensure input and other have the same dtype
+    if isinstance(other, (int, float)):
+        other = torch.tensor(other, dtype=input.dtype, device=input.device)
+    else:
+        other = other.to(input.dtype)
+    
+    # Expand other to match input shape if needed
+    if other.shape != input.shape:
+        other = other.expand_as(input)
+    
+    # Expand alpha to match input shape if needed
+    if isinstance(alpha, (int, float)):
+        alpha = torch.tensor(alpha, dtype=input.dtype, device=input.device)
+    else:
+        alpha = alpha.to(input.dtype)
+    
+    # Ensure alpha has the same shape as input
+    if alpha.shape != input.shape:
+        alpha = alpha.expand_as(input)
+    
+    # Get the total number of elements
+    n_elements = input.numel()
+    
+    # Launch kernel
+    grid = (triton.cdiv(n_elements, 1024),)
+    gelu_kernel[grid](
+        input_ptr=input.data_ptr(),
+        other_ptr=other.data_ptr(),
+        alpha_ptr=alpha.data_ptr(),
+        output_ptr=out.data_ptr(),
+        n_elements=n_elements,
+        approximate=approximate,
+        BLOCK_SIZE=1024
+    )
+    
+    return out

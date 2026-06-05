@@ -1,0 +1,81 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def symmetric_mv_norm_kernel(
+    A_ptr, x_ptr, y_ptr, 
+    n, 
+    alpha, beta, 
+    p,
+    BLOCK_SIZE: tl.constexpr
+):
+    # Initialize accumulator for norm calculation
+    norm_acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    
+    # Load x vector
+    x = tl.load(x_ptr + tl.arange(0, BLOCK_SIZE), mask=tl.arange(0, BLOCK_SIZE) < n)
+    
+    # Compute y = alpha * A @ x + beta * y
+    for i in range(n):
+        # Load A[i, :] row
+        row = tl.load(A_ptr + i * n + tl.arange(0, BLOCK_SIZE), mask=tl.arange(0, BLOCK_SIZE) < n)
+        
+        # Compute dot product of row with x
+        dot_prod = tl.sum(row * x)
+        
+        # Accumulate result
+        y_val = alpha * dot_prod
+        
+        # Store intermediate result in y
+        if i < BLOCK_SIZE:
+            tl.store(y_ptr + i, y_val)
+    
+    # Add beta * y term
+    y = tl.load(y_ptr + tl.arange(0, BLOCK_SIZE), mask=tl.arange(0, BLOCK_SIZE) < n)
+    y = beta * y + y
+    tl.store(y_ptr + tl.arange(0, BLOCK_SIZE), y, mask=tl.arange(0, BLOCK_SIZE) < n)
+    
+    # Compute norm
+    for i in range(n):
+        val = tl.load(y_ptr + i)
+        norm_acc[i] = tl.abs(val) ** p
+
+@triton.jit
+def norm_reduction_kernel(norm_acc, result_ptr, n, p, BLOCK_SIZE: tl.constexpr):
+    # Reduce norm values
+    total = tl.sum(norm_acc)
+    norm_val = total ** (1.0 / p)
+    tl.store(result_ptr, norm_val)
+
+def symmetric_matrix_vector_norm(A: torch.Tensor, x: torch.Tensor, alpha: float, beta: float, p: float = 2.0) -> torch.Tensor:
+    # Ensure inputs are on the same device and have correct dtypes
+    device = A.device
+    assert A.shape[0] == A.shape[1], "Matrix A must be square"
+    assert A.shape[1] == x.shape[0], "Matrix A and vector x dimensions must match"
+    assert len(x.shape) == 1, "Vector x must be 1-dimensional"
+    
+    n = A.shape[0]
+    # Allocate output vector y
+    y = torch.zeros(n, device=device, dtype=torch.float32)
+    
+    # Use Triton kernel for computation
+    BLOCK_SIZE = 1024
+    grid = (1, 1)
+    
+    # Allocate intermediate storage for y
+    y = torch.zeros(n, device=device, dtype=torch.float32)
+    
+    # Launch kernel
+    symmetric_mv_norm_kernel[grid](
+        A, x, y,
+        n,
+        alpha, beta,
+        p,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    # Compute final norm
+    norm_val = torch.norm(y, p=p)
+    
+    return norm_val

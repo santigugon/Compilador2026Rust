@@ -1,0 +1,96 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def pixel_shuffle_conv2d_kernel(
+    input_ptr, weight_ptr, bias_ptr, output_ptr,
+    in_channels, out_channels, iH, iW, oH, oW,
+    kH, kW, stride, padding, dilation, groups, upscale_factor,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(oH, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(oW, BLOCK_SIZE_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    
+    mask_m = offs_m < oH
+    mask_n = offs_n < oW
+    
+    output = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    for g in range(groups):
+        for k in range(kH * kW):
+            kh = k // kW
+            kw = k % kW
+            
+            input_offset = g * (in_channels // groups) * iH * iW
+            weight_offset = g * (out_channels // groups) * (in_channels // groups) * kH * kW
+            
+            for c in range(in_channels // groups):
+                input_idx = input_offset + c * iH * iW
+                weight_idx = weight_offset + c * kH * kW + k
+                
+                for m in range(BLOCK_SIZE_M):
+                    for n in range(BLOCK_SIZE_N):
+                        if mask_m[m] and mask_n[n]:
+                            ih = (offs_m[m] * stride - padding + kh * dilation)
+                            iw = (offs_n[n] * stride - padding + kw * dilation)
+                            if 0 <= ih < iH and 0 <= iw < iW:
+                                input_val = tl.load(input_ptr + input_idx + ih * iW + iw, mask=True)
+                                weight_val = tl.load(weight_ptr + weight_idx)
+                                output[m, n] += input_val * weight_val
+    
+    if bias_ptr is not None:
+        for m in range(BLOCK_SIZE_M):
+            for n in range(BLOCK_SIZE_N):
+                if mask_m[m] and mask_n[n]:
+                    output[m, n] += tl.load(bias_ptr + (offs_m[m] * oW + offs_n[n]) % out_channels)
+    
+    output_ptr += pid_m * oW * BLOCK_SIZE_M + pid_n * BLOCK_SIZE_N
+    for m in range(BLOCK_SIZE_M):
+        for n in range(BLOCK_SIZE_N):
+            if mask_m[m] and mask_n[n]:
+                tl.store(output_ptr + m * oW + n, output[m, n])
+
+def pixel_shuffle_conv2d(input: torch.Tensor, weight: torch.Tensor, bias=None, stride=1, padding=0, dilation=1, groups=1, upscale_factor=2) -> torch.Tensor:
+    assert input.dim() == 4, "Input must be a 4D tensor"
+    assert weight.dim() == 4, "Weight must be a 4D tensor"
+    assert input.size(1) == weight.size(1) * groups, "Input channels must match weight channels"
+    
+    minibatch, in_channels, iH, iW = input.shape
+    out_channels, _, kH, kW = weight.shape
+    
+    oH = (iH + 2 * padding - (dilation * (kH - 1) + 1)) // stride + 1
+    oW = (iW + 2 * padding - (dilation * (kW - 1) + 1)) // stride + 1
+    
+    output = torch.empty((minibatch, out_channels, oH, oW), device=input.device, dtype=input.dtype)
+    
+    BLOCK_SIZE_M = 16
+    BLOCK_SIZE_N = 16
+    BLOCK_SIZE_K = 32
+    
+    num_pid_m = triton.cdiv(oH, BLOCK_SIZE_M)
+    num_pid_n = triton.cdiv(oW, BLOCK_SIZE_N)
+    num_pid = num_pid_m * num_pid_n
+    
+    grid = (num_pid, 1, 1)
+    
+    if bias is not None:
+        bias_ptr = bias.data_ptr()
+    else:
+        bias_ptr = None
+    
+    pixel_shuffle_conv2d_kernel[grid](
+        input.data_ptr(), weight.data_ptr(), bias_ptr, output.data_ptr(),
+        in_channels, out_channels, iH, iW, oH, oW,
+        kH, kW, stride, padding, dilation, groups, upscale_factor,
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
+    )
+    
+    return output

@@ -1,0 +1,100 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_cross_entropy_log_softmax_kernel(
+    input_ptr, target_ptr, weight_ptr, output_ptr,
+    N, C, dim, ignore_index, reduction, label_smoothing,
+    BLOCK_SIZE: tl.constexpr
+):
+    # Get the thread index
+    pid = tl.program_id(0)
+    # Each block processes one row
+    row = pid
+    
+    # Shared memory for reduction
+    shared_max = tl.shared_memory(shape=(BLOCK_SIZE,), dtype=tl.float32)
+    shared_sum = tl.shared_memory(shape=(BLOCK_SIZE,), dtype=tl.float32)
+    
+    # Load input data for this row
+    input_row = tl.load(input_ptr + row * C + tl.arange(0, BLOCK_SIZE))
+    
+    # Apply log softmax
+    # Compute max for numerical stability
+    max_val = tl.max(input_row)
+    input_row = input_row - max_val
+    
+    # Compute log sum exp
+    exp_row = tl.exp(input_row)
+    sum_exp = tl.sum(exp_row)
+    log_sum_exp = tl.log(sum_exp)
+    
+    # Compute log softmax
+    log_softmax_row = input_row - log_sum_exp
+    
+    # Apply label smoothing if needed
+    if label_smoothing > 0.0:
+        smooth_log_softmax = log_softmax_row * (1.0 - label_smoothing) - label_smoothing * tl.log(C)
+        log_softmax_row = smooth_log_softmax
+    
+    # Load target
+    target_val = tl.load(target_ptr + row)
+    
+    # Check if target is ignore_index
+    if target_val == ignore_index:
+        loss_val = 0.0
+    else:
+        # Compute cross entropy loss
+        loss_val = -log_softmax_row[target_val]
+        
+        # Apply weight if provided
+        if weight_ptr is not None:
+            weight_val = tl.load(weight_ptr + target_val)
+            loss_val = loss_val * weight_val
+    
+    # Store result
+    tl.store(output_ptr + row, loss_val)
+
+def fused_cross_entropy_log_softmax(input: torch.Tensor, target: torch.Tensor, dim: int = 1, weight: torch.Tensor = None, ignore_index: int = -100, reduction: str = 'mean', label_smoothing: float = 0.0) -> torch.Tensor:
+    # Validate inputs
+    assert input.dim() == target.dim() + 1 or input.dim() == target.dim(), "Input and target dimensions mismatch"
+    assert dim < input.dim(), "dim must be less than input dimensions"
+    
+    # Get dimensions
+    N = input.shape[0]  # batch size
+    C = input.shape[dim]  # number of classes
+    
+    # Ensure target has the same number of dimensions as input
+    if target.dim() < input.dim():
+        target = target.unsqueeze(-1)
+    
+    # Prepare output tensor
+    output = torch.empty(N, dtype=torch.float32, device=input.device)
+    
+    # Launch kernel
+    BLOCK_SIZE = 1024
+    grid = (N,)
+    
+    # Handle weight tensor
+    weight_ptr = weight.data_ptr() if weight is not None else None
+    
+    # Launch kernel
+    fused_cross_entropy_log_softmax_kernel[grid](
+        input.data_ptr(),
+        target.data_ptr(),
+        weight_ptr,
+        output.data_ptr(),
+        N, C, dim, ignore_index, reduction, label_smoothing,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    # Apply reduction
+    if reduction == 'mean':
+        return output.mean()
+    elif reduction == 'sum':
+        return output.sum()
+    else:  # reduction == 'none'
+        return output
+```

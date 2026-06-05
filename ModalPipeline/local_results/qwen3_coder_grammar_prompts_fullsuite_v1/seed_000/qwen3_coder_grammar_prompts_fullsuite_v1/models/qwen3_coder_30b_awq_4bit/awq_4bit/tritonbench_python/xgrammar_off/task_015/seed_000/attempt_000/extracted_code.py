@@ -1,0 +1,47 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _add_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, alpha: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+    tl.store(out_ptr + offsets, x + alpha * y, mask=mask)
+
+def add(input, other, *, alpha=1, out=None):
+    # Handle scalar other case
+    if not torch.is_tensor(other):
+        return input + alpha * other
+    
+    # Ensure inputs have the same dtype for computation
+    if input.dtype != other.dtype:
+        # Promote to common dtype
+        common_dtype = torch.result_type(input, other)
+        input = input.to(common_dtype)
+        other = other.to(common_dtype)
+    
+    # Handle broadcasting
+    # For simplicity, we'll use PyTorch's built-in broadcasting
+    # since Triton doesn't handle complex broadcasting natively
+    out_shape = torch.broadcast_shapes(input.shape, other.shape)
+    
+    # Create output tensor
+    if out is None:
+        out = torch.empty(out_shape, dtype=input.dtype, device=input.device)
+    else:
+        if out.shape != out_shape:
+            raise ValueError(f"Output tensor shape {out.shape} does not match expected broadcast shape {out_shape}")
+    
+    # If shapes match exactly, use Triton kernel
+    if input.shape == other.shape:
+        n = input.numel()
+        block = 256
+        grid = (triton.cdiv(n, block),)
+        _add_kernel[grid](input, other, out, n, alpha, BLOCK=block)
+        return out
+    else:
+        # Fall back to PyTorch for broadcasting
+        return torch.add(input, other, alpha=alpha, out=out)

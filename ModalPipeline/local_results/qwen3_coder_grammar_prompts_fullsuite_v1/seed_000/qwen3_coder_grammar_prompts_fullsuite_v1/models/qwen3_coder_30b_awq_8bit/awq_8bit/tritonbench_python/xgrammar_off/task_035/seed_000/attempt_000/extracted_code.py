@@ -1,0 +1,84 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fused_mv_sigmoid_sub_kernel(
+    input_ptr, vec_ptr, other_ptr, out_ptr,
+    n: tl.constexpr, m: tl.constexpr,
+    alpha: tl.constexpr,
+    input_stride_0: tl.constexpr, input_stride_1: tl.constexpr,
+    vec_stride: tl.constexpr,
+    other_stride: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    row = pid
+    
+    if row >= n:
+        return
+    
+    # Load vector
+    vec = tl.load(vec_ptr + tl.arange(0, BLOCK_SIZE) * vec_stride, mask=tl.arange(0, BLOCK_SIZE) < m)
+    
+    # Compute dot product for this row
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    for i in range(0, m, BLOCK_SIZE):
+        vec_offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = vec_offsets < m
+        
+        input_vals = tl.load(input_ptr + row * input_stride_0 + vec_offsets * input_stride_1, mask=mask)
+        acc += input_vals * tl.load(vec_ptr + vec_offsets * vec_stride, mask=mask)
+    
+    # Compute sigmoid
+    sigmoid_vals = 1.0 / (1.0 + tl.exp(-acc))
+    
+    # Load other value (scalar or tensor)
+    if other_stride == 0:  # scalar
+        other_val = other_ptr[0]
+    else:
+        other_val = tl.load(other_ptr + row * other_stride, mask=row < n)
+    
+    # Apply alpha and subtract
+    result = sigmoid_vals - alpha * other_val
+    
+    # Store result
+    tl.store(out_ptr + row * input_stride_0, result, mask=tl.arange(0, BLOCK_SIZE) < m)
+
+def fused_mv_sigmoid_sub(input, vec, other, alpha=1, *, out=None):
+    # Validate inputs
+    assert input.dim() == 2, "input must be a 2D tensor"
+    assert vec.dim() == 1, "vec must be a 1D tensor"
+    assert input.size(1) == vec.size(0), "input and vec dimensions must match"
+    
+    n, m = input.shape
+    out = torch.empty_like(input) if out is None else out
+    
+    # Handle scalar other
+    if not torch.is_tensor(other):
+        other = torch.tensor(other, dtype=input.dtype, device=input.device)
+    
+    # Determine if other is scalar or tensor
+    other_is_scalar = other.dim() == 0 or (other.dim() == 1 and other.size(0) == 1)
+    
+    # Set up kernel launch parameters
+    BLOCK_SIZE = 256
+    grid = (n,)
+    
+    # Determine strides
+    input_stride_0, input_stride_1 = input.stride()
+    vec_stride = vec.stride(0) if vec.numel() > 0 else 0
+    other_stride = 0 if other_is_scalar else other.stride(0) if other.numel() > 0 else 0
+    
+    # Launch kernel
+    _fused_mv_sigmoid_sub_kernel[grid](
+        input, vec, other, out,
+        n, m,
+        alpha,
+        input_stride_0, input_stride_1,
+        vec_stride,
+        other_stride,
+        BLOCK_SIZE
+    )
+    
+    return out

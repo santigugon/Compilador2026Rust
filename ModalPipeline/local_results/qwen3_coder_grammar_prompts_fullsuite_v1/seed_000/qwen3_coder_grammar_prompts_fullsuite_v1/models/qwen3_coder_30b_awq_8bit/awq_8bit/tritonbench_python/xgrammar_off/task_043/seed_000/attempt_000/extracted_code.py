@@ -1,0 +1,72 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _symmetric_mv_norm_kernel(A_ptr, x_ptr, y_ptr, out_ptr, n: tl.constexpr, alpha: tl.constexpr, beta: tl.constexpr, p: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    
+    # Load x values
+    x_vals = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Compute matrix-vector product for symmetric matrix
+    # For symmetric matrix, we only need to compute one triangular part
+    # and then add the transpose part
+    y_vals = tl.zeros((BLOCK,), dtype=tl.float32)
+    
+    for i in range(n):
+        # Load A[i, :] values
+        a_row = tl.load(A_ptr + i * n + offsets, mask=mask, other=0.0)
+        # Compute dot product of row i with x
+        y_vals += a_row * x_vals
+    
+    # Load existing y values
+    old_y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+    
+    # Apply alpha * A @ x + beta * y
+    result = alpha * y_vals + beta * old_y
+    
+    # Store result in y
+    tl.store(y_ptr + offsets, result, mask=mask)
+    
+    # Compute norm
+    if pid == 0:
+        # Compute sum of |y|^p
+        if p == 1.0:
+            norm_val = tl.sum(tl.abs(result))
+        elif p == 2.0:
+            norm_val = tl.sqrt(tl.sum(result * result))
+        elif p == float('inf'):
+            norm_val = tl.max(tl.abs(result))
+        elif p == float('-inf'):
+            norm_val = tl.min(tl.abs(result))
+        else:
+            norm_val = tl.pow(tl.sum(tl.pow(tl.abs(result), p)), 1.0 / p)
+        
+        tl.store(out_ptr, norm_val)
+
+def symmetric_matrix_vector_norm(A: torch.Tensor, x: torch.Tensor, alpha: float, beta: float, p: float = 2.0) -> torch.Tensor:
+    # Validate inputs
+    assert A.dim() == 2 and A.shape[0] == A.shape[1], "A must be a square matrix"
+    assert x.dim() == 1 and x.shape[0] == A.shape[0], "x must be a vector with length matching A's dimension"
+    
+    n = A.shape[0]
+    y = torch.empty_like(x)
+    
+    # Initialize y with x
+    y.copy_(x)
+    
+    # Create output tensor for norm
+    out = torch.empty(1, dtype=torch.float32, device=A.device)
+    
+    # Launch kernel
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    
+    # For simplicity, we'll use a more straightforward approach
+    # Compute the matrix-vector product and norm in a single kernel
+    _symmetric_mv_norm_kernel[grid](A, x, y, out, n, alpha, beta, p, BLOCK=block)
+    
+    return out[0]

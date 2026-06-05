@@ -1,0 +1,97 @@
+import torch
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def sum_kernel(
+    input_ptr, 
+    output_ptr, 
+    n_elements, 
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    output = tl.sum(input, axis=0)
+    tl.store(output_ptr + pid, output, mask=mask)
+
+@triton.jit
+def std_kernel(
+    input_ptr, 
+    output_ptr, 
+    n_elements, 
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    mean = tl.sum(input, axis=0) / n_elements
+    squared_diff = (input - mean) ** 2
+    variance = tl.sum(squared_diff, axis=0) / (n_elements - 1)
+    std = tl.sqrt(variance)
+    tl.store(output_ptr + pid, std, mask=mask)
+
+def sum_std(input, dim=None, keepdim=False, dtype=None, correction=1, out=None):
+    if dtype is not None:
+        input = input.to(dtype)
+    
+    if dim is None:
+        # Reduce all dimensions
+        input_flat = input.flatten()
+        n_elements = input_flat.numel()
+        output = torch.empty(1, dtype=input.dtype, device=input.device)
+        
+        # Use Triton kernel for sum
+        grid = (triton.cdiv(n_elements, 1024),)
+        sum_kernel[grid](input_flat, output, n_elements, BLOCK_SIZE=1024)
+        
+        # Calculate standard deviation
+        if correction == 1:
+            std = torch.std(input_flat, unbiased=True)
+        else:
+            std = torch.std(input_flat, unbiased=False)
+        
+        return std
+    
+    # Handle specific dimensions
+    input_shape = input.shape
+    if isinstance(dim, int):
+        dim = (dim,)
+    
+    # Calculate output shape
+    output_shape = list(input_shape)
+    for d in sorted(dim, reverse=True):
+        if d < 0:
+            d += len(input_shape)
+        output_shape.pop(d)
+    
+    # Flatten the tensor along the specified dimensions
+    if len(dim) == len(input_shape):
+        # All dimensions reduced
+        input_flat = input.flatten()
+        n_elements = input_flat.numel()
+        output = torch.empty(1, dtype=input.dtype, device=input.device)
+        
+        # Use Triton kernel for sum
+        grid = (triton.cdiv(n_elements, 1024),)
+        sum_kernel[grid](input_flat, output, n_elements, BLOCK_SIZE=1024)
+        
+        # Calculate standard deviation
+        if correction == 1:
+            std = torch.std(input_flat, unbiased=True)
+        else:
+            std = torch.std(input_flat, unbiased=False)
+        
+        return std
+    
+    # For partial reduction, use PyTorch's implementation
+    reduced = torch.sum(input, dim=dim, keepdim=keepdim)
+    if keepdim:
+        std = torch.std(reduced, unbiased=correction == 1)
+    else:
+        std = torch.std(reduced, unbiased=correction == 1)
+    
+    return std

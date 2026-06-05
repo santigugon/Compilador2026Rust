@@ -1,0 +1,118 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def adam_kernel(
+    param_ptr, 
+    grad_ptr, 
+    exp_avg_ptr, 
+    exp_avg_sq_ptr, 
+    max_exp_avg_sq_ptr,
+    lr, 
+    beta1, 
+    beta2, 
+    eps, 
+    weight_decay,
+    amsgrad,
+    maximize,
+    step,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    param = tl.load(param_ptr + offsets, mask=mask)
+    grad = tl.load(grad_ptr + offsets, mask=mask)
+    
+    if weight_decay != 0:
+        grad = grad + weight_decay * param
+    
+    exp_avg = tl.load(exp_avg_ptr + offsets, mask=mask)
+    exp_avg_sq = tl.load(exp_avg_sq_ptr + offsets, mask=mask)
+    
+    exp_avg = beta1 * exp_avg + (1 - beta1) * grad
+    exp_avg_sq = beta2 * exp_avg_sq + (1 - beta2) * grad * grad
+    
+    if amsgrad:
+        max_exp_avg_sq = tl.load(max_exp_avg_sq_ptr + offsets, mask=mask)
+        max_exp_avg_sq = tl.maximum(max_exp_avg_sq, exp_avg_sq)
+        tl.store(max_exp_avg_sq_ptr + offsets, max_exp_avg_sq, mask=mask)
+        denom = tl.sqrt(max_exp_avg_sq) + eps
+    else:
+        denom = tl.sqrt(exp_avg_sq) + eps
+    
+    bias_correction1 = 1 - beta1 ** step
+    bias_correction2 = 1 - beta2 ** step
+    
+    step_size = lr / bias_correction1
+    if maximize:
+        step_size = -step_size
+    
+    param_update = step_size * exp_avg / (bias_correction2 * denom)
+    param = param + param_update
+    
+    tl.store(param_ptr + offsets, param, mask=mask)
+    tl.store(exp_avg_ptr + offsets, exp_avg, mask=mask)
+    tl.store(exp_avg_sq_ptr + offsets, exp_avg_sq, mask=mask)
+
+class Adam:
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, amsgrad=False, foreach=None, maximize=False, capturable=False, differentiable=False, fused=None):
+        self.params = list(params)
+        self.lr = lr
+        self.betas = betas
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.amsgrad = amsgrad
+        self.foreach = foreach
+        self.maximize = maximize
+        self.capturable = capturable
+        self.differentiable = differentiable
+        self.fused = fused
+        
+        # Initialize momentum buffers
+        self.exp_avg = [torch.zeros_like(p) for p in self.params]
+        self.exp_avg_sq = [torch.zeros_like(p) for p in self.params]
+        self.max_exp_avg_sq = [torch.zeros_like(p) for p in self.params]
+        self.step = 0
+
+    def step(self):
+        self.step += 1
+        beta1, beta2 = self.betas
+        
+        for i, param in enumerate(self.params):
+            if param.grad is None:
+                continue
+                
+            grad = param.grad
+            exp_avg = self.exp_avg[i]
+            exp_avg_sq = self.exp_avg_sq[i]
+            max_exp_avg_sq = self.max_exp_avg_sq[i]
+            
+            # Use Triton kernel for optimization
+            n_elements = param.numel()
+            BLOCK_SIZE = 1024
+            grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+            
+            adam_kernel[grid](
+                param.data_ptr(),
+                grad.data_ptr(),
+                exp_avg.data_ptr(),
+                exp_avg_sq.data_ptr(),
+                max_exp_avg_sq.data_ptr(),
+                self.lr,
+                beta1,
+                beta2,
+                self.eps,
+                self.weight_decay,
+                self.amsgrad,
+                self.maximize,
+                self.step,
+                n_elements,
+                BLOCK_SIZE
+            )
+```

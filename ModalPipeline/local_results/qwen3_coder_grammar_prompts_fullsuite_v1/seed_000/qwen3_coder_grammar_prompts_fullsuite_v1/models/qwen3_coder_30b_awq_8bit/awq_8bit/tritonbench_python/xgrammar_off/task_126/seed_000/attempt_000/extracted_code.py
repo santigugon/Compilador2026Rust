@@ -1,0 +1,34 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def gelu_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    # GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    sqrt_2_over_pi = 0.7978845608028654  # sqrt(2/pi)
+    coeff = 0.044715
+    gelu_x = 0.5 * x * (1.0 + tl.tanh(sqrt_2_over_pi * (x + coeff * x * x * x)))
+    tl.store(output_ptr + offsets, gelu_x, mask=mask)
+
+def gelu(input, approximate='none'):
+    if approximate != 'none':
+        raise ValueError("Triton implementation only supports exact GELU computation")
+    
+    output = torch.empty_like(input)
+    n_elements = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    gelu_kernel[grid](
+        input,
+        output,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return output

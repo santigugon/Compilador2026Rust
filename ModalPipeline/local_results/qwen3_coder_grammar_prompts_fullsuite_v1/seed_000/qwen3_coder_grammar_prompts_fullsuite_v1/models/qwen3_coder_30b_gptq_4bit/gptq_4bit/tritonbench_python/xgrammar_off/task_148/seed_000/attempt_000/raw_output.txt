@@ -1,0 +1,134 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def adam_kernel(
+    param_ptr, 
+    grad_ptr, 
+    exp_avg_ptr, 
+    exp_avg_sq_ptr, 
+    max_exp_avg_sq_ptr,
+    lr, 
+    beta1, 
+    beta2, 
+    eps, 
+    weight_decay, 
+    amsgrad, 
+    maximize, 
+    step, 
+    n_params
+):
+    pid = tl.program_id(0)
+    if pid >= n_params:
+        return
+    
+    param = tl.load(param_ptr + pid)
+    grad = tl.load(grad_ptr + pid)
+    
+    exp_avg = tl.load(exp_avg_ptr + pid)
+    exp_avg_sq = tl.load(exp_avg_sq_ptr + pid)
+    
+    if amsgrad:
+        max_exp_avg_sq = tl.load(max_exp_avg_sq_ptr + pid)
+    
+    # Update biased first moment estimate
+    exp_avg = beta1 * exp_avg + (1 - beta1) * grad
+    
+    # Update biased second raw moment estimate
+    exp_avg_sq = beta2 * exp_avg_sq + (1 - beta2) * grad * grad
+    
+    if amsgrad:
+        max_exp_avg_sq = tl.maximum(max_exp_avg_sq, exp_avg_sq)
+        denom = tl.sqrt(max_exp_avg_sq) + eps
+    else:
+        denom = tl.sqrt(exp_avg_sq) + eps
+    
+    # Compute bias-corrected learning rate
+    bias_correction1 = 1 - beta1 ** step
+    bias_correction2 = 1 - beta2 ** step
+    
+    # Apply weight decay
+    if weight_decay != 0:
+        param = param - weight_decay * param
+    
+    # Compute step size
+    step_size = lr / bias_correction1
+    
+    # Update parameter
+    if maximize:
+        param = param + step_size * exp_avg / denom
+    else:
+        param = param - step_size * exp_avg / denom
+    
+    # Store updated values
+    tl.store(param_ptr + pid, param)
+    tl.store(exp_avg_ptr + pid, exp_avg)
+    tl.store(exp_avg_sq_ptr + pid, exp_avg_sq)
+    
+    if amsgrad:
+        tl.store(max_exp_avg_sq_ptr + pid, max_exp_avg_sq)
+
+def Adam(params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, amsgrad=False, foreach=None, maximize=False, capturable=False, differentiable=False, fused=None):
+    if foreach is not None or fused is not None:
+        raise NotImplementedError("foreach and fused options are not implemented in this Triton version")
+    
+    if capturable or differentiable:
+        raise NotImplementedError("capturable and differentiable options are not implemented in this Triton version")
+    
+    if not isinstance(params, (list, tuple)):
+        raise TypeError("params must be a list or tuple of tensors")
+    
+    if len(params) == 0:
+        raise ValueError("params must contain at least one parameter")
+    
+    # Flatten all parameters into a single tensor for processing
+    param_tensors = []
+    for p in params:
+        if not isinstance(p, torch.Tensor):
+            raise TypeError("All params must be torch.Tensor objects")
+        param_tensors.append(p)
+    
+    # Flatten all parameters into a single tensor
+    flat_params = torch.cat([p.flatten() for p in param_tensors])
+    flat_grads = torch.cat([p.grad.flatten() for p in param_tensors if p.grad is not None])
+    
+    # Initialize momentum and variance tensors
+    exp_avg = torch.zeros_like(flat_params)
+    exp_avg_sq = torch.zeros_like(flat_params)
+    max_exp_avg_sq = torch.zeros_like(flat_params) if amsgrad else None
+    
+    # Get step count (assuming it's tracked elsewhere)
+    step = 1
+    
+    # Launch kernel
+    n_params = flat_params.shape[0]
+    grid = (triton.cdiv(n_params, 1024),)
+    
+    adam_kernel[grid](
+        flat_params,
+        flat_grads,
+        exp_avg,
+        exp_avg_sq,
+        max_exp_avg_sq,
+        lr,
+        betas[0],
+        betas[1],
+        eps,
+        weight_decay,
+        amsgrad,
+        maximize,
+        step,
+        n_params
+    )
+    
+    # Reshape back to original parameter shapes
+    start = 0
+    for i, p in enumerate(param_tensors):
+        end = start + p.numel()
+        p.data = flat_params[start:end].view(p.shape)
+        start = end
+    
+    return params
+```

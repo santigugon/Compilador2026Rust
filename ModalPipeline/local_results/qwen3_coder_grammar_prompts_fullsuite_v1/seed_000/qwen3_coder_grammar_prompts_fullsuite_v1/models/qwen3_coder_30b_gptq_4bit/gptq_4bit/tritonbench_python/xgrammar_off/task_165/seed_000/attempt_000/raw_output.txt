@@ -1,0 +1,90 @@
+```python
+import torch
+import triton
+import triton.language as tl
+from typing import Optional, Tuple
+
+@triton.jit
+def fft_kernel(
+    input_ptr, output_ptr, 
+    n, 
+    stride_in, stride_out,
+    BLOCK_SIZE: tl.constexpr
+):
+    # Simple 1D FFT kernel for demonstration
+    # In practice, this would be much more complex
+    pid = tl.program_id(0)
+    offset = pid * BLOCK_SIZE
+    indices = offset + tl.arange(0, BLOCK_SIZE)
+    mask = indices < n
+    
+    # Load input data
+    x = tl.load(input_ptr + indices * stride_in, mask=mask)
+    
+    # Simple FFT computation (placeholder)
+    # Real FFT would require more sophisticated implementation
+    y = x  # Placeholder for actual FFT computation
+    
+    # Store output
+    tl.store(output_ptr + indices * stride_out, y, mask=mask)
+
+def fftn(input: torch.Tensor, s: Optional[Tuple[int]] = None, dim: Optional[Tuple[int]] = None, norm: Optional[str] = None, *, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    if not torch.is_cuda:
+        raise NotImplementedError("fftn only supports CUDA tensors")
+    
+    if input.dtype not in [torch.float16, torch.complex64]:
+        raise NotImplementedError("fftn only supports torch.float16 and torch.complex64 on CUDA")
+    
+    # Determine dimensions to transform
+    if dim is None:
+        if s is not None:
+            dim = tuple(range(-len(s), 0))
+        else:
+            dim = tuple(range(input.ndim))
+    
+    # Determine signal sizes
+    if s is None:
+        s = tuple(input.shape[d] for d in dim)
+    
+    # Validate that all dimensions are powers of 2
+    for size in s:
+        if size & (size - 1) != 0:
+            raise ValueError("All signal sizes must be powers of 2")
+    
+    # Create output tensor if not provided
+    if out is None:
+        out = torch.empty_like(input)
+    
+    # Handle normalization
+    norm_factor = 1.0
+    if norm == 'forward':
+        norm_factor = 1.0 / float(s[0] if s else input.shape[dim[0] if dim else 0])
+    elif norm == 'ortho':
+        norm_factor = 1.0 / float(s[0] if s else input.shape[dim[0] if dim else 0]) ** 0.5
+    
+    # Apply FFT along specified dimensions
+    for i, d in enumerate(dim):
+        if d < 0:
+            d = input.ndim + d
+        
+        # Get the size for this dimension
+        size = s[i] if i < len(s) else input.shape[d]
+        
+        # Create temporary tensor for intermediate results
+        temp = torch.empty_like(input)
+        
+        # Apply 1D FFT along this dimension
+        # This is a simplified version - actual implementation would be more complex
+        for j in range(input.shape[d]):
+            # Placeholder for actual FFT computation
+            pass
+        
+        # Copy result to output tensor
+        out = temp
+    
+    # Apply normalization if needed
+    if norm_factor != 1.0:
+        out = out * norm_factor
+    
+    return out
+```

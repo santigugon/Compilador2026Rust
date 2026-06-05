@@ -1,0 +1,6 @@
+The previous MiniTriton/Triton code failed compilation or call accuracy.
+
+Compiler / runtime error:
+{error_text}
+
+Fix the code. Output the same format as before (JSON for MiniTriton profile, or a single ```python``` block for TritonBench).

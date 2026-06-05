@@ -1,0 +1,95 @@
+import triton
+import triton.language as tl
+import torch
+from typing import List, Tuple, Union
+
+@triton.jit
+def tensordot_kernel(
+    a_ptr, b_ptr, out_ptr,
+    a_shape0, a_shape1, a_shape2, a_shape3,
+    b_shape0, b_shape1, b_shape2, b_shape3,
+    contract_dim0, contract_dim1,
+    out_shape0, out_shape1, out_shape2, out_shape3,
+    BLOCK_SIZE_M=16, BLOCK_SIZE_N=16, BLOCK_SIZE_K=16
+):
+    # Get the block indices
+    block_idx_m = tl.program_id(0)
+    block_idx_n = tl.program_id(1)
+    block_idx_k = tl.program_id(2)
+    
+    # Compute the start indices for this block
+    start_m = block_idx_m * BLOCK_SIZE_M
+    start_n = block_idx_n * BLOCK_SIZE_N
+    start_k = block_idx_k * BLOCK_SIZE_K
+    
+    # Initialize accumulator
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    # Loop over the K dimension
+    for k in range(0, contract_dim0, BLOCK_SIZE_K):
+        # Load a and b tiles
+        a_tile = tl.load(
+            a_ptr + start_m * a_shape1 + k,
+            mask=(start_m < out_shape0) & (k < contract_dim0)
+        )
+        b_tile = tl.load(
+            b_ptr + k * b_shape1 + start_n,
+            mask=(k < contract_dim0) & (start_n < out_shape1)
+        )
+        # Perform matrix multiplication
+        accumulator += tl.dot(a_tile, b_tile)
+    
+    # Store result
+    tl.store(
+        out_ptr + start_m * out_shape1 + start_n,
+        accumulator,
+        mask=(start_m < out_shape0) & (start_n < out_shape1)
+    )
+
+def tensordot(a: torch.Tensor, b: torch.Tensor, dims: Union[int, Tuple[List[int], List[int]], List[List[int]]]) -> torch.Tensor:
+    # Handle different types of dims
+    if isinstance(dims, int):
+        # Contract last dims
+        a_contract_dims = list(range(len(a.shape) - dims, len(a.shape)))
+        b_contract_dims = list(range(0, dims))
+    elif isinstance(dims, tuple):
+        a_contract_dims, b_contract_dims = dims
+    else:
+        a_contract_dims, b_contract_dims = dims
+    
+    # Validate dimensions
+    if len(a_contract_dims) != len(b_contract_dims):
+        raise ValueError("Number of dimensions to contract must be equal for both tensors")
+    
+    # Compute output shape
+    a_out_shape = [s for i, s in enumerate(a.shape) if i not in a_contract_dims]
+    b_out_shape = [s for i, s in enumerate(b.shape) if i not in b_contract_dims]
+    
+    # Check if contraction is valid
+    contract_size = 1
+    for i in range(len(a_contract_dims)):
+        if a.shape[a_contract_dims[i]] != b.shape[b_contract_dims[i]]:
+            raise ValueError("Contraction dimensions must match")
+        contract_size *= a.shape[a_contract_dims[i]]
+    
+    # Compute output shape
+    output_shape = a_out_shape + b_out_shape
+    
+    # Flatten tensors for computation
+    a_flat = a.view(-1, contract_size)
+    b_flat = b.view(contract_size, -1)
+    
+    # Create output tensor
+    out = torch.empty(output_shape, dtype=torch.float32)
+    
+    # Launch kernel
+    grid = (1, 1, 1)
+    tensordot_kernel[grid](
+        a_flat, b_flat, out,
+        a_flat.shape[0], a_flat.shape[1], 1, 1,
+        b_flat.shape[0], b_flat.shape[1], 1, 1,
+        contract_size, contract_size,
+        out.shape[0], out.shape[1], 1, 1
+    )
+    
+    return out

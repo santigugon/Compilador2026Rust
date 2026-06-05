@@ -1,0 +1,167 @@
+import torch
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def conv2d_relu_kernel(
+    input_ptr, weight_ptr, bias_ptr, output_ptr,
+    input_height, input_width,
+    output_height, output_width,
+    in_channels, out_channels,
+    kernel_height, kernel_width,
+    stride_h, stride_w,
+    padding_h, padding_w,
+    dilation_h, dilation_w,
+    groups,
+    BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C
+):
+    # Get thread indices
+    batch_idx = tl.program_id(0)
+    out_ch_idx = tl.program_id(1)
+    out_h_idx = tl.program_id(2)
+    out_w_idx = tl.program_id(3)
+    
+    # Calculate output dimensions
+    output_h = output_height
+    output_w = output_width
+    
+    # Calculate input dimensions
+    input_h = input_height
+    input_w = input_width
+    
+    # Calculate kernel dimensions
+    kH = kernel_height
+    kW = kernel_width
+    
+    # Calculate padding and stride
+    pad_h = padding_h
+    pad_w = padding_w
+    stride_h = stride_h
+    stride_w = stride_w
+    dilation_h = dilation_h
+    dilation_w = dilation_w
+    
+    # Calculate effective kernel size with dilation
+    eff_kH = (kH - 1) * dilation_h + 1
+    eff_kW = (kW -1) * dilation_w + 1
+    
+    # Calculate input indices
+    input_h_start = out_h_idx * stride_h - pad_h
+    input_w_start = out_w_idx * stride_w - pad_w
+    
+    # Calculate output index
+    output_idx = batch_idx * out_channels * output_h * output_w + \
+                 out_ch_idx * output_h * output_w + \
+                 out_h_idx * output_w + out_w_idx
+    
+    # Initialize accumulator
+    acc = 0.0
+    
+    # Loop over input channels and kernel elements
+    for g in range(groups):
+        for kh in range(kH):
+            for kw in range(kW):
+                # Calculate input indices
+                ih = input_h_start + kh * dilation_h
+                iw = input_w_start + kw * dilation_w
+                
+                # Check bounds
+                if ih >= 0 and ih < input_h and iw >= 0 and iw < input_w:
+                    # Calculate input index
+                    input_ch = g * (in_channels // groups) + (out_ch_idx % (in_channels // groups))
+                    input_idx = batch_idx * in_channels * input_h * input_w + \
+                                input_ch * input_h * input_w + \
+                                ih * input_w + iw
+                    
+                    # Calculate weight index
+                    weight_ch = g * (in_channels // groups) + (out_ch_idx % (in_channels // groups))
+                    weight_idx = out_ch_idx * (in_channels // groups) * kH * kW + \
+                                 weight_ch * kH * kW + \
+                                 kh * kW + kw
+                    
+                    # Accumulate
+                    acc += tl.load(input_ptr + input_idx) * tl.load(weight_ptr + weight_idx)
+    
+    # Add bias if present
+    if bias_ptr is not None:
+        acc += tl.load(bias_ptr + out_ch_idx)
+    
+    # Apply ReLU
+    acc = tl.maximum(acc, 0.0)
+    
+    # Store result
+    tl.store(output_ptr + output_idx, acc)
+
+def relu_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, inplace=False):
+    # Handle stride
+    if isinstance(stride, int):
+        stride_h = stride_w = stride
+    else:
+        stride_h, stride_w = stride
+    
+    # Handle padding
+    if isinstance(padding, int):
+        padding_h = padding_w = padding
+    elif isinstance(padding, tuple):
+        padding_h, padding_w = padding
+    else:
+        raise ValueError("padding must be int or tuple")
+    
+    # Handle dilation
+    if isinstance(dilation, int):
+        dilation_h = dilation_w = dilation
+    else:
+        dilation_h, dilation_w = dilation
+    
+    # Get input dimensions
+    batch_size, in_channels, input_h, input_w = input.shape
+    out_channels, _, kernel_h, kernel_w = weight.shape
+    
+    # Calculate output dimensions
+    output_h = (input_h + 2 * padding_h - (dilation_h * (kernel_h - 1) + 1)) // stride_h + 1
+    output_w = (input_w + 2 * padding_w - (dilation_w * (kernel_w - 1) + 1)) // stride_w + 1
+    
+    # Create output tensor
+    output = torch.empty(batch_size, out_channels, output_h, output_w, device=input.device, dtype=input.dtype)
+    
+    # Prepare for kernel launch
+    grid = (
+        batch_size,
+        out_channels,
+        output_h,
+        output_w
+    )
+    
+    # Define block sizes
+    BLOCK_SIZE_H = 16
+    BLOCK_SIZE_W = 16
+    BLOCK_SIZE_C = 32
+    
+    # Launch kernel
+    conv2d_relu_kernel[grid](
+        input_ptr=input.data_ptr(),
+        weight_ptr=weight.data_ptr(),
+        bias_ptr=bias.data_ptr() if bias is not None else None,
+        output_ptr=output.data_ptr(),
+        input_height=input_h,
+        input_width=input_w,
+        output_height=output_h,
+        output_width=output_w,
+        in_channels=in_channels,
+        out_channels=out_channels,
+        kernel_height=kernel_h,
+        kernel_width=kernel_w,
+        stride_h=stride_h,
+        stride_w=stride_w,
+        padding_h=padding_h,
+        padding_w=padding_w,
+        dilation_h=dilation_h,
+        dilation_w=dilation_w,
+        groups=groups,
+        BLOCK_SIZE_H=BLOCK_SIZE_H,
+        BLOCK_SIZE_W=BLOCK_SIZE_W,
+        BLOCK_SIZE_C=BLOCK_SIZE_C
+    )
+    
+    return output

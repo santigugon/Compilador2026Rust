@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are an expert Triton programmer.\n\nGenerate ONLY a single valid Python module.\nNo explanations.\nNo prose.\nNo markdown outside the code block.\nNo tests.\nNo example calls.\n\nThe module must contain:\n- imports\n- Triton kernels\n- wrapper function\n\nThe wrapper function must exactly match the required signature.\n\nWrap the entire response in ONE ```python``` block.\n"
+  },
+  {
+    "role": "user",
+    "content": "You are an expert in Trion programming, capable of writing corresponding Triton kernels and wrapper functions based on functional descriptions and function parameters. Ensure that the wrapper function fully corresponds to the provided function information.\nFunctional Description: Performs a fused operation combining batch matrix multiplication, RMS normalization, GELU activation, and dropout.\nWrapper Entry Information: fused_bmm_rmsnorm_gelu_dropout(input1, input2, normalized_shape, dropout_p=0.1, eps=1e-5, training=True, approximate='none', *, out=None) -> Tensor; input1 (Tensor): First input tensor for bmm, of shape (B, N, M), where B is the batch size; input2 (Tensor): Second input tensor for bmm, of shape (B, M, P); normalized_shape (int or list or torch.Size): Input shape from an expected input of size (B, N, P). This is the shape over which RMS normalization is applied; dropout_p (float, optional): Probability of an element to be zeroed in the dropout layer. Default: 0.1; eps (float, optional): A value added to the denominator for numerical stability in RMS normalization. Default: 1e-5; training (bool, optional): Apply dropout if True. Default: True; approximate (str, optional): Can be 'none' or 'tanh'. The approximation to use for GELU. Default: 'none'; out (Tensor, optional): Output tensor. Ignored if None. Default: None.\nAfter generation, verify if the Triton wrapper aligns with the provided func_inputs. If not, regenerate."
+  }
+]

@@ -1,0 +1,126 @@
+import torch
+import triton
+import triton.language as tl
+from torch.utils.cpp_extension import load
+
+# Load the Triton kernel
+try:
+    ldl_kernel = load(
+        name="ldl_kernel",
+        sources=["ldl_kernel.tri"],
+        extra_cuda_cflags=["-O3"],
+    )
+except:
+    # Fallback to pure Python implementation if Triton fails
+    def ldl_factor_triton(A, hermitian=False, out=None):
+        return None
+
+@triton.jit
+def ldl_kernel(
+    A_ptr, LD_ptr, pivots_ptr,
+    n, batch_size,
+    BLOCK_SIZE: tl.constexpr,
+    hermitian: tl.constexpr
+):
+    batch_idx = tl.program_id(0)
+    if batch_idx >= batch_size:
+        return
+    
+    # Load matrix A for this batch
+    A_batch = A_ptr + batch_idx * n * n
+    LD_batch = LD_ptr + batch_idx * n * n
+    
+    # Initialize pivots
+    pivots_batch = pivots_ptr + batch_idx * n
+    
+    # Simple LDL factorization kernel (simplified for demonstration)
+    for i in range(n):
+        # Store pivot
+        tl.store(pivots_batch + i, i + 1)
+        
+        # Compute diagonal element
+        diag_val = tl.load(A_batch + i * n + i)
+        if hermitian:
+            # For complex matrices, use conjugate transpose
+            diag_val = tl.conj(diag_val)
+        tl.store(LD_batch + i * n + i, diag_val)
+        
+        # Compute off-diagonal elements
+        for j in range(i + 1, n):
+            if i == 0:
+                # First row
+                val = tl.load(A_batch + j * n + i)
+                if hermitian:
+                    val = tl.conj(val)
+                tl.store(LD_batch + j * n + i, val)
+            else:
+                # Subsequent rows
+                val = tl.load(A_batch + j * n + i)
+                if hermitian:
+                    val = tl.conj(val)
+                # Accumulate previous computations
+                for k in range(i):
+                    val -= tl.load(LD_batch + j * n + k) * tl.load(LD_batch + i * n + k)
+                tl.store(LD_batch + j * n + i, val)
+
+def ldl_factor(A, *, hermitian=False, out=None):
+    """
+    Computes a compact representation of the LDL factorization of a Hermitian or symmetric matrix.
+    
+    Args:
+        A (Tensor): tensor of shape `(*, n, n)` where `*` is zero or more batch dimensions
+        hermitian (bool, optional): whether to consider the input to be Hermitian or symmetric
+        out (tuple, optional): tuple of two tensors to write the output to
+        
+    Returns:
+        A named tuple (LD, pivots)
+    """
+    # Validate input
+    if A.dim() < 2:
+        raise ValueError("Input tensor must have at least 2 dimensions")
+    
+    batch_dims = A.shape[:-2]
+    n = A.shape[-1]
+    if A.shape[-2] != n:
+        raise ValueError("Input tensor must be square")
+    
+    # Determine batch size
+    batch_size = 1
+    for dim in batch_dims:
+        batch_size *= dim
+    
+    # Create output tensors if not provided
+    if out is None:
+        LD = torch.empty_like(A)
+        pivots = torch.empty(batch_dims + (n,), dtype=torch.int32, device=A.device)
+    else:
+        LD, pivots = out
+    
+    # Ensure output tensors have correct shape
+    if LD.shape != A.shape:
+        raise ValueError("LD tensor must have the same shape as input tensor A")
+    if pivots.shape != batch_dims + (n,):
+        raise ValueError("pivots tensor must have shape (*, n)")
+    
+    # Handle different dtypes
+    dtype = A.dtype
+    if dtype not in [torch.float32, torch.float64, torch.complex64, torch.complex128]:
+        raise ValueError("Unsupported dtype")
+    
+    # Call Triton kernel
+    if batch_size > 0:
+        # Use Triton kernel for batched operations
+        grid = (batch_size,)
+        BLOCK_SIZE = 16
+        ldl_kernel[grid](
+            A,
+            LD,
+            pivots,
+            n,
+            batch_size,
+            BLOCK_SIZE=BLOCK_SIZE,
+            hermitian=hermitian
+        )
+    
+    # Return result as named tuple
+    return (LD, pivots)

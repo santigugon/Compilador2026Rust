@@ -1,0 +1,62 @@
+# MiniTriton secondary benchmark (parser gate; no TritonBench GPU eval).
+tasks:
+  - task_id: task_001
+    category: elementwise
+    difficulty: easy
+    description: Vector add with tl.load and tl.store.
+  - task_id: task_002
+    category: elementwise
+    difficulty: easy
+    description: Elementwise multiply.
+  - task_id: task_003
+    category: fused
+    difficulty: medium
+    description: Fused add + ReLU.
+  - task_id: task_004
+    category: reduction
+    difficulty: medium
+    description: Row-wise sum.
+  - task_id: task_005
+    category: reduction
+    difficulty: medium
+    description: Column-wise sum.
+  - task_id: task_006
+    category: matmul
+    difficulty: hard
+    description: Matrix multiplication.
+  - task_id: task_007
+    category: matmul
+    difficulty: hard
+    description: Batched matrix multiplication.
+  - task_id: task_008
+    category: normalization
+    difficulty: hard
+    description: Softmax.
+  - task_id: task_009
+    category: normalization
+    difficulty: hard
+    description: Layer normalization.
+  - task_id: task_010
+    category: normalization
+    difficulty: hard
+    description: RMSNorm.
+  - task_id: task_011
+    category: fused
+    difficulty: medium
+    description: Fused bias + GELU.
+  - task_id: task_012
+    category: memory
+    difficulty: medium
+    description: Masked load/store.
+  - task_id: task_013
+    category: dynamic
+    difficulty: hard
+    description: Dynamic shape handling.
+  - task_id: task_014
+    category: stride
+    difficulty: hard
+    description: Non-contiguous stride handling.
+  - task_id: task_015
+    category: reduction
+    difficulty: hard
+    description: Numerically sensitive reduction.

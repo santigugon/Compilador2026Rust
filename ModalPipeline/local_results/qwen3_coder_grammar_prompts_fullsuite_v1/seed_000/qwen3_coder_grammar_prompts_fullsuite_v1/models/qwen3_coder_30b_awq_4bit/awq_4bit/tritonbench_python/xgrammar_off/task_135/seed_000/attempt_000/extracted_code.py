@@ -1,0 +1,48 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _mul_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+    result = x * y
+    tl.store(out_ptr + offsets, result, mask=mask)
+
+def mul(input, other, *, out=None):
+    # Handle scalar other case
+    if not torch.is_tensor(other):
+        if out is not None:
+            return torch.mul(input, other, out=out)
+        return input * other
+    
+    # Ensure inputs are compatible for broadcasting
+    # For simplicity, we'll use torch's implementation for broadcasting
+    # and focus on the core multiplication kernel for tensors
+    
+    # Get output shape through broadcasting
+    if out is not None:
+        # Use torch's implementation for out parameter
+        return torch.mul(input, other, out=out)
+    
+    # For the kernel implementation, we need to handle broadcasting
+    # by using torch's broadcasting rules and then apply the kernel
+    # to the broadcasted tensors
+    
+    # Create output tensor with correct shape and dtype
+    out = torch.empty_like(input, dtype=torch.result_type(input, other))
+    
+    # If shapes are compatible for element-wise operation
+    if input.shape == other.shape:
+        # Direct element-wise multiplication
+        n = input.numel()
+        block = 256
+        grid = (triton.cdiv(n, block),)
+        _mul_kernel[grid](input, other, out, n, BLOCK=block)
+        return out
+    else:
+        # Use torch's broadcasting for complex cases
+        return torch.mul(input, other)

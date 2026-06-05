@@ -1,0 +1,127 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def cos_avg_pool1d_kernel(
+    input_ptr,
+    output_ptr,
+    input_stride_0,
+    input_stride_1,
+    input_stride_2,
+    output_stride_0,
+    output_stride_1,
+    output_stride_2,
+    input_size_0,
+    input_size_1,
+    input_size_2,
+    output_size_0,
+    output_size_1,
+    output_size_2,
+    kernel_size,
+    stride,
+    padding,
+    ceil_mode,
+    count_include_pad,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Get the block index
+    block_idx = tl.program_id(0)
+    
+    # Calculate the output index
+    output_idx = block_idx * BLOCK_SIZE
+    
+    # Calculate the input index
+    input_idx = output_idx * stride - padding
+    
+    # Initialize accumulator
+    accumulator = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    
+    # Loop over the kernel size
+    for i in range(kernel_size):
+        # Calculate the input index
+        input_i = input_idx + i
+        
+        # Check if the input index is within bounds
+        if input_i >= 0 and input_i < input_size_2:
+            # Load the input value
+            input_val = tl.load(input_ptr + input_i * input_stride_2)
+            # Apply cosine
+            input_val = tl.cos(input_val)
+            # Accumulate
+            accumulator += input_val
+    
+    # Calculate the number of elements included in the average
+    num_elements = 0
+    for i in range(kernel_size):
+        input_i = input_idx + i
+        if input_i >= 0 and input_i < input_size_2:
+            num_elements += 1
+    
+    # If count_include_pad is False, we need to adjust the number of elements
+    if not count_include_pad:
+        # Count the padding elements
+        padding_elements = 0
+        for i in range(kernel_size):
+            input_i = input_idx + i
+            if input_i < 0 or input_i >= input_size_2:
+                padding_elements += 1
+        num_elements -= padding_elements
+    
+    # Calculate the average
+    if num_elements > 0:
+        average = accumulator / num_elements
+    else:
+        average = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    
+    # Store the result
+    tl.store(output_ptr + output_idx * output_stride_2, average)
+
+def cos_avg_pool1d(input: torch.Tensor, kernel_size: int, stride: int = None, padding: int = 0, ceil_mode: bool = False, count_include_pad: bool = True) -> torch.Tensor:
+    # Handle default stride
+    if stride is None:
+        stride = kernel_size
+    
+    # Get input dimensions
+    minibatch, in_channels, iW = input.shape
+    
+    # Calculate output size
+    if ceil_mode:
+        output_size = (iW + 2 * padding - kernel_size) // stride + 1
+    else:
+        output_size = (iW + 2 * padding - kernel_size) // stride + 1
+    
+    # Create output tensor
+    output = torch.zeros((minibatch, in_channels, output_size), device=input.device, dtype=input.dtype)
+    
+    # Define block size
+    BLOCK_SIZE = 1024
+    
+    # Calculate grid size
+    grid = (output_size + BLOCK_SIZE - 1) // BLOCK_SIZE
+    
+    # Launch kernel
+    cos_avg_pool1d_kernel[grid](
+        input_ptr=input.data_ptr(),
+        output_ptr=output.data_ptr(),
+        input_stride_0=input.stride(0),
+        input_stride_1=input.stride(1),
+        input_stride_2=input.stride(2),
+        output_stride_0=output.stride(0),
+        output_stride_1=output.stride(1),
+        output_stride_2=output.stride(2),
+        input_size_0=minibatch,
+        input_size_1=in_channels,
+        input_size_2=iW,
+        output_size_0=minibatch,
+        output_size_1=in_channels,
+        output_size_2=output_size,
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding,
+        ceil_mode=ceil_mode,
+        count_include_pad=count_include_pad,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return output

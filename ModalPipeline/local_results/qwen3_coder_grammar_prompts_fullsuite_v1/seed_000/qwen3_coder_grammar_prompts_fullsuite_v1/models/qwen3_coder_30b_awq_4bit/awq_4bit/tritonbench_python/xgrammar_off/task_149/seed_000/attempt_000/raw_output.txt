@@ -1,0 +1,70 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _hstack_div_kernel(
+    stacked_ptr, 
+    divisor_ptr, 
+    out_ptr, 
+    n: tl.constexpr, 
+    rounding_mode: tl.constexpr,
+    BLOCK: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    
+    stacked = tl.load(stacked_ptr + offsets, mask=mask, other=0.0)
+    divisor = tl.load(divisor_ptr + offsets, mask=mask, other=1.0)
+    
+    # Perform division
+    result = stacked / divisor
+    
+    # Apply rounding if specified
+    if rounding_mode == 1:  # trunc
+        result = tl.where(result >= 0, tl.floor(result), tl.ceil(result))
+    elif rounding_mode == 2:  # floor
+        result = tl.floor(result)
+    
+    tl.store(out_ptr + offsets, result, mask=mask)
+
+def fused_hstack_div(tensors, divisor, *, rounding_mode=None, out=None):
+    # Handle scalar divisor
+    if not torch.is_tensor(divisor):
+        divisor = torch.tensor(divisor, dtype=torch.float32, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    
+    # Stack tensors horizontally
+    stacked = torch.hstack(tensors)
+    
+    # Handle output tensor
+    if out is None:
+        out = torch.empty_like(stacked)
+    else:
+        if out.shape != stacked.shape:
+            raise ValueError("Output tensor shape must match the stacked tensor shape")
+    
+    # Determine rounding mode
+    rounding_mode_code = 0
+    if rounding_mode == 'trunc':
+        rounding_mode_code = 1
+    elif rounding_mode == 'floor':
+        rounding_mode_code = 2
+    
+    # Launch kernel
+    n = stacked.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    
+    _hstack_div_kernel[grid](
+        stacked, 
+        divisor, 
+        out, 
+        n, 
+        rounding_mode_code, 
+        BLOCK=block
+    )
+    
+    return out
+```

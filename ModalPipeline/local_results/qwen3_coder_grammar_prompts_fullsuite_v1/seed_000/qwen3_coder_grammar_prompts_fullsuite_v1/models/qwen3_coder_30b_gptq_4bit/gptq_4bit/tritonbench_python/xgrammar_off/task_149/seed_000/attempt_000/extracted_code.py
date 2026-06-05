@@ -1,0 +1,81 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def hstack_div_kernel(
+    input_ptr, divisor_ptr, output_ptr,
+    input_size, divisor_size,
+    rounding_mode,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offset = pid * BLOCK_SIZE
+    input_offsets = offset + tl.arange(0, BLOCK_SIZE)
+    divisor_offsets = offset + tl.arange(0, BLOCK_SIZE)
+    
+    input_mask = input_offsets < input_size
+    divisor_mask = divisor_offsets < divisor_size
+    
+    input_vals = tl.load(input_ptr + input_offsets, mask=input_mask)
+    divisor_vals = tl.load(divisor_ptr + divisor_offsets, mask=divisor_mask)
+    
+    result = input_vals / divisor_vals
+    
+    if rounding_mode == 1:  # trunc
+        result = tl.math.trunc(result)
+    elif rounding_mode == 2:  # floor
+        result = tl.math.floor(result)
+    
+    output_offsets = offset + tl.arange(0, BLOCK_SIZE)
+    output_mask = output_offsets < input_size
+    tl.store(output_ptr + output_offsets, result, mask=output_mask)
+
+def fused_hstack_div(tensors, divisor, *, rounding_mode=None, out=None):
+    if not tensors:
+        raise ValueError("tensors sequence cannot be empty")
+    
+    # Stack tensors horizontally
+    stacked = torch.hstack(tensors)
+    
+    # Handle divisor
+    if isinstance(divisor, (int, float)):
+        divisor_tensor = torch.tensor(divisor, dtype=stacked.dtype, device=stacked.device)
+    else:
+        divisor_tensor = divisor
+    
+    # Ensure divisor is broadcastable
+    if divisor_tensor.shape != stacked.shape:
+        divisor_tensor = divisor_tensor.expand_as(stacked)
+    
+    # Determine rounding mode
+    rounding_mode_code = 0
+    if rounding_mode == 'trunc':
+        rounding_mode_code = 1
+    elif rounding_mode == 'floor':
+        rounding_mode_code = 2
+    
+    # Prepare output tensor
+    if out is not None:
+        output = out
+    else:
+        output = torch.empty_like(stacked)
+    
+    # Launch kernel
+    input_size = stacked.numel()
+    divisor_size = divisor_tensor.numel()
+    
+    BLOCK_SIZE = 1024
+    grid = (input_size + BLOCK_SIZE - 1) // BLOCK_SIZE
+    
+    hstack_div_kernel[grid](
+        stacked.data_ptr(),
+        divisor_tensor.data_ptr(),
+        output.data_ptr(),
+        input_size,
+        divisor_size,
+        rounding_mode_code,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return output

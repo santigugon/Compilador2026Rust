@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are an expert Triton programmer.\n\nGenerate ONLY a single valid Python module.\nNo explanations.\nNo prose.\nNo markdown outside the code block.\nNo tests.\nNo example calls.\n\nThe module must contain:\n- imports\n- Triton kernels\n- wrapper function\n\nThe wrapper function must exactly match the required signature.\n\nWrap the entire response in ONE ```python``` block.\n"
+  },
+  {
+    "role": "user",
+    "content": "You are an expert in Trion programming, capable of writing corresponding Triton kernels and wrapper functions based on functional descriptions and function parameters. Ensure that the wrapper function fully corresponds to the provided function information.\nFunctional Description: Computes the eigenvalue decomposition of a square matrix if it exists. Supports input of float, double, cfloat and cdouble dtypes. Also supports batches of matrices, and if A is a batch of matrices then the output has the same batch dimensions. The returned eigenvalues are not guaranteed to be in any specific order. The eigenvalues and eigenvectors of a real matrix may be complex. When inputs are on a CUDA device, this function synchronizes that device with the CPU. Assumes that A is diagonalizable. The returned eigenvectors are normalized to have norm 1. The eigenvectors of a matrix are not unique, nor are they continuous with respect to A. Gradients computed using the eigenvectors tensor will only be finite when A has distinct eigenvalues.\nWrapper Entry Information: def linalg.eig(A, *, out=None) -> (Tensor, Tensor) Args: A (Tensor): tensor of shape `(*, n, n)` where `*` is zero or more batch dimensions consisting of diagonalizable matrices. Keyword args: out (tuple, optional): output tuple of two tensors. Ignored if `None`. Default: `None`.\nAfter generation, verify if the Triton wrapper aligns with the provided func_inputs. If not, regenerate."
+  }
+]

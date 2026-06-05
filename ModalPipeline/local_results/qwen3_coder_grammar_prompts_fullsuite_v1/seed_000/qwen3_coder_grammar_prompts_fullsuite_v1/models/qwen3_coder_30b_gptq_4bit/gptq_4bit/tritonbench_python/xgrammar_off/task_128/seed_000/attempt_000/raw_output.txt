@@ -1,0 +1,133 @@
+```python
+import torch
+import triton
+import triton.language as tl
+from typing import Union, List
+
+@triton.jit
+def fused_bmm_rmsnorm_gelu_dropout_kernel(
+    input1_ptr, input2_ptr, output_ptr, 
+    normalized_shape, dropout_p, eps,
+    B, N, M, P,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_P: tl.constexpr,
+    BLOCK_SIZE_RMS: tl.constexpr,
+    IS_TRAINING: tl.constexpr,
+    APPROXIMATE: tl.constexpr
+):
+    # Get block indices
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+    
+    # Compute block offsets
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    
+    # Load input1 and input2
+    input1 = tl.load(input1_ptr + offs_m[:, None] * M + offs_k[None, :])
+    input2 = tl.load(input2_ptr + offs_k[:, None] * P + offs_n[None, :])
+    
+    # Perform batch matrix multiplication
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, M, BLOCK_SIZE_K):
+        input1_k = tl.load(input1_ptr + offs_m[:, None] * M + (k + offs_k[None, :]))
+        input2_k = tl.load(input2_ptr + (k + offs_k[:, None]) * P + offs_n[None, :])
+        acc += tl.dot(input1_k, input2_k)
+    
+    # Reshape for RMS normalization
+    output = acc.to(tl.float32)
+    
+    # RMS normalization
+    # Compute mean of squares
+    mean_sq = tl.sum(output * output, axis=1) / normalized_shape
+    # Add epsilon and take square root
+    rms = tl.sqrt(mean_sq + eps)
+    # Normalize
+    output = output / rms[:, None]
+    
+    # GELU activation
+    if APPROXIMATE == 'tanh':
+        output = 0.5 * output * (1 + tl.tanh(0.7978845608 * (output + 0.044715 * output * output * output)))
+    else:
+        output = 0.5 * output * (1 + tl.erf(output / tl.sqrt(2.0)))
+    
+    # Dropout
+    if IS_TRAINING:
+        # Generate random mask
+        mask = tl.random.rand(B * N, BLOCK_SIZE_N) > dropout_p
+        output = output * mask / (1.0 - dropout_p)
+    
+    # Store output
+    tl.store(output_ptr + offs_m[:, None] * P + offs_n[None, :], output)
+
+def fused_bmm_rmsnorm_gelu_dropout(
+    input1: torch.Tensor,
+    input2: torch.Tensor,
+    normalized_shape: Union[int, List[int], torch.Size],
+    dropout_p: float = 0.1,
+    eps: float = 1e-5,
+    training: bool = True,
+    approximate: str = 'none',
+    *,
+    out: torch.Tensor = None
+) -> torch.Tensor:
+    # Validate inputs
+    assert input1.dim() == 3, "input1 must be 3-dimensional"
+    assert input2.dim() == 3, "input2 must be 3-dimensional"
+    assert input1.shape[0] == input2.shape[0], "Batch sizes must match"
+    assert input1.shape[2] == input2.shape[1], "Matrix dimensions must be compatible"
+    
+    B, N, M = input1.shape
+    _, _, P = input2.shape
+    
+    # Handle normalized_shape
+    if isinstance(normalized_shape, int):
+        normalized_shape = [normalized_shape]
+    elif isinstance(normalized_shape, torch.Size):
+        normalized_shape = list(normalized_shape)
+    
+    # Ensure normalized_shape is a list of integers
+    assert len(normalized_shape) == 1, "Only single dimension normalization is supported"
+    assert normalized_shape[0] == P, "normalized_shape must match the last dimension of the output"
+    
+    # Create output tensor if not provided
+    if out is None:
+        out = torch.empty(B, N, P, dtype=input1.dtype, device=input1.device)
+    
+    # Launch kernel
+    grid = (triton.cdiv(N, 128), triton.cdiv(P, 128), triton.cdiv(M, 64))
+    
+    # Determine block sizes
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 64
+    BLOCK_SIZE_P = 128
+    BLOCK_SIZE_RMS = 128
+    
+    # Launch kernel
+    fused_bmm_rmsnorm_gelu_dropout_kernel[grid](
+        input1_ptr=input1.data_ptr(),
+        input2_ptr=input2.data_ptr(),
+        output_ptr=out.data_ptr(),
+        normalized_shape=normalized_shape[0],
+        dropout_p=dropout_p,
+        eps=eps,
+        B=B,
+        N=N,
+        M=M,
+        P=P,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        BLOCK_SIZE_P=BLOCK_SIZE_P,
+        BLOCK_SIZE_RMS=BLOCK_SIZE_RMS,
+        IS_TRAINING=training,
+        APPROXIMATE=approximate
+    )
+    
+    return out
+```

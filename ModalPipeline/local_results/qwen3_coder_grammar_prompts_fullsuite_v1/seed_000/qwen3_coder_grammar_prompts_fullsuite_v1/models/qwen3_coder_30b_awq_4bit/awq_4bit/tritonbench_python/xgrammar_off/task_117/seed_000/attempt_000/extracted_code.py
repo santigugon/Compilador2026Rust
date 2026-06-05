@@ -1,0 +1,63 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _logspace_kernel(start_ptr, end_ptr, out_ptr, steps: tl.constexpr, base: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < steps
+    
+    # Load start and end values (assuming they are scalar)
+    start_val = tl.load(start_ptr)
+    end_val = tl.load(end_ptr)
+    
+    # Calculate the logarithmic spacing
+    # We want: base^(start + i * (end - start) / (steps - 1)) for i in [0, steps-1]
+    # This is equivalent to: base^(start + i * delta) where delta = (end - start) / (steps - 1)
+    if steps > 1:
+        delta = (end_val - start_val) / (steps - 1)
+        indices = offsets * delta + start_val
+    else:
+        # If steps == 1, just return base^start
+        indices = tl.full((BLOCK,), start_val, dtype=tl.float32)
+        mask = offsets < 1
+    
+    # Compute base^indices
+    # Using the identity: base^x = exp(x * log(base))
+    result = tl.exp(indices * tl.log(base))
+    
+    # Store the result
+    tl.store(out_ptr + offsets, result, mask=mask)
+
+def logspace(start, end, steps, base=10.0, *, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False):
+    # Handle scalar inputs
+    if not torch.is_tensor(start):
+        start = torch.tensor(start, dtype=torch.float32)
+    if not torch.is_tensor(end):
+        end = torch.tensor(end, dtype=torch.float32)
+    
+    # Create output tensor
+    if out is None:
+        if dtype is None:
+            dtype = torch.get_default_dtype()
+        out = torch.empty(steps, dtype=dtype, device=device, layout=layout, requires_grad=requires_grad)
+    else:
+        if out.numel() != steps:
+            raise ValueError(f"Output tensor must have {steps} elements")
+        if dtype is not None and out.dtype != dtype:
+            out = out.to(dtype)
+        if device is not None and out.device != device:
+            out = out.to(device)
+    
+    # Handle special case of 0 steps
+    if steps == 0:
+        return out
+    
+    # Launch kernel
+    block = 256
+    grid = (triton.cdiv(steps, block),)
+    
+    _logspace_kernel[grid](start, end, out, steps, base, BLOCK=block)
+    
+    return out

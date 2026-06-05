@@ -1,0 +1,50 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def ones_like_kernel(
+    input_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    tl.store(output_ptr + offsets, tl.full((BLOCK_SIZE,), 1.0, dtype=tl.float32), mask=mask)
+
+def ones_like(input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format):
+    if layout is not None and layout != torch.strided:
+        raise ValueError("Triton implementation only supports strided layout")
+    if device is not None and device.type != 'cuda':
+        raise ValueError("Triton implementation only supports CUDA tensors")
+    if memory_format != torch.preserve_format:
+        raise ValueError("Triton implementation only supports preserve_format memory format")
+    
+    # Determine output dtype
+    if dtype is None:
+        dtype = input.dtype
+    else:
+        # Ensure dtype is a torch dtype
+        dtype = torch.tensor([], dtype=dtype).dtype
+    
+    # Create output tensor with same shape as input
+    output = torch.empty_like(input, dtype=dtype, device=input.device, requires_grad=requires_grad)
+    
+    # Launch kernel
+    n_elements = output.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    ones_like_kernel[grid](
+        input_ptr=input.data_ptr(),
+        output_ptr=output.data_ptr(),
+        n_elements=n_elements,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return output
+```

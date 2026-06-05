@@ -1,0 +1,57 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _div_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, rounding_mode: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+    
+    # Perform division
+    result = x / y
+    
+    # Apply rounding if specified
+    if rounding_mode == "trunc":
+        result = tl.where(result >= 0, tl.floor(result), tl.ceil(result))
+    elif rounding_mode == "floor":
+        result = tl.floor(result)
+    
+    tl.store(out_ptr + offsets, result, mask=mask)
+
+def div(input, other, *, rounding_mode=None, out=None):
+    # Handle scalar other
+    if not torch.is_tensor(other):
+        other = torch.tensor(other, dtype=input.dtype, device=input.device)
+    
+    # Handle broadcasting
+    expanded_input, expanded_other = torch.broadcast_tensors(input, other)
+    
+    # Determine output tensor
+    if out is not None:
+        result = out
+    else:
+        result = torch.empty_like(expanded_input)
+    
+    # Get total number of elements
+    n = expanded_input.numel()
+    
+    # Set up kernel launch parameters
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    
+    # Launch kernel
+    _div_kernel[grid](
+        expanded_input,
+        expanded_other,
+        result,
+        n,
+        rounding_mode,
+        BLOCK=block
+    )
+    
+    return result
+```

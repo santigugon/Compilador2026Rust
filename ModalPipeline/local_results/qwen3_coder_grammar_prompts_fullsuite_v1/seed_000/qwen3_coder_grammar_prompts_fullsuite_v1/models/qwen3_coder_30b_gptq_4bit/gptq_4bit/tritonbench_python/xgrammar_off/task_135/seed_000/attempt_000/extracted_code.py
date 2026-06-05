@@ -1,0 +1,54 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def mul_kernel(
+    input_ptr,
+    other_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    other = tl.load(other_ptr + offsets, mask=mask)
+    output = input * other
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+def mul(input, other, *, out=None):
+    if out is None:
+        out = torch.empty_like(input)
+    
+    if isinstance(other, (int, float, complex)):
+        other = torch.tensor(other, dtype=input.dtype, device=input.device)
+    
+    if input.shape != other.shape:
+        # Handle broadcasting
+        input, other = torch.broadcast_tensors(input, other)
+    
+    # Ensure both tensors are on the same device
+    if other.device != input.device:
+        other = other.to(input.device)
+    
+    # Ensure both tensors have the same dtype
+    if other.dtype != input.dtype:
+        other = other.to(input.dtype)
+    
+    # Get the total number of elements
+    n_elements = input.numel()
+    
+    # Launch the kernel
+    grid = (triton.cdiv(n_elements, 1024),)
+    mul_kernel[grid](
+        input_ptr=input.data_ptr(),
+        other_ptr=other.data_ptr(),
+        output_ptr=out.data_ptr(),
+        n_elements=n_elements,
+        BLOCK_SIZE=1024
+    )
+    
+    return out

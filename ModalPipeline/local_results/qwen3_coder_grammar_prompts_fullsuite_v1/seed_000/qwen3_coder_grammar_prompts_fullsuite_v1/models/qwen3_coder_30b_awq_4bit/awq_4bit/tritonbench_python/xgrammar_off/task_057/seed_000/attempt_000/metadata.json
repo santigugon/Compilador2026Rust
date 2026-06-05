@@ -1,0 +1,28 @@
+{
+  "run_id": "90846987-4c60-4eb8-93d3-639ea89b1b37",
+  "experiment_id": "qwen3_coder_grammar_prompts_fullsuite_v1",
+  "model_name": "qwen3_coder_30b_awq_4bit",
+  "hf_model_id": "cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit",
+  "condition": {
+    "output_profile": "tritonbench_python",
+    "decoding_mode": "xgrammar_off",
+    "xgrammar_enabled": false,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "max_output_tokens": 2048,
+    "prompt_variant": "two_shot",
+    "repair_budget": 0,
+    "runtime_limit": {
+      "name": "default",
+      "compile_timeout_s": 120,
+      "exec_timeout_s": 300,
+      "memory_cap_mb": null
+    },
+    "seed": 0,
+    "grammar_version": "1.0",
+    "prompt_template_version": "tritonbench_v1"
+  },
+  "task_idx": 57,
+  "task_id": "tritonbench_t_057",
+  "repair_round": 0
+}

@@ -1,0 +1,140 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _pairwise_distance_kernel(
+    x1_ptr, x2_ptr, out_ptr,
+    x1_stride_batch, x1_stride_c, x1_stride_h, x1_stride_w,
+    x2_stride_batch, x2_stride_c, x2_stride_h, x2_stride_w,
+    out_stride_batch, out_stride_c,
+    batch_size, channels, h1, w1, h2, w2,
+    output_h, output_w,
+    p_val, eps_val,
+    BLOCK: tl.constexpr
+):
+    batch_idx = tl.program_id(0)
+    channel_idx = tl.program_id(1)
+    
+    if batch_idx >= batch_size or channel_idx >= channels:
+        return
+    
+    # Load pooled values
+    x1_pooled = tl.zeros((output_h * output_w,), dtype=tl.float32)
+    x2_pooled = tl.zeros((output_h * output_w,), dtype=tl.float32)
+    
+    # Compute adaptive average pooling for x1
+    for i in range(output_h):
+        for j in range(output_w):
+            h_start = (i * h1) // output_h
+            h_end = ((i + 1) * h1 + output_h - 1) // output_h
+            w_start = (j * w1) // output_w
+            w_end = ((j + 1) * w1 + output_w - 1) // output_w
+            
+            # Compute average
+            sum_val = 0.0
+            count = 0
+            for h in range(h_start, h_end):
+                for w in range(w_start, w_end):
+                    if h < h1 and w < w1:
+                        offset = batch_idx * x1_stride_batch + channel_idx * x1_stride_c + h * x1_stride_h + w * x1_stride_w
+                        sum_val += tl.load(x1_ptr + offset, mask=True)
+                        count += 1
+            
+            if count > 0:
+                x1_pooled[i * output_w + j] = sum_val / count
+            else:
+                x1_pooled[i * output_w + j] = 0.0
+    
+    # Compute adaptive average pooling for x2
+    for i in range(output_h):
+        for j in range(output_w):
+            h_start = (i * h2) // output_h
+            h_end = ((i + 1) * h2 + output_h - 1) // output_h
+            w_start = (j * w2) // output_w
+            w_end = ((j + 1) * w2 + output_w - 1) // output_w
+            
+            # Compute average
+            sum_val = 0.0
+            count = 0
+            for h in range(h_start, h_end):
+                for w in range(w_start, w_end):
+                    if h < h2 and w < w2:
+                        offset = batch_idx * x2_stride_batch + channel_idx * x2_stride_c + h * x2_stride_h + w * x2_stride_w
+                        sum_val += tl.load(x2_ptr + offset, mask=True)
+                        count += 1
+            
+            if count > 0:
+                x2_pooled[i * output_w + j] = sum_val / count
+            else:
+                x2_pooled[i * output_w + j] = 0.0
+    
+    # Compute distance
+    diff = 0.0
+    for i in range(output_h * output_w):
+        diff += tl.abs(x1_pooled[i] - x2_pooled[i]) ** p_val
+    
+    if p_val == 0.0:
+        result = 0.0
+    else:
+        result = diff ** (1.0 / p_val)
+    
+    # Add eps to avoid division by zero
+    result = result + eps_val
+    
+    # Store result
+    out_offset = batch_idx * out_stride_batch + channel_idx * out_stride_c
+    tl.store(out_ptr + out_offset, result)
+
+def fused_pairwise_distance_adaptive_avg_pool2d(
+    x1: torch.Tensor, 
+    x2: torch.Tensor, 
+    output_size: int or tuple, 
+    p: float = 2.0, 
+    eps: float = 1e-6, 
+    keepdim: bool = False
+) -> torch.Tensor:
+    # Handle output_size
+    if isinstance(output_size, int):
+        output_h = output_size
+        output_w = output_size
+    else:
+        output_h, output_w = output_size
+    
+    # Ensure inputs are 4D
+    if x1.dim() == 3:
+        x1 = x1.unsqueeze(0)
+    if x2.dim() == 3:
+        x2 = x2.unsqueeze(0)
+    
+    batch_size, channels, h1, w1 = x1.shape
+    _, _, h2, w2 = x2.shape
+    
+    # Apply adaptive average pooling
+    x1_pooled = torch.nn.functional.adaptive_avg_pool2d(x1, (output_h, output_w))
+    x2_pooled = torch.nn.functional.adaptive_avg_pool2d(x2, (output_h, output_w))
+    
+    # Compute output shape
+    if keepdim:
+        out_shape = (batch_size, channels, 1, 1)
+    else:
+        out_shape = (batch_size, channels)
+    
+    out = torch.empty(out_shape, dtype=torch.float32, device=x1.device)
+    
+    # Launch kernel
+    if batch_size * channels > 0:
+        grid = (batch_size, channels)
+        block = 128
+        _pairwise_distance_kernel[grid](
+            x1_pooled, x2_pooled, out,
+            x1_pooled.stride(0), x1_pooled.stride(1), x1_pooled.stride(2), x1_pooled.stride(3),
+            x2_pooled.stride(0), x2_pooled.stride(1), x2_pooled.stride(2), x2_pooled.stride(3),
+            out.stride(0), out.stride(1),
+            batch_size, channels, h1, w1, h2, w2,
+            output_h, output_w,
+            p, eps,
+            BLOCK=block
+        )
+    
+    return out

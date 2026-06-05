@@ -1,0 +1,98 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _qr_decomp_kernel(A, Q, R, m, n, stride_A, stride_Q, stride_R, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    if pid >= m * n:
+        return
+    
+    row = pid // n
+    col = pid % n
+    
+    if row < m and col < n:
+        A_val = tl.load(A + row * stride_A + col)
+        tl.store(Q + row * stride_Q + col, A_val)
+        if row <= col:
+            tl.store(R + row * stride_R + col, A_val)
+        else:
+            tl.store(R + row * stride_R + col, 0.0)
+
+@triton.jit
+def _apply_householder_kernel(Q, R, v, m, n, stride_Q, stride_R, stride_v, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    if pid >= m * n:
+        return
+    
+    row = pid // n
+    col = pid % n
+    
+    if row < m and col < n:
+        v_val = tl.load(v + col)
+        Q_val = tl.load(Q + row * stride_Q + col)
+        R_val = tl.load(R + row * stride_R + col)
+        # Apply Householder reflector
+        if row >= col:
+            # Update Q
+            tl.store(Q + row * stride_Q + col, Q_val - 2.0 * v_val * tl.load(Q + row * stride_Q + col))
+            # Update R
+            tl.store(R + row * stride_R + col, R_val - 2.0 * v_val * tl.load(R + row * stride_R + col))
+
+@triton.jit
+def _solve_triangular_kernel(R, b, x, m, n, k, stride_R, stride_b, stride_x, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    if pid >= k:
+        return
+    
+    col = pid
+    
+    for i in range(n - 1, -1, -1):
+        if i < m:
+            sum_val = 0.0
+            for j in range(i + 1, n):
+                sum_val += tl.load(R + i * stride_R + j) * tl.load(x + j * stride_x + col)
+            x_val = (tl.load(b + i * stride_b + col) - sum_val) / tl.load(R + i * stride_R + i)
+            tl.store(x + i * stride_x + col, x_val)
+
+def fused_qr_solve(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, n = A.shape
+    k = b.shape[1]
+    
+    # Ensure inputs are on GPU and contiguous
+    A = A.contiguous().cuda()
+    b = b.contiguous().cuda()
+    
+    # Allocate output tensors
+    Q = torch.empty_like(A)
+    R = torch.zeros((m, n), device=A.device, dtype=A.dtype)
+    
+    # QR decomposition
+    grid = (m * n + 256 - 1) // 256
+    _qr_decomp_kernel[grid](A, Q, R, m, n, A.stride(0), Q.stride(0), R.stride(0), BLOCK_SIZE=256)
+    
+    # Apply Householder reflectors (simplified version)
+    # In a full implementation, this would involve computing Householder vectors
+    # For this example, we'll assume a simplified approach
+    v = torch.zeros(n, device=A.device, dtype=A.dtype)
+    for i in range(min(m, n)):
+        # Compute Householder vector
+        v[i:] = Q[i:, i]
+        v[i] += torch.sign(v[i]) * torch.norm(v[i:])
+        v[i:] = v[i:] / torch.norm(v[i:])
+        
+        # Apply Householder transformation
+        grid = (m * n + 256 - 1) // 256
+        _apply_householder_kernel[grid](Q, R, v, m, n, Q.stride(0), R.stride(0), v.stride(0), BLOCK_SIZE=256)
+    
+    # Compute Q^T * b
+    Q_T_b = torch.matmul(Q.t(), b)
+    
+    # Solve Rx = Q^T * b
+    x = torch.zeros((n, k), device=A.device, dtype=A.dtype)
+    grid = (k + 256 - 1) // 256
+    _solve_triangular_kernel[grid](R, Q_T_b, x, m, n, k, R.stride(0), Q_T_b.stride(0), x.stride(0), BLOCK_SIZE=256)
+    
+    return x
+```

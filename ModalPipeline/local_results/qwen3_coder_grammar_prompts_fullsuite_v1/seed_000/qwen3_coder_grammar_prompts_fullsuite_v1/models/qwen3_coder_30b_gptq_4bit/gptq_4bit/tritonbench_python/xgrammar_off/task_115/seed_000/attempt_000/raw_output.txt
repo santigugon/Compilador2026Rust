@@ -1,0 +1,89 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def tanh_linear_kernel(
+    input_ptr,
+    weight_ptr,
+    bias_ptr,
+    output_ptr,
+    in_features,
+    out_features,
+    stride_input_n,
+    stride_input_k,
+    stride_weight_k,
+    stride_weight_n,
+    stride_bias_n,
+    stride_output_n,
+    stride_output_k,
+    BLOCK_SIZE_M=32,
+    BLOCK_SIZE_N=32,
+    BLOCK_SIZE_K=32
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Compute output for this block
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    for k in range(0, in_features, BLOCK_SIZE_K):
+        # Load input and weight tiles
+        input_tile = tl.load(input_ptr + pid_m * stride_input_n + k * stride_input_k)
+        weight_tile = tl.load(weight_ptr + k * stride_weight_k + pid_n * stride_weight_n)
+        
+        # Perform matrix multiplication
+        accumulator += tl.dot(input_tile, weight_tile)
+    
+    # Add bias if present
+    if bias_ptr is not None:
+        bias_tile = tl.load(bias_ptr + pid_n * stride_bias_n)
+        accumulator += bias_tile
+    
+    # Apply tanh activation
+    output = tl.tanh(accumulator)
+    
+    # Store result
+    tl.store(output_ptr + pid_m * stride_output_n + pid_n * stride_output_k, output)
+
+def tanh_linear(input, weight, bias=None):
+    # Ensure input is contiguous
+    input = input.contiguous()
+    weight = weight.contiguous()
+    
+    # Get dimensions
+    batch_size = input.shape[:-1]
+    in_features = input.shape[-1]
+    out_features = weight.shape[0]
+    
+    # Flatten input for processing
+    input_flat = input.view(-1, in_features)
+    batch_size_flat = input_flat.shape[0]
+    
+    # Create output tensor
+    output = torch.empty(batch_size_flat, out_features, device=input.device, dtype=input.dtype)
+    
+    # Define grid dimensions
+    grid = (triton.cdiv(batch_size_flat, 32), triton.cdiv(out_features, 32))
+    
+    # Launch kernel
+    tanh_linear_kernel[grid](
+        input_flat,
+        weight,
+        bias,
+        output,
+        in_features,
+        out_features,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+    )
+    
+    # Reshape output to match input shape
+    return output.view(*batch_size, out_features)
+```

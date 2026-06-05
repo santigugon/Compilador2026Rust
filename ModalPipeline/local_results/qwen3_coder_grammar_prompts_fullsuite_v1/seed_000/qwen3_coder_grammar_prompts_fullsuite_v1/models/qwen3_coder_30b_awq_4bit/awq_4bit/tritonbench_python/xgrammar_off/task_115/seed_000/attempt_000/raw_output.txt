@@ -1,0 +1,203 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _tanh_linear_kernel(input_ptr, weight_ptr, bias_ptr, output_ptr, 
+                        in_features: tl.constexpr, out_features: tl.constexpr, 
+                        batch_size: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    batch_offset = pid * out_features
+    
+    # Load weight and bias
+    weight = tl.load(weight_ptr + tl.arange(0, in_features)[:, None] @ tl.arange(0, out_features)[None, :])
+    
+    # Process each output feature
+    for i in range(0, out_features, BLOCK):
+        out_offsets = i + tl.arange(0, BLOCK)
+        mask = out_offsets < out_features
+        
+        # Compute linear transformation
+        linear_result = tl.zeros((BLOCK,), dtype=tl.float32)
+        for j in range(0, in_features, BLOCK):
+            in_offsets = j + tl.arange(0, BLOCK)
+            in_mask = in_offsets < in_features
+            
+            # Load input and weight
+            input_vals = tl.load(input_ptr + tl.arange(0, BLOCK)[:, None] + in_offsets[None, :], 
+                               mask=in_mask[None, :], other=0.0)
+            weight_vals = tl.load(weight_ptr + in_offsets[:, None] @ out_offsets[None, :], 
+                                mask=in_mask[:, None] & mask[None, :], other=0.0)
+            
+            # Accumulate
+            linear_result = tl.where(mask, linear_result + tl.sum(input_vals * weight_vals, axis=0), linear_result)
+        
+        # Add bias if present
+        if bias_ptr is not None:
+            bias_vals = tl.load(bias_ptr + out_offsets, mask=mask, other=0.0)
+            linear_result = linear_result + bias_vals
+        
+        # Apply tanh
+        tanh_result = 2.0 / (1.0 + tl.exp(-2.0 * linear_result)) - 1.0
+        
+        # Store result
+        tl.store(output_ptr + batch_offset + out_offsets, tanh_result, mask=mask)
+
+@triton.jit
+def _tanh_linear_kernel_simple(input_ptr, weight_ptr, bias_ptr, output_ptr, 
+                               in_features: tl.constexpr, out_features: tl.constexpr, 
+                               batch_size: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    batch_offset = pid * out_features
+    
+    # Process each output feature
+    for i in range(0, out_features, BLOCK):
+        out_offsets = i + tl.arange(0, BLOCK)
+        mask = out_offsets < out_features
+        
+        # Compute linear transformation for this output feature
+        linear_result = tl.zeros((BLOCK,), dtype=tl.float32)
+        
+        # Compute dot product for this output feature
+        for j in range(0, in_features, BLOCK):
+            in_offsets = j + tl.arange(0, BLOCK)
+            in_mask = in_offsets < in_features
+            
+            # Load input and weight
+            input_vals = tl.load(input_ptr + tl.arange(0, BLOCK)[:, None] + in_offsets[None, :], 
+                               mask=in_mask[None, :], other=0.0)
+            weight_vals = tl.load(weight_ptr + in_offsets[:, None] @ out_offsets[None, :], 
+                                mask=in_mask[:, None] & mask[None, :], other=0.0)
+            
+            # Accumulate
+            linear_result = tl.where(mask, linear_result + tl.sum(input_vals * weight_vals, axis=0), linear_result)
+        
+        # Add bias if present
+        if bias_ptr is not None:
+            bias_vals = tl.load(bias_ptr + out_offsets, mask=mask, other=0.0)
+            linear_result = linear_result + bias_vals
+        
+        # Apply tanh
+        tanh_result = 2.0 / (1.0 + tl.exp(-2.0 * linear_result)) - 1.0
+        
+        # Store result
+        tl.store(output_ptr + batch_offset + out_offsets, tanh_result, mask=mask)
+
+@triton.jit
+def _tanh_linear_kernel_optimized(input_ptr, weight_ptr, bias_ptr, output_ptr, 
+                                  in_features: tl.constexpr, out_features: tl.constexpr, 
+                                  batch_size: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    batch_offset = pid * out_features
+    
+    # Process each output feature
+    for i in range(0, out_features, BLOCK):
+        out_offsets = i + tl.arange(0, BLOCK)
+        mask = out_offsets < out_features
+        
+        # Compute linear transformation for this output feature
+        linear_result = tl.zeros((BLOCK,), dtype=tl.float32)
+        
+        # Compute dot product for this output feature
+        for j in range(0, in_features, BLOCK):
+            in_offsets = j + tl.arange(0, BLOCK)
+            in_mask = in_offsets < in_features
+            
+            # Load input and weight
+            input_vals = tl.load(input_ptr + tl.arange(0, BLOCK)[:, None] + in_offsets[None, :], 
+                               mask=in_mask[None, :], other=0.0)
+            weight_vals = tl.load(weight_ptr + in_offsets[:, None] @ out_offsets[None, :], 
+                                mask=in_mask[:, None] & mask[None, :], other=0.0)
+            
+            # Accumulate
+            linear_result = tl.where(mask, linear_result + tl.sum(input_vals * weight_vals, axis=0), linear_result)
+        
+        # Add bias if present
+        if bias_ptr is not None:
+            bias_vals = tl.load(bias_ptr + out_offsets, mask=mask, other=0.0)
+            linear_result = linear_result + bias_vals
+        
+        # Apply tanh
+        tanh_result = 2.0 / (1.0 + tl.exp(-2.0 * linear_result)) - 1.0
+        
+        # Store result
+        tl.store(output_ptr + batch_offset + out_offsets, tanh_result, mask=mask)
+
+def tanh_linear(input, weight, bias=None):
+    # Handle the case where input is a scalar or has no batch dimensions
+    if input.dim() == 1:
+        input = input.unsqueeze(0)
+        batch_size = 1
+    else:
+        batch_size = input.shape[0]
+    
+    in_features = input.shape[-1]
+    out_features = weight.shape[0]
+    
+    # Create output tensor
+    if input.dim() == 1:
+        output = torch.empty(out_features, dtype=input.dtype, device=input.device)
+    else:
+        output = torch.empty(input.shape[:-1] + (out_features,), dtype=input.dtype, device=input.device)
+    
+    # Flatten input for easier processing
+    if input.dim() > 2:
+        input_flat = input.view(-1, in_features)
+        output_flat = output.view(-1, out_features)
+    else:
+        input_flat = input
+        output_flat = output
+    
+    # Launch kernel
+    block = 256
+    grid = (triton.cdiv(output_flat.shape[0], block),)
+    
+    # Create a kernel that handles the computation properly
+    @triton.jit
+    def _tanh_linear_kernel(input_ptr, weight_ptr, bias_ptr, output_ptr, 
+                            in_features: tl.constexpr, out_features: tl.constexpr, 
+                            batch_size: tl.constexpr, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        batch_offset = pid * out_features
+        
+        # For each output feature
+        for out_idx in range(0, out_features, BLOCK):
+            out_offsets = out_idx + tl.arange(0, BLOCK)
+            out_mask = out_offsets < out_features
+            
+            # Compute linear transformation for this output feature
+            linear_result = tl.zeros((BLOCK,), dtype=tl.float32)
+            
+            # Compute dot product for this output feature
+            for in_idx in range(0, in_features, BLOCK):
+                in_offsets = in_idx + tl.arange(0, BLOCK)
+                in_mask = in_offsets < in_features
+                
+                # Load input and weight
+                input_vals = tl.load(input_ptr + batch_offset + in_offsets[None, :], 
+                                   mask=in_mask[None, :], other=0.0)
+                weight_vals = tl.load(weight_ptr + in_offsets[:, None] @ out_offsets[None, :], 
+                                    mask=in_mask[:, None] & out_mask[None, :], other=0.0)
+                
+                # Accumulate
+                linear_result = tl.where(out_mask, linear_result + tl.sum(input_vals * weight_vals, axis=0), linear_result)
+            
+            # Add bias if present
+            if bias_ptr is not None:
+                bias_vals = tl.load(bias_ptr + out_offsets, mask=out_mask, other=0.0)
+                linear_result = linear_result + bias_vals
+            
+            # Apply tanh
+            tanh_result = 2.0 / (1.0 + tl.exp(-2.0 * linear_result)) - 1.0
+            
+            # Store result
+            tl.store(output_ptr + batch_offset + out_offsets, tanh_result, mask=out_mask)
+    
+    # Launch kernel
+    if bias is not None:
+        _tanh_linear_kernel[grid](input_flat, weight, bias, output_flat, 
+                                 in_features, out_features, output_flat.shape[0], BLOCK=block)
+    else:
+        _tanh_linear_kernel[grid](input_flat, weight, None, output_flat, 
+                                 in_features, out_features, output_flat.shape

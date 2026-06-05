@@ -1,0 +1,45 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def polygamma_kernel(n, input_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    
+    # Compute polygamma function using recurrence relation
+    # For n=0, polygamma is digamma function
+    # For n>0, polygamma(n,x) = (-1)^(n+1) * n! * sum(1/(x+k)^(n+1))
+    
+    # Simplified implementation for demonstration
+    # In practice, this would require more sophisticated numerical methods
+    result = tl.zeros_like(input)
+    
+    # Special case for n=0 (digamma)
+    if n == 0:
+        # Simple approximation for digamma
+        result = tl.log(input) - 1.0 / (2.0 * input)
+        # Add more terms for better accuracy
+        result = result - 1.0 / (12.0 * input * input)
+    else:
+        # For higher order derivatives, use recurrence relation
+        # This is a simplified version - actual implementation would be more complex
+        result = tl.pow(-1.0, n + 1.0) * tl.factorial(n) * tl.pow(input, -(n + 1.0))
+    
+    tl.store(output_ptr + offsets, result, mask=mask)
+
+def polygamma(n, input, *, out=None) -> torch.Tensor:
+    if n < 0:
+        raise ValueError("n must be a non-negative integer")
+    
+    if out is None:
+        out = torch.empty_like(input, dtype=torch.float32)
+    
+    # Launch kernel
+    grid = (triton.cdiv(input.numel(), 1024),)
+    polygamma_kernel[grid](n, input.data_ptr(), out.data_ptr(), input.numel(), BLOCK_SIZE=1024)
+    
+    return out

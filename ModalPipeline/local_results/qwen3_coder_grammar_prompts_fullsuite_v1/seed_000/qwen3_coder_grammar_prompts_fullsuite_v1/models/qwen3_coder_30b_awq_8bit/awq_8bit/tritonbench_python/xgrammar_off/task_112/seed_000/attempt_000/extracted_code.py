@@ -1,0 +1,89 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def min_kernel(
+    input_ptr, 
+    output_ptr, 
+    indices_ptr,
+    n_rows, 
+    n_cols,
+    BLOCK_SIZE: tl.constexpr
+):
+    row_id = tl.program_id(0)
+    if row_id >= n_rows:
+        return
+    
+    # Initialize min and index
+    min_val = tl.full([1], float('inf'), dtype=tl.float32)
+    min_idx = tl.full([1], 0, dtype=tl.int32)
+    
+    # Load data in chunks
+    for col_start in range(0, n_cols, BLOCK_SIZE):
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = (cols + col_start) < n_cols
+        data = tl.load(input_ptr + row_id * n_cols + cols + col_start, mask=mask, other=float('inf'))
+        
+        # Find min in this chunk
+        chunk_min = tl.min(data)
+        chunk_min_idx = tl.argmin(data)
+        
+        # Update global min
+        if chunk_min < min_val:
+            min_val = chunk_min
+            min_idx = chunk_min_idx + col_start
+    
+    # Store results
+    tl.store(output_ptr + row_id, min_val)
+    tl.store(indices_ptr + row_id, min_idx)
+
+def min(input, dim, keepdim=False, *, out=None):
+    if dim < 0:
+        dim = input.dim() + dim
+    
+    if dim >= input.dim():
+        raise ValueError("dim out of range")
+    
+    # Get input shape
+    shape = input.shape
+    n_rows = 1
+    n_cols = shape[dim]
+    
+    # Calculate number of rows (product of all dimensions except dim)
+    for i in range(input.dim()):
+        if i != dim:
+            n_rows *= shape[i]
+    
+    # Create output tensors
+    if out is not None:
+        output, indices = out
+    else:
+        output = torch.empty(n_rows, dtype=torch.float32, device=input.device)
+        indices = torch.empty(n_rows, dtype=torch.int64, device=input.device)
+    
+    # Launch kernel
+    BLOCK_SIZE = 1024
+    grid_size = (n_rows + BLOCK_SIZE - 1) // BLOCK_SIZE
+    
+    min_kernel[grid_size](
+        input_ptr=input.data_ptr(),
+        output_ptr=output.data_ptr(),
+        indices_ptr=indices.data_ptr(),
+        n_rows=n_rows,
+        n_cols=n_cols,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    # Reshape outputs if needed
+    if keepdim:
+        new_shape = list(shape)
+        new_shape[dim] = 1
+        output = output.view(new_shape)
+        indices = indices.view(new_shape)
+    else:
+        new_shape = [s for i, s in enumerate(shape) if i != dim]
+        output = output.view(new_shape)
+        indices = indices.view(new_shape)
+    
+    return output, indices

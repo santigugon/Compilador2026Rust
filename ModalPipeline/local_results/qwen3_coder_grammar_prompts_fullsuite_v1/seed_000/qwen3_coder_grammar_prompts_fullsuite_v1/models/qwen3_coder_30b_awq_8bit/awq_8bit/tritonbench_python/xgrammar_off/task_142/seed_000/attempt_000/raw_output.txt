@@ -1,0 +1,71 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def airy_ai_kernel(input_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    
+    # Airy function Ai(x) computation using asymptotic expansion for large |x|
+    # For simplicity, using a basic approximation here
+    # In practice, this would involve more sophisticated numerical methods
+    
+    # Basic approximation: Ai(x) ≈ (1/(2*sqrt(pi)*|x|^(1/2))) * exp(-2/3 * |x|^(3/2))
+    # This is a simplified version for demonstration
+    
+    x = input
+    x_abs = tl.abs(x)
+    
+    # Avoid division by zero
+    x_abs_safe = tl.where(x_abs == 0.0, 1e-10, x_abs)
+    
+    # Compute Ai(x) using asymptotic form for large |x|
+    # Ai(x) ≈ (1/(2*sqrt(pi)*|x|^(1/2))) * exp(-2/3 * |x|^(3/2)) for x > 0
+    # Ai(x) ≈ (1/(2*sqrt(pi)*|x|^(1/2))) * exp(2/3 * |x|^(3/2)) for x < 0
+    
+    x_pow_3_2 = x_abs_safe ** (3.0 / 2.0)
+    x_pow_1_2 = x_abs_safe ** (1.0 / 2.0)
+    
+    # For x > 0, use the decreasing exponential
+    exp_term_pos = tl.exp(-2.0 / 3.0 * x_pow_3_2)
+    # For x < 0, use the increasing exponential  
+    exp_term_neg = tl.exp(2.0 / 3.0 * x_pow_3_2)
+    
+    # Combine based on sign of x
+    exp_term = tl.where(x > 0, exp_term_pos, exp_term_neg)
+    
+    # Final approximation
+    result = (1.0 / (2.0 * tl.sqrt(tl.pi) * x_pow_1_2)) * exp_term
+    
+    # Handle special case for x = 0
+    result = tl.where(x == 0.0, 1.0 / (3.0 ** (2.0 / 3.0) * tl.gamma(2.0 / 3.0)), result)
+    
+    tl.store(output_ptr + offsets, result, mask=mask)
+
+def airy_ai(input, *, out=None):
+    if out is None:
+        out = torch.empty_like(input, dtype=torch.float32)
+    
+    # Ensure input is on CPU for this implementation
+    if input.is_cuda:
+        input = input.cpu()
+        out = out.cpu()
+    
+    n_elements = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    airy_ai_kernel[grid](
+        input.data_ptr(),
+        out.data_ptr(),
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return out
+```

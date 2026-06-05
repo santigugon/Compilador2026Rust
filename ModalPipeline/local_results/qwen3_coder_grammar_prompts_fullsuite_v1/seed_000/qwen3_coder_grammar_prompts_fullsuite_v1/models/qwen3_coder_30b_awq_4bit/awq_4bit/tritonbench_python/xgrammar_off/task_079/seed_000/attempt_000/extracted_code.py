@@ -1,0 +1,108 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _addmm_kernel(mat1_ptr, mat2_ptr, input_ptr, out_ptr, 
+                  mat1_rows: tl.constexpr, mat1_cols: tl.constexpr, 
+                  mat2_cols: tl.constexpr, 
+                  beta: tl.constexpr, alpha: tl.constexpr,
+                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, 
+                  BLOCK_K: tl.constexpr):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Compute the block offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Initialize accumulator
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Loop over the K dimension
+    for k in range(0, mat1_cols, BLOCK_K):
+        # Load mat1 and mat2 with appropriate masks
+        mat1_mask = (offs_m[:, None] < mat1_rows) & (offs_k[None, :] < mat1_cols - k)
+        mat2_mask = (offs_k[:, None] < mat1_cols - k) & (offs_n[None, :] < mat2_cols)
+        
+        mat1_block = tl.load(mat1_ptr + offs_m[:, None] * mat1_cols + (k + offs_k[None, :]), 
+                            mask=mat1_mask, other=0.0)
+        mat2_block = tl.load(mat2_ptr + (k + offs_k[:, None]) * mat2_cols + offs_n[None, :], 
+                            mask=mat2_mask, other=0.0)
+        
+        # Matrix multiplication
+        accumulator = tl.dot(mat1_block, mat2_block, accumulator)
+    
+    # Scale and add input
+    out_mask = (offs_m[:, None] < mat1_rows) & (offs_n[None, :] < mat2_cols)
+    
+    # Load input
+    input_block = tl.load(input_ptr + offs_m[:, None] * mat2_cols + offs_n[None, :], 
+                         mask=out_mask, other=0.0)
+    
+    # Compute output
+    out_block = alpha * accumulator + beta * input_block
+    
+    # Store result
+    tl.store(out_ptr + offs_m[:, None] * mat2_cols + offs_n[None, :], 
+             out_block, mask=out_mask)
+
+def addmm(input, mat1, mat2, *, beta=1, alpha=1, out=None):
+    # Handle scalar inputs
+    if not torch.is_tensor(beta):
+        beta = torch.tensor(beta, dtype=torch.float32, device=mat1.device)
+    if not torch.is_tensor(alpha):
+        alpha = torch.tensor(alpha, dtype=torch.float32, device=mat1.device)
+    
+    # Check dimensions
+    if mat1.dim() != 2 or mat2.dim() != 2:
+        raise ValueError("mat1 and mat2 must be 2D tensors")
+    
+    if mat1.size(1) != mat2.size(0):
+        raise ValueError("mat1 and mat2 must be compatible for matrix multiplication")
+    
+    # Get output shape
+    n, m = mat1.shape
+    m2, p = mat2.shape
+    
+    if input.shape != (n, p):
+        # Try to broadcast input
+        try:
+            input = input.expand(n, p)
+        except RuntimeError:
+            raise ValueError("input must be broadcastable to (n, p) tensor")
+    
+    # Create output tensor
+    if out is None:
+        out = torch.empty(n, p, dtype=mat1.dtype, device=mat1.device)
+    else:
+        if out.shape != (n, p):
+            raise ValueError("out tensor must have shape (n, p)")
+        if out.dtype != mat1.dtype or out.device != mat1.device:
+            raise ValueError("out tensor must have the same dtype and device as mat1")
+    
+    # Launch kernel
+    BLOCK_M = 16
+    BLOCK_N = 16
+    BLOCK_K = 16
+    
+    grid_m = triton.cdiv(n, BLOCK_M)
+    grid_n = triton.cdiv(p, BLOCK_N)
+    grid = (grid_m, grid_n)
+    
+    # Ensure all tensors are contiguous for kernel access
+    mat1 = mat1.contiguous()
+    mat2 = mat2.contiguous()
+    input = input.contiguous()
+    out = out.contiguous()
+    
+    _addmm_kernel[grid](
+        mat1, mat2, input, out,
+        n, m, p,
+        beta.item() if torch.is_tensor(beta) else beta,
+        alpha.item() if torch.is_tensor(alpha) else alpha,
+        BLOCK_M, BLOCK_N, BLOCK_K
+    )
+    
+    return out

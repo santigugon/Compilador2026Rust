@@ -1,0 +1,86 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _max_kernel(x_ptr, out_ptr, indices_ptr, n_elements: tl.constexpr, dim_size: tl.constexpr, stride_x_dim: tl.constexpr, stride_out_dim: tl.constexpr, stride_indices_dim: tl.constexpr, BLOCK: tl.constexpr):
+    # Get the row index
+    row_idx = tl.program_id(0)
+    
+    # Initialize max value and index
+    max_val = tl.full([1], -float('inf'), dtype=tl.float32)
+    max_idx = tl.full([1], 0, dtype=tl.int64)
+    
+    # Iterate through the dimension
+    for i in range(dim_size):
+        # Calculate the offset for this element
+        offset = row_idx * stride_x_dim + i
+        val = tl.load(x_ptr + offset)
+        
+        # Update max if current value is greater
+        mask = val > max_val
+        max_val = tl.where(mask, val, max_val)
+        max_idx = tl.where(mask, i, max_idx)
+    
+    # Store results
+    out_offset = row_idx * stride_out_dim
+    indices_offset = row_idx * stride_indices_dim
+    tl.store(out_ptr + out_offset, max_val)
+    tl.store(indices_ptr + indices_offset, max_idx)
+
+def max(input, dim, keepdim=False, *, out=None):
+    # Handle negative dimension
+    if dim < 0:
+        dim = input.dim() + dim
+    
+    # Get input shape and strides
+    shape = input.shape
+    strides = input.stride()
+    
+    # Calculate output shape
+    output_shape = list(shape)
+    if keepdim:
+        output_shape[dim] = 1
+    else:
+        output_shape.pop(dim)
+    
+    # Create output tensors
+    if out is not None:
+        max_vals, max_indices = out
+        if max_vals.shape != tuple(output_shape):
+            max_vals = torch.empty(tuple(output_shape), dtype=input.dtype, device=input.device)
+        if max_indices.shape != tuple(output_shape):
+            max_indices = torch.empty(tuple(output_shape), dtype=torch.long, device=input.device)
+    else:
+        max_vals = torch.empty(tuple(output_shape), dtype=input.dtype, device=input.device)
+        max_indices = torch.empty(tuple(output_shape), dtype=torch.long, device=input.device)
+    
+    # Get dimension size
+    dim_size = shape[dim]
+    
+    # Get stride for the dimension we're reducing
+    stride_x_dim = strides[dim]
+    
+    # Get stride for output tensors
+    stride_out_dim = 1
+    stride_indices_dim = 1
+    for i in range(dim + 1, len(shape)):
+        stride_out_dim *= shape[i]
+        stride_indices_dim *= shape[i]
+    
+    # Calculate number of elements in output
+    n_elements = 1
+    for i in range(len(shape)):
+        if i != dim:
+            n_elements *= shape[i]
+    
+    # Launch kernel
+    if n_elements > 0:
+        block = 256
+        grid = (triton.cdiv(n_elements, block),)
+        _max_kernel[grid](
+            input, max_vals, max_indices, n_elements, dim_size, stride_x_dim, 
+            stride_out_dim, stride_indices_dim, BLOCK=block
+        )
+    
+    return (max_vals, max_indices)

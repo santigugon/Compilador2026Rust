@@ -1,0 +1,73 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def softmax_mul_kernel(
+    input_ptr, other_ptr, output_ptr,
+    input_row_stride, other_row_stride, output_row_stride,
+    n_cols, dim, dtype, BLOCK_SIZE: tl.constexpr
+):
+    row = tl.program_id(0)
+    input_row = input_ptr + row * input_row_stride
+    other_row = other_ptr + row * other_row_stride
+    output_row = output_ptr + row * output_row_stride
+    
+    # Load input data
+    input_vals = tl.load(input_row + tl.arange(0, BLOCK_SIZE), mask=tl.arange(0, BLOCK_SIZE) < n_cols)
+    
+    # Apply softmax
+    max_val = tl.max(input_vals, axis=0)
+    exp_vals = tl.exp(input_vals - max_val)
+    sum_exp = tl.sum(exp_vals, axis=0)
+    softmax_vals = exp_vals / sum_exp
+    
+    # Multiply with other
+    other_vals = tl.load(other_row + tl.arange(0, BLOCK_SIZE), mask=tl.arange(0, BLOCK_SIZE) < n_cols)
+    result_vals = softmax_vals * other_vals
+    
+    # Store result
+    tl.store(output_row + tl.arange(0, BLOCK_SIZE), result_vals, mask=tl.arange(0, BLOCK_SIZE) < n_cols)
+
+def softmax_mul(input, other, dim, dtype=None, out=None):
+    if dtype is not None:
+        input = input.to(dtype)
+        other = other.to(dtype)
+    
+    if out is None:
+        out = torch.empty_like(input)
+    
+    # Ensure tensors are contiguous
+    input = input.contiguous()
+    other = other.contiguous()
+    out = out.contiguous()
+    
+    # Get dimensions
+    shape = input.shape
+    n_rows = 1
+    n_cols = shape[dim]
+    for i in range(len(shape)):
+        if i != dim:
+            n_rows *= shape[i]
+    
+    # Set up block size
+    BLOCK_SIZE = 1024
+    if n_cols > BLOCK_SIZE:
+        BLOCK_SIZE = triton.next_power_of_2(n_cols)
+    
+    # Launch kernel
+    grid = (n_rows,)
+    softmax_mul_kernel[grid](
+        input_ptr=input.data_ptr(),
+        other_ptr=other.data_ptr(),
+        output_ptr=out.data_ptr(),
+        input_row_stride=n_cols,
+        other_row_stride=n_cols,
+        output_row_stride=n_cols,
+        n_cols=n_cols,
+        dim=dim,
+        dtype=dtype,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return out

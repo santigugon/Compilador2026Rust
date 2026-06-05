@@ -1,0 +1,4 @@
+quantization,attempts,overall_pass_rate,compile_rate,correctness_rate,mean_gen_latency_ms
+awq_4bit,1,0.0,0.0,0.0,3364.701174000004
+awq_8bit,1,0.0,0.0,0.0,2394.8883950000095
+gptq_4bit,1,0.0,0.0,0.0,3264.036223000062

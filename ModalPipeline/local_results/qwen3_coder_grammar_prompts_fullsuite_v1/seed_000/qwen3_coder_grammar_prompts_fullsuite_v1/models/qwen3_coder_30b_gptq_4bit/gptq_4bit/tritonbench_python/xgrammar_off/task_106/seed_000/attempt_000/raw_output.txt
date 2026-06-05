@@ -1,0 +1,163 @@
+```python
+import torch
+import triton
+import triton.language as tl
+from typing import Tuple, Optional
+
+@triton.jit
+def lu_kernel(
+    A_ptr, P_ptr, L_ptr, U_ptr,
+    m, n, batch_size,
+    stride_A_batch, stride_A_row, stride_A_col,
+    stride_P_batch, stride_P_row, stride_P_col,
+    stride_L_batch, stride_L_row, stride_L_col,
+    stride_U_batch, stride_U_row, stride_U_col,
+    BLOCK_SIZE: tl.constexpr,
+    pivot: tl.constexpr
+):
+    batch_idx = tl.program_id(0)
+    if batch_idx >= batch_size:
+        return
+    
+    A_batch = A_ptr + batch_idx * stride_A_batch
+    P_batch = P_ptr + batch_idx * stride_P_batch
+    L_batch = L_ptr + batch_idx * stride_L_batch
+    U_batch = U_ptr + batch_idx * stride_U_batch
+    
+    for k in range(min(m, n)):
+        # Find pivot
+        if pivot:
+            max_val = tl.load(A_batch + k * stride_A_row + k * stride_A_col)
+            max_idx = k
+            for i in range(k + 1, m):
+                val = tl.load(A_batch + i * stride_A_row + k * stride_A_col)
+                if val > max_val:
+                    max_val = val
+                    max_idx = i
+            if max_idx != k:
+                # Swap rows in A
+                for j in range(k, n):
+                    temp = tl.load(A_batch + k * stride_A_row + j * stride_A_col)
+                    tl.store(A_batch + k * stride_A_row + j * stride_A_col,
+                            tl.load(A_batch + max_idx * stride_A_row + j * stride_A_col))
+                    tl.store(A_batch + max_idx * stride_A_row + j * stride_A_col, temp)
+                # Update permutation matrix
+                for j in range(n):
+                    temp = tl.load(P_batch + k * stride_P_row + j * stride_P_col)
+                    tl.store(P_batch + k * stride_P_row + j * stride_P_col,
+                            tl.load(P_batch + max_idx * stride_P_row + j * stride_P_col))
+                    tl.store(P_batch + max_idx * stride_P_row + j * stride_P_col, temp)
+        
+        # Compute L and U
+        for i in range(k + 1, m):
+            if k < n:
+                factor = tl.load(A_batch + i * stride_A_row + k * stride_A_col) / \
+                         tl.load(A_batch + k * stride_A_row + k * stride_A_col)
+                tl.store(L_batch + i * stride_L_row + k * stride_L_col, factor)
+                for j in range(k + 1, n):
+                    val = tl.load(A_batch + i * stride_A_row + j * stride_A_col) - \
+                          factor * tl.load(A_batch + k * stride_A_row + j * stride_A_col)
+                    tl.store(A_batch + i * stride_A_row + j * stride_A_col, val)
+    
+    # Copy result to L and U
+    for i in range(m):
+        for j in range(n):
+            if i > j:
+                if i < m and j < n:
+                    tl.store(L_batch + i * stride_L_row + j * stride_L_col,
+                            tl.load(A_batch + i * stride_A_row + j * stride_A_col))
+            else:
+                if i < m and j < n:
+                    tl.store(U_batch + i * stride_U_row + j * stride_U_col,
+                            tl.load(A_batch + i * stride_A_row + j * stride_A_col))
+
+def lu(A: torch.Tensor, *, pivot: bool = True, out: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if A.dim() < 2:
+        raise ValueError("Input tensor must have at least 2 dimensions")
+    
+    batch_dims = A.shape[:-2]
+    m, n = A.shape[-2], A.shape[-1]
+    
+    # Create output tensors
+    if out is not None:
+        P, L, U = out
+        if P.shape != batch_dims + (m, m):
+            raise ValueError("P tensor has incorrect shape")
+        if L.shape != batch_dims + (m, n):
+            raise ValueError("L tensor has incorrect shape")
+        if U.shape != batch_dims + (m, n):
+            raise ValueError("U tensor has incorrect shape")
+    else:
+        P = torch.empty(batch_dims + (m, m), dtype=torch.float32, device=A.device)
+        L = torch.empty(batch_dims + (m, n), dtype=A.dtype, device=A.device)
+        U = torch.empty(batch_dims + (m, n), dtype=A.dtype, device=A.device)
+    
+    # Initialize P as identity matrix
+    if len(batch_dims) == 0:
+        P.fill_(0)
+        for i in range(m):
+            P[i, i] = 1
+    else:
+        for i in range(m):
+            P[..., i, i] = 1
+    
+    # Copy input to L and U for processing
+    if len(batch_dims) == 0:
+        L.copy_(A)
+        U.copy_(A)
+    else:
+        L.copy_(A)
+        U.copy_(A)
+    
+    # Launch kernel
+    batch_size = 1 if len(batch_dims) == 0 else torch.prod(torch.tensor(batch_dims))
+    grid = (batch_size, 1, 1)
+    
+    # Determine block size
+    BLOCK_SIZE = 16
+    
+    # Launch kernel
+    if A.dtype == torch.float32:
+        lu_kernel[grid](
+            L, P, L, U,
+            m, n, batch_size,
+            L.stride(0) if len(batch_dims) > 0 else 0,
+            L.stride(1) if len(batch_dims) > 0 else 0,
+            L.stride(2) if len(batch_dims) > 0 else 0,
+            P.stride(0) if len(batch_dims) > 0 else 0,
+            P.stride(1) if len(batch_dims) > 0 else 0,
+            P.stride(2) if len(batch_dims) > 0 else 0,
+            L.stride(0) if len(batch_dims) > 0 else 0,
+            L.stride(1) if len(batch_dims) > 0 else 0,
+            L.stride(2) if len(batch_dims) > 0 else 0,
+            U.stride(0) if len(batch_dims) > 0 else 0,
+            U.stride(1) if len(batch_dims) > 0 else 0,
+            U.stride(2) if len(batch_dims) > 0 else 0,
+            BLOCK_SIZE,
+            pivot
+        )
+    elif A.dtype == torch.float64:
+        lu_kernel[grid](
+            L, P, L, U,
+            m, n, batch_size,
+            L.stride(0) if len(batch_dims) > 0 else 0,
+            L.stride(1) if len(batch_dims) > 0 else 0,
+            L.stride(2) if len(batch_dims) > 0 else 0,
+            P.stride(0) if len(batch_dims) > 0 else 0,
+            P.stride(1) if len(batch_dims) > 0 else 0,
+            P.stride(2) if len(batch_dims) > 0 else 0,
+            L.stride(0) if len(batch_dims) > 0 else 0,
+            L.stride(1) if len(batch_dims) > 0 else 0,
+            L.stride(2) if len(batch_dims) > 0 else 0,
+            U.stride(0) if len(batch_dims) > 0 else 0,
+            U.stride(1) if len(batch_dims) > 0 else 0,
+            U.stride(2) if len(batch_dims) > 0 else 0,
+            BLOCK_SIZE,
+            pivot
+        )
+    else:
+        raise ValueError(f"Unsupported dtype: {A.dtype}")
+    
+    # Return results
+    return (P, L, U)
+```

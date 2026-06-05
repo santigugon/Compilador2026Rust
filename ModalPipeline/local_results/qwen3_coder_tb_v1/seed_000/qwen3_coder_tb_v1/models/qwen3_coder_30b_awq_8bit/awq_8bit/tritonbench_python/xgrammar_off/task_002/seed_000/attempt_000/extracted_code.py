@@ -1,0 +1,91 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def sigmoid_conv2d_kernel(
+    input_ptr, weight_ptr, bias_ptr, output_ptr,
+    input_shape_0, input_shape_1, input_shape_2, input_shape_3,
+    weight_shape_0, weight_shape_1, weight_shape_2, weight_shape_3,
+    output_shape_0, output_shape_1, output_shape_2, output_shape_3,
+    stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w, groups,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    num_pid_n = tl.cdiv(output_shape_2, BLOCK_SIZE_M)
+    num_pid_m = tl.cdiv(output_shape_3, BLOCK_SIZE_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    
+    output_offset = pid_m * output_shape_3 + pid_n
+    output_ptr += output_offset
+    
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    for g in range(groups):
+        for k in range(weight_shape_1):
+            input_offset = g * (input_shape_1 // groups) + k
+            weight_offset = g * (weight_shape_0 // groups) + 0
+            for i in range(weight_shape_2):
+                for j in range(weight_shape_3):
+                    input_h = offs_m * stride_h - pad_h + i * dilation_h
+                    input_w = offs_n * stride_w - pad_w + j * dilation_w
+                    if input_h >= 0 and input_h < input_shape_2 and input_w >= 0 and input_w < input_shape_3:
+                        input_val = tl.load(input_ptr + input_offset * input_shape_2 * input_shape_3 + input_h * input_shape_3 + input_w)
+                        weight_val = tl.load(weight_ptr + weight_offset * weight_shape_1 * weight_shape_2 * weight_shape_3 + k * weight_shape_2 * weight_shape_3 + i * weight_shape_3 + j)
+                        acc += input_val * weight_val
+    
+    if bias_ptr is not None:
+        for i in range(BLOCK_SIZE_M):
+            for j in range(BLOCK_SIZE_N):
+                acc[i, j] += tl.load(bias_ptr + pid_m * BLOCK_SIZE_M + i)
+    
+    output = tl.sigmoid(acc)
+    tl.store(output_ptr, output)
+
+def sigmoid_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, out=None):
+    if isinstance(stride, int):
+        stride = (stride, stride)
+    if isinstance(padding, int):
+        padding = (padding, padding)
+    if isinstance(dilation, int):
+        dilation = (dilation, dilation)
+    
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    dilation_h, dilation_w = dilation
+    
+    input_shape = input.shape
+    weight_shape = weight.shape
+    
+    batch_size, in_channels, iH, iW = input_shape
+    out_channels, _, kH, kW = weight_shape
+    
+    oH = (iH + 2 * pad_h - (kH - 1) * dilation_h - 1) // stride_h + 1
+    oW = (iW + 2 * pad_w - (kW - 1) * dilation_w - 1) // stride_w + 1
+    
+    if out is None:
+        out = torch.empty((batch_size, out_channels, oH, oW), device=input.device, dtype=torch.float32)
+    
+    BLOCK_SIZE_M = 16
+    BLOCK_SIZE_N = 16
+    BLOCK_SIZE_K = 32
+    
+    num_warps = 4
+    
+    grid = (triton.cdiv(oH, BLOCK_SIZE_M) * triton.cdiv(oW, BLOCK_SIZE_N),)
+    
+    sigmoid_conv2d_kernel[grid](
+        input, weight, bias, out,
+        input_shape[0], input_shape[1], input_shape[2], input_shape[3],
+        weight_shape[0], weight_shape[1], weight_shape[2], weight_shape[3],
+        out.shape[0], out.shape[1], out.shape[2], out.shape[3],
+        stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w, groups,
+        BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
+        num_warps=num_warps
+    )
+    
+    return out

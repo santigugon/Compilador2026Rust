@@ -1,0 +1,52 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def chebyshev_kernel(
+    input_ptr, n_ptr, out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    n = tl.load(n_ptr + offsets, mask=mask)
+    
+    # Handle special cases
+    result = tl.where(n == 0, 1.0, 
+                     tl.where(n == 1, input,
+                             tl.where(tl.abs(input) > 1,
+                                     # Recursive formula for |input| > 1
+                                     tl.where(n < 6,
+                                             # Use explicit formula for n >= 6
+                                             tl.cos(n * tl.acos(input)),
+                                             # Recursive for n >= 6
+                                             tl.where(n == 2, 2 * input * input - 1,
+                                                     tl.where(n == 3, 4 * input * input * input - 3 * input,
+                                                             tl.where(n == 4, 8 * input * input * input * input - 8 * input * input + 1,
+                                                                     tl.where(n == 5, 16 * input * input * input * input * input - 20 * input * input * input + 5 * input,
+                                                                             2 * input * tl.cos(n * tl.acos(input)) - tl.cos((n-1) * tl.acos(input)))))),
+                                     # Explicit trigonometric formula for |input| <= 1
+                                     tl.cos(n * tl.acos(input)))))
+    
+    tl.store(out_ptr + offsets, result, mask=mask)
+
+def chebyshev_polynomial_t(input, n, *, out=None):
+    if out is None:
+        out = torch.empty_like(input)
+    
+    n_elements = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    chebyshev_kernel[grid](
+        input_ptr=input.data_ptr(),
+        n_ptr=n.data_ptr(),
+        out_ptr=out.data_ptr(),
+        n_elements=n_elements,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return out

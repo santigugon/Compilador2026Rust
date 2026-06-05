@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are an expert Triton programmer.\n\nGenerate ONLY a single valid Python module.\nNo explanations.\nNo prose.\nNo markdown outside the code block.\nNo tests.\nNo example calls.\n\nThe module must contain:\n- imports\n- Triton kernels\n- wrapper function\n\nThe wrapper function must exactly match the required signature.\n\nWrap the entire response in ONE ```python``` block.\n"
+  },
+  {
+    "role": "user",
+    "content": "You are an expert in Trion programming, capable of writing corresponding Triton kernels and wrapper functions based on functional descriptions and function parameters. Ensure that the wrapper function fully corresponds to the provided function information.\nFunctional Description: Applies a 2D convolution over an input tensor, followed by applying the rectified linear unit (ReLU) activation function element-wise on the result. This operation first applies a 2D convolution over the input tensor using the specified filters, and then applies ReLU activation to the convolution result, setting all negative values to zero.\nWrapper Entry Information: relu_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, inplace=False) -> Tensor: input (Tensor): The input tensor of shape (minibatch, in_channels, iH, iW). weight (Tensor): The convolution filters of shape (out_channels, in_channels / groups, kH, kW). bias (Tensor, optional): Optional bias tensor of shape (out_channels). Default: None. stride (int or tuple, optional): The stride of the convolution kernel. Default: 1. padding (int, tuple, or string, optional): Padding added to all sides of the input. Default: 0. dilation (int or tuple, optional): The spacing between kernel elements. Default: 1. groups (int, optional): Number of blocked connections from input channels to output channels. Default: 1. inplace (bool, optional): If True, will perform ReLU operation in-place. Default: False.\nAfter generation, verify if the Triton wrapper aligns with the provided func_inputs. If not, regenerate."
+  }
+]

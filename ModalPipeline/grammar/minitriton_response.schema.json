@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MiniTritonStructuredResponse",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "kernel_name",
+    "assumptions",
+    "minitriton_code",
+    "test_code",
+    "expected_input_shapes",
+    "expected_output_shapes",
+    "numerical_tolerance",
+    "notes"
+  ],
+  "properties": {
+    "task_id": { "type": "string" },
+    "kernel_name": { "type": "string" },
+    "assumptions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "minitriton_code": { "type": "string" },
+    "test_code": { "type": "string" },
+    "expected_input_shapes": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "expected_output_shapes": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "numerical_tolerance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rtol", "atol"],
+      "properties": {
+        "rtol": { "type": "number" },
+        "atol": { "type": "number" }
+      }
+    },
+    "notes": { "type": "string" }
+  }
+}

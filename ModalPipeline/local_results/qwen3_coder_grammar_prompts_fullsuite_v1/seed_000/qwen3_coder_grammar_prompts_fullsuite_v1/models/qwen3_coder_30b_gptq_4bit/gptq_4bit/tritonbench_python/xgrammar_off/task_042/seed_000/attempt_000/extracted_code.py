@@ -1,0 +1,56 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def zeta_kernel(
+    x_ptr, q_ptr, output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    q = tl.load(q_ptr + offsets, mask=mask)
+    
+    # Compute Hurwitz zeta function using series approximation
+    # zeta(x, q) = sum_{n=0}^{inf} (q + n)^{-x}
+    result = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    
+    # Use a simple iterative approach for demonstration
+    # In practice, more sophisticated algorithms would be used
+    for i in range(100):  # Limit iterations for stability
+        n = i
+        term = tl.pow(q + n, -x)
+        result = result + term
+        # Early stopping if term becomes negligible
+        if tl.abs(term) < 1e-12:
+            break
+    
+    tl.store(output_ptr + offsets, result, mask=mask)
+
+def zeta(input, other, *, out=None):
+    if out is None:
+        out = torch.empty_like(input)
+    
+    # Ensure inputs are float32
+    input = input.float()
+    other = other.float()
+    out = out.float()
+    
+    # Get the total number of elements
+    n_elements = input.numel()
+    
+    # Launch kernel
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    zeta_kernel[grid](
+        input, other, out,
+        n_elements,
+        BLOCK_SIZE
+    )
+    
+    return out

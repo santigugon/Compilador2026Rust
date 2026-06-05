@@ -1,0 +1,13 @@
+{
+  "experiment_id": "qwen3_coder_smoke_v1",
+  "tables": {
+    "attempts_parquet": "/results/qwen3_coder_smoke_v1/attempts.parquet",
+    "attempts_csv": "/results/qwen3_coder_smoke_v1/attempts.csv",
+    "aggregate_by_quantization": "/results/qwen3_coder_smoke_v1/aggregate_by_quantization.csv",
+    "aggregate_by_role": "/results/qwen3_coder_smoke_v1/aggregate_by_role.csv",
+    "aggregate_by_decoding_mode": "/results/qwen3_coder_smoke_v1/aggregate_by_decoding_mode.csv",
+    "aggregate_by_task": "/results/qwen3_coder_smoke_v1/aggregate_by_task.csv",
+    "pareto_frontier": "/results/qwen3_coder_smoke_v1/pareto_frontier.csv",
+    "failure_counts": "/results/qwen3_coder_smoke_v1/failure_counts.csv"
+  }
+}

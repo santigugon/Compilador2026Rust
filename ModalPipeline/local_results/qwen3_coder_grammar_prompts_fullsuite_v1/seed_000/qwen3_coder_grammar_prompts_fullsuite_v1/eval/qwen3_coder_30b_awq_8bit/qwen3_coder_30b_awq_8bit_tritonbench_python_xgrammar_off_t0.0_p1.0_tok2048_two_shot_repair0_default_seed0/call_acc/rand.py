@@ -1,0 +1,95 @@
+import torch
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def _rand_kernel(out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    # Generate random numbers using a simple linear congruential generator
+    # Using a fixed seed for reproducibility
+    state = offsets + 12345  # Simple seed
+    # Simple LCG parameters
+    a = 1664525
+    c = 1013904223
+    m = 2**32
+    state = (a * state + c) % m
+    # Convert to [0, 1) range
+    rand_val = state / m
+    tl.store(out_ptr + offsets, rand_val, mask=mask)
+
+def rand(*size, generator=None, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False, pin_memory=False):
+    # Handle the case where size is a single integer or a sequence
+    if len(size) == 1 and not isinstance(size[0], int):
+        # size is a sequence like a list or tuple
+        shape = size[0]
+    else:
+        shape = size
+    
+    # Convert shape to a tuple if it's not already
+    if not isinstance(shape, tuple):
+        shape = tuple(shape)
+    
+    # Create the output tensor
+    if out is not None:
+        # Use the provided output tensor
+        if out.shape != shape:
+            raise ValueError(f"Output tensor shape {out.shape} does not match requested shape {shape}")
+        if dtype is not None and out.dtype != dtype:
+            raise ValueError(f"Output tensor dtype {out.dtype} does not match requested dtype {dtype}")
+        if device is not None and out.device != device:
+            raise ValueError(f"Output tensor device {out.device} does not match requested device {device}")
+        if layout != torch.strided:
+            raise ValueError("Only strided layout is supported")
+        if pin_memory:
+            raise ValueError("pin_memory is not supported for provided output tensor")
+    else:
+        # Create a new tensor with the specified properties
+        if dtype is None:
+            dtype = torch.get_default_dtype()
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if layout != torch.strided:
+            raise ValueError("Only strided layout is supported")
+        if pin_memory:
+            raise ValueError("pin_memory is not supported in this implementation")
+        
+        out = torch.empty(shape, dtype=dtype, layout=layout, device=device, requires_grad=requires_grad)
+    
+    # Fill the tensor with random numbers
+    if out.numel() > 0:
+        n = out.numel()
+        block = 256
+        grid = (triton.cdiv(n, block),)
+        _rand_kernel[grid](out, n, BLOCK=block)
+    
+    return out
+
+##################################################################################################################################################
+
+
+
+import torch
+
+def test_rand():
+    results = {}
+
+    # Test case 1: Basic usage with size only
+    results["test_case_1"] = rand(2, 3, device='cuda')
+
+    # Test case 2: Specifying dtype
+    results["test_case_2"] = rand(2, 3, dtype=torch.float64, device='cuda')
+
+    # Test case 3: Using a generator
+    gen = torch.Generator(device='cuda')
+    gen.manual_seed(42)
+    results["test_case_3"] = rand(2, 3, generator=gen, device='cuda')
+
+    # Test case 4: Requires gradient
+    results["test_case_4"] = rand(2, 3, requires_grad=True, device='cuda')
+
+    return results
+
+test_results = test_rand()

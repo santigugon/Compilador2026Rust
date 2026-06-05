@@ -1,0 +1,137 @@
+```python
+import torch
+import triton
+import triton.language as tl
+from typing import Tuple, Optional, Union
+
+@triton.jit
+def relu_kernel(
+    input_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    output = tl.where(input > 0, input, 0)
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+@triton.jit
+def fractional_max_pool2d_kernel(
+    input_ptr,
+    output_ptr,
+    indices_ptr,
+    input_height,
+    input_width,
+    output_height,
+    output_width,
+    kernel_height,
+    kernel_width,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < output_height * output_width
+    output_idx = offsets
+    output_y = output_idx // output_width
+    output_x = output_idx % output_width
+    
+    # Calculate input region for fractional pooling
+    input_y_start = (output_y * input_height) // output_height
+    input_x_start = (output_x * input_width) // output_width
+    input_y_end = ((output_y + 1) * input_height + output_height - 1) // output_height
+    input_x_end = ((output_x + 1) * input_width + output_width - 1) // output_width
+    
+    # Find max value in region
+    max_val = -float('inf')
+    max_idx = 0
+    
+    for y in range(input_y_start, input_y_end):
+        for x in range(input_x_start, input_x_end):
+            input_val = tl.load(input_ptr + y * input_width + x)
+            if input_val > max_val:
+                max_val = input_val
+                max_idx = y * input_width + x
+    
+    tl.store(output_ptr + output_idx, max_val, mask=mask)
+    if indices_ptr is not None:
+        tl.store(indices_ptr + output_idx, max_idx, mask=mask)
+
+def fused_fractional_max_pool2d_with_relu(
+    input: torch.Tensor,
+    kernel_size: Union[int, Tuple[int, int]],
+    output_size: Optional[Tuple[int, int]] = None,
+    output_ratio: Optional[Tuple[float, float]] = None,
+    return_indices: bool = False
+) -> torch.Tensor:
+    # Handle input tensor
+    input = input.contiguous()
+    input_height, input_width = input.shape[-2], input.shape[-1]
+    
+    # Determine output size
+    if output_size is not None:
+        output_height, output_width = output_size
+    elif output_ratio is not None:
+        output_height = int(input_height * output_ratio[0])
+        output_width = int(input_width * output_ratio[1])
+    else:
+        # Default to kernel size
+        if isinstance(kernel_size, int):
+            kernel_height = kernel_width = kernel_size
+        else:
+            kernel_height, kernel_width = kernel_size
+        output_height = input_height // kernel_height
+        output_width = input_width // kernel_width
+    
+    # Apply ReLU
+    output = torch.empty(input.shape, dtype=input.dtype, device=input.device)
+    n_elements = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE
+    relu_kernel[grid,](input, output, n_elements, BLOCK_SIZE)
+    
+    # Apply fractional max pooling
+    output_pool = torch.empty(
+        input.shape[:-2] + (output_height, output_width),
+        dtype=input.dtype,
+        device=input.device
+    )
+    
+    if return_indices:
+        indices = torch.empty(
+            input.shape[:-2] + (output_height, output_width),
+            dtype=torch.long,
+            device=input.device
+        )
+        grid = (output_height * output_width + BLOCK_SIZE - 1) // BLOCK_SIZE
+        fractional_max_pool2d_kernel[grid,](
+            output,
+            output_pool,
+            indices,
+            input_height,
+            input_width,
+            output_height,
+            output_width,
+            kernel_height,
+            kernel_width,
+            BLOCK_SIZE
+        )
+        return output_pool, indices
+    else:
+        grid = (output_height * output_width + BLOCK_SIZE - 1) // BLOCK_SIZE
+        fractional_max_pool2d_kernel[grid,](
+            output,
+            output_pool,
+            None,
+            input_height,
+            input_width,
+            output_height,
+            output_width,
+            kernel_height,
+            kernel_width,
+            BLOCK_SIZE
+        )
+        return output_pool
+```

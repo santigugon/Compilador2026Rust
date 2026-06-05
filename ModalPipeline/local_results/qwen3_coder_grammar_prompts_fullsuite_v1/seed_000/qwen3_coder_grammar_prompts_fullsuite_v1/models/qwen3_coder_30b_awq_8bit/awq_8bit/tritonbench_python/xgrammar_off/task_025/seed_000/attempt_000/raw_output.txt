@@ -1,0 +1,150 @@
+```python
+import torch
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def _qr_decomposition_kernel(A_ptr, R_ptr, Q_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    # Initialize shared memory for Householder reflectors
+    v = tl.shared_ptr(tl.zeros((BLOCK,), dtype=tl.float32), shape=(BLOCK,))
+    
+    for k in range(n):
+        # Compute the Householder reflector for column k
+        # Load the k-th column of A
+        col_offsets = k + tl.arange(0, BLOCK) * n
+        col_data = tl.load(A_ptr + col_offsets, mask=(k + tl.arange(0, BLOCK)) < n, other=0.0)
+        
+        # Compute the norm of the column vector
+        norm_sq = tl.sum(col_data * col_data)
+        norm = tl.sqrt(norm_sq)
+        
+        # Compute the Householder vector v
+        if k == 0:
+            # For the first column, we need to handle the sign carefully
+            v_val = col_data[0] + tl.sign(col_data[0]) * norm
+            v[0] = v_val
+            for i in range(1, BLOCK):
+                v[i] = col_data[i]
+        else:
+            # For other columns, we can use the standard approach
+            v[0] = col_data[0]
+            for i in range(1, BLOCK):
+                v[i] = col_data[i]
+        
+        # Normalize v
+        v_norm_sq = tl.sum(v * v)
+        v_norm = tl.sqrt(v_norm_sq)
+        v_normalized = v / (v_norm + 1e-12)  # Add small epsilon to avoid division by zero
+        
+        # Compute the Householder reflector H = I - 2 * v * v^T
+        # Apply H to the submatrix starting from column k
+        for j in range(k, n):
+            # Compute the dot product of v and column j
+            dot_product = tl.sum(v_normalized * tl.load(A_ptr + j + tl.arange(0, BLOCK) * n, mask=(k + tl.arange(0, BLOCK)) < n, other=0.0))
+            
+            # Apply the reflector to column j
+            for i in range(k, BLOCK):
+                if k + i < n:
+                    A_val = tl.load(A_ptr + j + i * n)
+                    new_val = A_val - 2.0 * dot_product * v_normalized[i]
+                    tl.store(A_ptr + j + i * n, new_val)
+        
+        # Store the diagonal element of R
+        if k < n:
+            diag_val = tl.load(A_ptr + k + k * n)
+            tl.store(R_ptr + k, diag_val)
+        
+        # Store the Q matrix (simplified version)
+        if Q_ptr is not None:
+            for i in range(n):
+                if i == k:
+                    tl.store(Q_ptr + i + k * n, 1.0)
+                else:
+                    tl.store(Q_ptr + i + k * n, 0.0)
+
+@triton.jit
+def _determinant_kernel(R_ptr, det_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    # Load diagonal elements of R
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < n
+    diag_elements = tl.load(R_ptr + offsets, mask=mask, other=0.0)
+    
+    # Compute product of diagonal elements
+    det = tl.ones(1, dtype=tl.float32)
+    for i in range(n):
+        det = det * diag_elements[i]
+    
+    tl.store(det_ptr, det)
+
+def determinant_via_qr(A, *, mode='reduced', out=None):
+    # Validate input
+    if A.dim() != 2 or A.size(0) != A.size(1):
+        raise ValueError("Input must be a square matrix")
+    
+    n = A.size(0)
+    if n == 0:
+        raise ValueError("Input matrix must not be empty")
+    
+    # Create output tensor
+    if out is not None:
+        if out.shape != () or out.dtype != A.dtype:
+            raise ValueError("Output tensor must be a scalar with the same dtype as input")
+        det = out
+    else:
+        det = torch.empty((), dtype=A.dtype, device=A.device)
+    
+    # For small matrices, use direct computation
+    if n <= 2:
+        if n == 1:
+            det.fill_(A[0, 0])
+        elif n == 2:
+            det.fill_(A[0, 0] * A[1, 1] - A[0, 1] * A[1, 0])
+        return det
+    
+    # For larger matrices, use QR decomposition
+    # Create a copy of A for QR decomposition
+    A_copy = A.clone()
+    
+    # Perform QR decomposition using Householder reflections
+    # This is a simplified implementation - in practice, you'd want a more robust QR algorithm
+    R = torch.zeros_like(A_copy)
+    
+    # Simple QR decomposition for demonstration
+    # In a real implementation, this would be more complex
+    for k in range(n):
+        # Compute the Householder reflector
+        x = A_copy[k:, k]
+        x_norm = torch.norm(x)
+        
+        # Create the Householder vector
+        if x[0] >= 0:
+            v = x.clone()
+            v[0] = v[0] + x_norm
+        else:
+            v = x.clone()
+            v[0] = v[0] - x_norm
+        
+        # Normalize v
+        v_norm = torch.norm(v)
+        if v_norm > 1e-12:
+            v = v / v_norm
+        
+        # Apply Householder reflection to A
+        for j in range(k, n):
+            dot_product = torch.dot(v, A_copy[k:, j])
+            A_copy[k:, j] = A_copy[k:, j] - 2 * dot_product * v
+        
+        # Store diagonal elements of R
+        for i in range(k, n):
+            if i == k:
+                R[k, k] = A_copy[k, k]
+            else:
+                R[i, k] = A_copy[i, k]
+    
+    # Compute determinant as product of diagonal elements of R
+    det_val = torch.prod(torch.diag(R))
+    det.fill_(det_val)
+    
+    return det
+```

@@ -1,0 +1,59 @@
+experiment_id: qwen3_coder_grammar_prompts_a10_budget_v1
+mode: full
+serve_quantized_first: true
+
+vllm:
+  max_model_len: 1024
+  gpu_memory_utilization: 0.90
+
+benchmark:
+  harness: tritonbench4modal
+  dataset: simp
+  limit: 166
+  gpu_eval: A10G
+
+matrix:
+  output_profiles:
+    - tritonbench_python
+  decoding_modes:
+    - xgrammar_off
+    - xgrammar_on
+  sampling:
+    - temperature: 0.0
+      top_p: 1.0
+  max_output_tokens:
+    - 512
+  prompt_variants:
+    - one_shot
+    - two_shot
+  repair_budgets:
+    - 0
+  runtime_limits:
+    - name: a10_budget
+      compile_timeout_s: 120
+      exec_timeout_s: 300
+      memory_cap_mb: null
+
+seeds:
+  - 0
+
+paired_design: true
+grammar_version: "1.0"
+prompt_template_version: "tritonbench_v1"
+
+performance:
+  min_speedup_vs_pytorch: 0.0
+
+volumes:
+  model_cache: qwen3-model-cache
+  results: qwen3-coder-results
+
+paths:
+  results_mount: /results
+  model_cache_mount: /models
+
+secrets:
+  modal_secret_name: hf-token
+  env_vars:
+    - HF_TOKEN
+    - HUGGING_FACE_HUB_TOKEN

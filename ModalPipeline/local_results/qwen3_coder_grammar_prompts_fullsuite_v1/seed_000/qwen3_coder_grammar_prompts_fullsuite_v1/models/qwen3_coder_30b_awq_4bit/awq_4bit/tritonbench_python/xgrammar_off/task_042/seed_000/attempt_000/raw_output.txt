@@ -1,0 +1,71 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _zeta_kernel(x_ptr, q_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    q = tl.load(q_ptr + offsets, mask=mask, other=0.0)
+    
+    # Compute Hurwitz zeta function using the series representation
+    # zeta(x, q) = sum_{n=0}^{inf} 1 / (n + q)^x
+    # We'll compute a finite sum with a reasonable number of terms
+    # to approximate the infinite series
+    
+    # Initialize result
+    result = tl.zeros((BLOCK,), dtype=tl.float32)
+    
+    # For numerical stability, we'll compute a few terms and check convergence
+    # We'll use 100 terms as a reasonable approximation
+    for i in range(100):
+        n_term = i + q
+        # Avoid division by zero
+        n_term = tl.where(n_term <= 0, 1e-10, n_term)
+        term = 1.0 / (n_term ** x)
+        result = result + term
+        
+        # Early stopping if term is very small
+        if tl.all(term < 1e-10):
+            break
+    
+    # Handle special case when x <= 1
+    # For x <= 1, the series doesn't converge, but we'll return a safe value
+    # or handle it with a different approach
+    result = tl.where(x <= 1, 1e10, result)
+    
+    tl.store(out_ptr + offsets, result, mask=mask)
+
+def zeta(input, other, *, out=None):
+    # Handle scalar inputs
+    if not torch.is_tensor(input):
+        input = torch.tensor(input, dtype=torch.float32)
+    if not torch.is_tensor(other):
+        other = torch.tensor(other, dtype=torch.float32)
+    
+    # Ensure inputs are float32 for consistency
+    input = input.to(torch.float32)
+    other = other.to(torch.float32)
+    
+    # Handle broadcasting
+    out_shape = torch.broadcast_shapes(input.shape, other.shape)
+    input = input.expand(out_shape)
+    other = other.expand(out_shape)
+    
+    # Create output tensor
+    if out is None:
+        out = torch.empty(out_shape, dtype=torch.float32, device=input.device)
+    else:
+        out = out.to(torch.float32)
+    
+    # Launch kernel
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    
+    _zeta_kernel[grid](input, other, out, n, BLOCK=block)
+    return out
+```

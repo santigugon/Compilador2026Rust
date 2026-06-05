@@ -1,0 +1,89 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def tril_mm_and_scale_kernel(
+    A_ptr, B_ptr, output_ptr,
+    n, p,
+    alpha, beta,
+    stride_a_row, stride_a_col,
+    stride_b_row, stride_b_col,
+    stride_out_row, stride_out_col,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    pid_m = pid // tl.cdiv(p, BLOCK_SIZE)
+    pid_n = pid % tl.cdiv(p, BLOCK_SIZE)
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
+    
+    # Loop over tiles of A
+    for k in range(0, n, BLOCK_SIZE):
+        # Load tile of A (lower triangular part)
+        a_tile = tl.load(
+            A_ptr + k * stride_a_row + tl.arange(0, BLOCK_SIZE)[:, None] * stride_a_row + 
+            tl.arange(0, BLOCK_SIZE)[None, :] * stride_a_col,
+            mask=(tl.arange(0, BLOCK_SIZE)[:, None] < n - k) & 
+                  (tl.arange(0, BLOCK_SIZE)[None, :] < n),
+            other=0.0
+        )
+        
+        # Apply lower triangular mask
+        mask = tl.arange(0, BLOCK_SIZE)[:, None] >= tl.arange(0, BLOCK_SIZE)[None, :]
+        a_tile = tl.where(mask, a_tile, 0.0)
+        
+        # Load tile of B
+        b_tile = tl.load(
+            B_ptr + k * stride_b_row + tl.arange(0, BLOCK_SIZE)[:, None] * stride_b_row + 
+            tl.arange(0, BLOCK_SIZE)[None, :] * stride_b_col,
+            mask=(tl.arange(0, BLOCK_SIZE)[:, None] < n - k) & 
+                  (tl.arange(0, BLOCK_SIZE)[None, :] < p),
+            other=0.0
+        )
+        
+        # Compute partial dot product
+        acc += tl.dot(a_tile, b_tile)
+    
+    # Scale by alpha
+    acc *= alpha
+    
+    # Scale by beta and store result
+    output_tile = acc * beta
+    
+    # Store result
+    tl.store(
+        output_ptr + pid_m * stride_out_row + pid_n * stride_out_col,
+        output_tile,
+        mask=(tl.arange(0, BLOCK_SIZE)[:, None] < n) & 
+              (tl.arange(0, BLOCK_SIZE)[None, :] < p)
+    )
+
+def tril_mm_and_scale(A: torch.Tensor, B: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
+    assert A.dim() == 2 and B.dim() == 2
+    assert A.shape[0] == A.shape[1]
+    assert A.shape[1] == B.shape[0]
+    
+    n, p = A.shape[0], B.shape[1]
+    
+    # Create output tensor
+    output = torch.empty(n, p, dtype=torch.float32, device=A.device)
+    
+    # Define block size
+    BLOCK_SIZE = 16
+    
+    # Launch kernel
+    grid = (triton.cdiv(n, BLOCK_SIZE) * triton.cdiv(p, BLOCK_SIZE),)
+    
+    tril_mm_and_scale_kernel[grid](
+        A, B, output,
+        n, p,
+        alpha, beta,
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_SIZE
+    )
+    
+    return output

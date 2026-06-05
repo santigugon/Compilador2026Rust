@@ -1,0 +1,43 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _signbit_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    # Extract sign bit: cast to int32 and check the 31st bit
+    x_bits = tl.bitwise_and(tl.cast(x, tl.int32), 0x80000000)
+    signbit_result = tl.cast(x_bits != 0, tl.int8)
+    tl.store(out_ptr + offsets, signbit_result, mask=mask)
+
+@triton.jit
+def _bitwise_and_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0)
+    result = tl.bitwise_and(x, y)
+    tl.store(out_ptr + offsets, result, mask=mask)
+
+def signbit_bitwise_and(input: torch.Tensor, other: torch.Tensor):
+    # For signbit operation
+    signbit_out = torch.empty(input.shape, dtype=torch.bool, device=input.device)
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _signbit_kernel[grid](input, signbit_out, n, BLOCK=block)
+    
+    # For bitwise_and operation
+    bitwise_and_out = torch.empty(other.shape, dtype=other.dtype, device=other.device)
+    n = other.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _bitwise_and_kernel[grid](input.to(torch.int32), other, bitwise_and_out, n, BLOCK=block)
+    
+    return signbit_out, bitwise_and_out
+```

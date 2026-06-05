@@ -1,0 +1,83 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def combined_activation_kernel(
+    input_ptr, weight1_ptr, weight2_ptr, bias_ptr, output_ptr,
+    input_row_stride, weight1_row_stride, weight2_row_stride, bias_row_stride,
+    output_row_stride,
+    N, D_in, D_out,
+    BLOCK_SIZE_M=32,
+    BLOCK_SIZE_N=32,
+    BLOCK_SIZE_K=32
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Compute output for this block
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    for k in range(0, D_in, BLOCK_SIZE_K):
+        # Load input and weight1
+        input_block = tl.load(input_ptr + pid_m * input_row_stride + k * N, mask=(k + tl.arange(0, BLOCK_SIZE_K) < D_in))
+        weight1_block = tl.load(weight1_ptr + k * weight1_row_stride + pid_n * D_in, mask=(k + tl.arange(0, BLOCK_SIZE_K) < D_in))
+        
+        # Matrix multiplication
+        accumulator += tl.dot(input_block, weight1_block)
+    
+    # Apply sigmoid and tanh
+    output = tl.sigmoid(accumulator) * tl.tanh(accumulator)
+    
+    # Load weight2 and bias
+    weight2_block = tl.load(weight2_ptr + pid_n * weight2_row_stride, mask=(tl.arange(0, BLOCK_SIZE_N) < D_out))
+    bias_block = tl.load(bias_ptr + pid_n * bias_row_stride, mask=(tl.arange(0, BLOCK_SIZE_N) < D_out))
+    
+    # Element-wise multiplication and addition
+    output = output * weight2_block + bias_block
+    
+    # Store result
+    tl.store(output_ptr + pid_m * output_row_stride + pid_n, output)
+
+def combined_activation(input, weight1, weight2, bias, *, out=None):
+    # Validate dimensions
+    assert input.shape[-1] == weight1.shape[-2], "Input and weight1 dimensions incompatible"
+    assert weight2.shape[-1] == weight1.shape[-1], "Weight2 and weight1 dimensions incompatible"
+    assert bias.shape[-1] == weight1.shape[-1], "Bias and weight1 dimensions incompatible"
+    
+    # Flatten batch dimensions
+    batch_shape = input.shape[:-2]
+    N, D_in = input.shape[-2], weight1.shape[-2]
+    D_out = weight1.shape[-1]
+    
+    # Reshape inputs for computation
+    input_reshaped = input.view(-1, N, D_in)
+    batch_size = input_reshaped.shape[0]
+    
+    # Create output tensor
+    if out is None:
+        out = torch.empty(batch_size, N, D_out, dtype=input.dtype, device=input.device)
+    else:
+        assert out.shape == (batch_size, N, D_out), "Output tensor shape mismatch"
+    
+    # Launch kernel
+    grid = (triton.cdiv(N, 32), triton.cdiv(D_out, 32))
+    
+    # Compute strides
+    input_row_stride = input_reshaped.stride(-2)
+    weight1_row_stride = weight1.stride(-2)
+    weight2_row_stride = weight2.stride(-1)
+    bias_row_stride = bias.stride(-1)
+    output_row_stride = out.stride(-2)
+    
+    combined_activation_kernel[grid](
+        input_reshaped, weight1, weight2, bias, out,
+        input_row_stride, weight1_row_stride, weight2_row_stride, bias_row_stride,
+        output_row_stride,
+        N, D_in, D_out
+    )
+    
+    # Reshape output to match original batch dimensions
+    return out.view(*batch_shape, N, D_out)
+```

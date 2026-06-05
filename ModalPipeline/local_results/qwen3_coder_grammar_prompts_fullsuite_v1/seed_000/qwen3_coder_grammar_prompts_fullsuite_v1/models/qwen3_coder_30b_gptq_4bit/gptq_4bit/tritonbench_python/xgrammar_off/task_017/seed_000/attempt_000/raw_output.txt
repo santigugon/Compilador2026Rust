@@ -1,0 +1,85 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_index_select_eq_kernel(
+    input_ptr, index_ptr, other_ptr, output_ptr,
+    input_size, index_size, other_size,
+    dim_size, stride_input_dim, stride_other_dim,
+    BLOCK_SIZE: tl.constexpr
+):
+    # Get the block index
+    block_idx = tl.program_id(0)
+    
+    # Calculate the starting position for this block
+    start_pos = block_idx * BLOCK_SIZE
+    
+    # Load indices
+    indices = tl.load(index_ptr + tl.arange(0, BLOCK_SIZE), mask=(tl.arange(0, BLOCK_SIZE) + start_pos) < index_size)
+    
+    # Load input tensor elements
+    input_elements = tl.load(input_ptr + indices * stride_input_dim + tl.arange(0, BLOCK_SIZE) * stride_input_dim, mask=(tl.arange(0, BLOCK_SIZE) + start_pos) < index_size)
+    
+    # Load other tensor elements
+    other_elements = tl.load(other_ptr + tl.arange(0, BLOCK_SIZE) * stride_other_dim, mask=(tl.arange(0, BLOCK_SIZE) + start_pos) < other_size)
+    
+    # Perform element-wise equality comparison
+    result = input_elements == other_elements
+    
+    # Store the result
+    tl.store(output_ptr + tl.arange(0, BLOCK_SIZE), result, mask=(tl.arange(0, BLOCK_SIZE) + start_pos) < index_size)
+
+def fused_index_select_eq(input, dim, index, other, *, out=None):
+    # Validate inputs
+    if dim < 0:
+        dim = input.dim() + dim
+    
+    if dim >= input.dim():
+        raise ValueError("dim must be within the range of input tensor dimensions")
+    
+    if index.dim() != 1:
+        raise ValueError("index must be a 1-dimensional tensor")
+    
+    # Determine output shape
+    output_shape = list(input.shape)
+    output_shape[dim] = index.shape[0]
+    
+    # Create output tensor if not provided
+    if out is None:
+        out = torch.empty(output_shape, dtype=torch.bool, device=input.device)
+    
+    # Ensure all tensors are on the same device
+    index = index.to(input.device)
+    other = other.to(input.device)
+    
+    # Calculate strides
+    stride_input_dim = input.stride(dim)
+    stride_other_dim = other.stride(dim) if hasattr(other, 'stride') else 1
+    
+    # Prepare for kernel launch
+    input_size = input.numel()
+    index_size = index.numel()
+    other_size = other.numel() if hasattr(other, 'numel') else 1
+    
+    # Launch kernel
+    BLOCK_SIZE = 1024
+    grid_size = (index_size + BLOCK_SIZE - 1) // BLOCK_SIZE
+    
+    fused_index_select_eq_kernel[grid_size](
+        input_ptr=input.data_ptr(),
+        index_ptr=index.data_ptr(),
+        other_ptr=other.data_ptr(),
+        output_ptr=out.data_ptr(),
+        input_size=input_size,
+        index_size=index_size,
+        other_size=other_size,
+        dim_size=input.shape[dim],
+        stride_input_dim=stride_input_dim,
+        stride_other_dim=stride_other_dim,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return out
+```

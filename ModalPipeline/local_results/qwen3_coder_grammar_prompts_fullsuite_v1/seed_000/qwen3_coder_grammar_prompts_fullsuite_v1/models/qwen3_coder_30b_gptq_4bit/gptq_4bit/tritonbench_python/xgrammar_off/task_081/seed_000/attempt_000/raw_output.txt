@@ -1,0 +1,109 @@
+```python
+import torch
+import triton
+import triton.language as tl
+from typing import Union, Tuple
+
+@triton.jit
+def sigmoid_adaptive_avg_pool2d_kernel(
+    input_ptr,
+    output_ptr,
+    input_row_stride,
+    input_col_stride,
+    output_row_stride,
+    output_col_stride,
+    output_size_h,
+    output_size_w,
+    input_h,
+    input_w,
+    BLOCK_SIZE_H,
+    BLOCK_SIZE_W,
+    num_warps=4
+):
+    # Get the block indices
+    block_row = tl.program_id(0)
+    block_col = tl.program_id(1)
+    
+    # Calculate the output indices
+    output_row = block_row * BLOCK_SIZE_H
+    output_col = block_col * BLOCK_SIZE_W
+    
+    # Calculate the input indices
+    input_start_h = (output_row * input_h) // output_size_h
+    input_end_h = ((output_row + BLOCK_SIZE_H) * input_h + output_size_h - 1) // output_size_h
+    input_start_w = (output_col * input_w) // output_size_w
+    input_end_w = ((output_col + BLOCK_SIZE_W) * input_w + output_size_w - 1) // output_size_w
+    
+    # Initialize accumulator
+    accumulator = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_W), dtype=tl.float32)
+    
+    # Loop over the input region
+    for h in range(input_start_h, input_end_h):
+        for w in range(input_start_w, input_end_w):
+            # Calculate the input index
+            input_idx = h * input_row_stride + w * input_col_stride
+            # Accumulate the value
+            accumulator += tl.load(input_ptr + input_idx)
+    
+    # Calculate the number of elements in the region
+    num_elements = (input_end_h - input_start_h) * (input_end_w - input_start_w)
+    
+    # Compute average
+    avg = accumulator / num_elements
+    
+    # Apply sigmoid
+    sigmoid_val = 1.0 / (1.0 + tl.exp(-avg))
+    
+    # Store the result
+    for i in range(BLOCK_SIZE_H):
+        for j in range(BLOCK_SIZE_W):
+            if output_row + i < output_size_h and output_col + j < output_size_w:
+                output_idx = (output_row + i) * output_row_stride + (output_col + j) * output_col_stride
+                tl.store(output_ptr + output_idx, sigmoid_val)
+
+def sigmoid_adaptive_avg_pool2d(input: torch.Tensor, output_size: Union[int, Tuple[int, int]]) -> torch.Tensor:
+    # Ensure input is 4D (N, C, H, W)
+    if input.dim() != 4:
+        raise ValueError("Input tensor must be 4-dimensional (N, C, H, W)")
+    
+    # Handle output_size
+    if isinstance(output_size, int):
+        output_size_h = output_size
+        output_size_w = output_size
+    else:
+        output_size_h, output_size_w = output_size
+    
+    # Get input dimensions
+    batch_size, channels, input_h, input_w = input.shape
+    
+    # Create output tensor
+    output = torch.empty(batch_size, channels, output_size_h, output_size_w, device=input.device, dtype=torch.float32)
+    
+    # Define block size
+    BLOCK_SIZE_H = 16
+    BLOCK_SIZE_W = 16
+    
+    # Calculate grid size
+    grid = (
+        triton.cdiv(output_size_h, BLOCK_SIZE_H),
+        triton.cdiv(output_size_w, BLOCK_SIZE_W)
+    )
+    
+    # Launch kernel
+    sigmoid_adaptive_avg_pool2d_kernel[grid](
+        input_ptr=input.data_ptr(),
+        output_ptr=output.data_ptr(),
+        input_row_stride=input.stride(2),
+        input_col_stride=input.stride(3),
+        output_row_stride=output.stride(2),
+        output_col_stride=output.stride(3),
+        output_size_h=output_size_h,
+        output_size_w=output_size_w,
+        input_h=input_h,
+        input_w=input_w,
+        BLOCK_SIZE_H=BLOCK_SIZE_H,
+        BLOCK_SIZE_W=BLOCK_SIZE_W
+    )
+    
+    return output
+```

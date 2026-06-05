@@ -1,0 +1,139 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _softmax_mul_kernel(
+    input_ptr, other_ptr, out_ptr,
+    input_stride, other_stride, out_stride,
+    dim_size: tl.constexpr,
+    num_elements: tl.constexpr,
+    dim: tl.constexpr,
+    BLOCK: tl.constexpr
+):
+    # Get the program ID
+    pid = tl.program_id(0)
+    
+    # Calculate the offset for this program
+    offset = pid * BLOCK
+    
+    # Create a mask for valid elements
+    mask = offset + tl.arange(0, BLOCK) < num_elements
+    
+    # Load input data
+    input_offsets = offset + tl.arange(0, BLOCK)
+    input_data = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
+    
+    # Load other data (broadcasting)
+    other_data = tl.load(other_ptr + input_offsets, mask=mask, other=0.0)
+    
+    # Apply softmax and multiply
+    # For softmax, we need to compute exp(x) / sum(exp(x)) along the specified dimension
+    # Since we're doing this in a single kernel, we'll compute the softmax for the entire tensor
+    # and then multiply by other
+    
+    # Compute max for numerical stability
+    max_val = tl.max(input_data, axis=0)
+    
+    # Compute exp(x - max_val)
+    exp_data = tl.exp(input_data - max_val)
+    
+    # Compute sum of exp
+    sum_exp = tl.sum(exp_data, axis=0)
+    
+    # Compute softmax
+    softmax_data = exp_data / sum_exp
+    
+    # Multiply by other
+    result = softmax_data * other_data
+    
+    # Store result
+    tl.store(out_ptr + input_offsets, result, mask=mask)
+
+def softmax_mul(input, other, dim, dtype=None, out=None):
+    # Handle dtype casting
+    if dtype is not None:
+        input = input.to(dtype)
+    
+    # Handle scalar other
+    if not torch.is_tensor(other):
+        other = torch.tensor(other, dtype=input.dtype, device=input.device)
+    
+    # Ensure other is broadcastable with input
+    if not torch.is_tensor(other):
+        other = torch.tensor(other, dtype=input.dtype, device=input.device)
+    
+    # Create output tensor
+    if out is None:
+        out = torch.empty_like(input)
+    else:
+        if out.shape != input.shape:
+            raise ValueError("Output tensor shape must match input tensor shape")
+    
+    # Get the size of the specified dimension
+    dim_size = input.shape[dim]
+    num_elements = input.numel()
+    
+    # Calculate grid size
+    block = 256
+    grid = (triton.cdiv(num_elements, block),)
+    
+    # Get strides
+    input_stride = input.stride()
+    other_stride = other.stride()
+    out_stride = out.stride()
+    
+    # Launch kernel
+    _softmax_mul_kernel[grid](
+        input, other, out,
+        input_stride, other_stride, out_stride,
+        dim_size, num_elements, dim, BLOCK=block
+    )
+    
+    return out
+
+##################################################################################################################################################
+
+
+
+import torch
+import torch.nn.functional as F
+
+# def softmax_mul(input, other, dim, dtype=None, out=None):
+#     softmaxed = F.softmax(input, dim=dim, dtype=dtype)
+#     if isinstance(other, torch.Tensor):
+#         result = softmaxed * other
+#     else:
+#         result = softmaxed * other
+#     if out is not None:
+#         out.copy_(result)
+#         return out
+#     return result
+
+def test_softmax_mul():
+    results = {}
+    
+    # Test case 1: Basic test with two tensors
+    input1 = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device='cuda')
+    other1 = torch.tensor([[0.5, 0.5], [0.5, 0.5]], device='cuda')
+    results["test_case_1"] = softmax_mul(input1, other1, dim=1)
+    
+    # Test case 2: Test with scalar multiplication
+    input2 = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device='cuda')
+    other2 = 0.5
+    results["test_case_2"] = softmax_mul(input2, other2, dim=1)
+    
+    # Test case 3: Test with different dtype
+    input3 = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device='cuda')
+    other3 = torch.tensor([[0.5, 0.5], [0.5, 0.5]], device='cuda')
+    results["test_case_3"] = softmax_mul(input3, other3, dim=1, dtype=torch.float64)
+    
+    # Test case 4: Test with out parameter
+    input4 = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device='cuda')
+    other4 = torch.tensor([[0.5, 0.5], [0.5, 0.5]], device='cuda')
+    out4 = torch.empty_like(input4)
+    results["test_case_4"] = softmax_mul(input4, other4, dim=1, out=out4)
+    
+    return results
+
+test_results = test_softmax_mul()

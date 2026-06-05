@@ -1,0 +1,69 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _div_kernel(
+    input_ptr,
+    other_ptr,
+    output_ptr,
+    n_elements,
+    rounding_mode,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    other = tl.load(other_ptr + offsets, mask=mask)
+    
+    if rounding_mode == 0:  # None
+        result = input / other
+    elif rounding_mode == 1:  # "floor"
+        result = tl.floor(input / other)
+    elif rounding_mode == 2:  # "round"
+        result = tl.round(input / other)
+    elif rounding_mode == 3:  # "trunc"
+        result = tl.trunc(input / other)
+    else:
+        result = input / other
+    
+    tl.store(output_ptr + offsets, result, mask=mask)
+
+def div(input, other, *, rounding_mode=None, out=None):
+    if isinstance(other, (int, float, complex)):
+        other = torch.tensor(other, dtype=input.dtype, device=input.device)
+    else:
+        other = other.to(input.dtype)
+    
+    if out is None:
+        out = torch.empty_like(input)
+    
+    if input.shape != other.shape:
+        input, other = torch.broadcast_tensors(input, other)
+    
+    n_elements = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    rounding_mode_map = {
+        None: 0,
+        "floor": 1,
+        "round": 2,
+        "trunc": 3
+    }
+    rounding_mode_code = rounding_mode_map.get(rounding_mode, 0)
+    
+    _div_kernel[grid](
+        input_ptr=input.data_ptr(),
+        other_ptr=other.data_ptr(),
+        output_ptr=out.data_ptr(),
+        n_elements=n_elements,
+        rounding_mode=rounding_mode_code,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return out
+```
