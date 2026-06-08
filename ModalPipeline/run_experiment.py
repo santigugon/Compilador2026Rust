@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -58,24 +59,38 @@ def _seed_dir(seed: int | str) -> str:
     return f"seed_{int(seed):03d}"
 
 
+def _merge_tree_preserving_local(src: Path, dst: Path) -> None:
+    dst.mkdir(parents=True, exist_ok=True)
+    for child in src.iterdir():
+        target = dst / child.name
+        if child.is_dir():
+            _merge_tree_preserving_local(child, target)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(child, target)
+
+
 def export_results_to_local(experiment_id: str, seeds: list[int | str]) -> None:
     unique_seeds = sorted({int(seed) for seed in seeds})
     for seed in unique_seeds:
         local_dir = PACKAGE_ROOT / "local_results" / experiment_id / _seed_dir(seed)
         local_dir.mkdir(parents=True, exist_ok=True)
-        proc = subprocess.run(
-            [
-                "modal",
-                "volume",
-                "get",
-                "--force",
-                "qwen3-coder-results",
-                f"/{experiment_id}",
-                str(local_dir),
-            ],
-            capture_output=True,
-            text=True,
-        )
+        with tempfile.TemporaryDirectory(prefix=f"{experiment_id}-export-") as tmp:
+            tmp_dir = Path(tmp)
+            proc = subprocess.run(
+                [
+                    "modal",
+                    "volume",
+                    "get",
+                    "qwen3-coder-results",
+                    f"/{experiment_id}",
+                    str(tmp_dir),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode == 0:
+                _merge_tree_preserving_local(tmp_dir, local_dir)
         if proc.returncode != 0:
             err = (proc.stderr or proc.stdout or "").strip()
             print(f"Warning: failed to auto-export results for seed {seed}: {err}")

@@ -100,7 +100,7 @@ def _gpu_for_model(model_cfg: dict, hf_defaults: dict) -> str:
 
 @app.function(
     image=image_serve,
-    gpu="A100-80GB",
+    gpu="A100-40GB",
     timeout=60 * 60 * 8,
     volumes={
         MODEL_CACHE_MOUNT: volume_models,

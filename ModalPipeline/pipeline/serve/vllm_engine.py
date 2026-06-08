@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import time
 from typing import Any
 
@@ -21,6 +22,41 @@ def build_llm_kwargs(model: dict[str, Any], cache_dir: str) -> dict[str, Any]:
     if quant:
         kwargs["quantization"] = quant
     return kwargs
+
+
+def _add_guided_json_sampling_param(
+    sampling_kwargs: dict[str, Any],
+    sampling_params_cls: type,
+    guided_json: dict[str, Any],
+) -> None:
+    params = inspect.signature(sampling_params_cls).parameters
+
+    if "structured_outputs" in params:
+        from vllm.sampling_params import StructuredOutputsParams
+
+        sampling_kwargs["structured_outputs"] = StructuredOutputsParams(json=guided_json)
+        return
+
+    if "guided_decoding" in params:
+        from vllm.sampling_params import GuidedDecodingParams
+
+        try:
+            sampling_kwargs["guided_decoding"] = GuidedDecodingParams(json=guided_json)
+        except TypeError:
+            sampling_kwargs["guided_decoding"] = GuidedDecodingParams(
+                json_schema=guided_json
+            )
+        return
+
+    if "guided_json" in params:
+        sampling_kwargs["guided_json"] = guided_json
+        return
+
+    raise RuntimeError(
+        "This vLLM SamplingParams version does not expose structured_outputs, "
+        "guided_json, or guided_decoding, so xgrammar_on cannot be used with "
+        "this image."
+    )
 
 
 class VllmGenerator:
@@ -54,17 +90,11 @@ class VllmGenerator:
         }
 
         if guided and guided.get("guided_json"):
-            try:
-                sampling_kwargs["guided_json"] = guided["guided_json"]
-            except TypeError:
-                try:
-                    from vllm.sampling_params import GuidedDecodingParams
-
-                    sampling_kwargs["guided_decoding"] = GuidedDecodingParams(
-                        json=guided["guided_json"]
-                    )
-                except Exception:
-                    pass
+            _add_guided_json_sampling_param(
+                sampling_kwargs,
+                SamplingParams,
+                guided["guided_json"],
+            )
 
         params = SamplingParams(**sampling_kwargs)
         t0 = time.perf_counter()
