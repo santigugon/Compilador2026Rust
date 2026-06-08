@@ -8,9 +8,9 @@ def _relu_sqrt_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    # Apply ReLU: set negative values to zero
+    # Apply ReLU: max(0, x)
     x = tl.maximum(x, 0.0)
-    # Apply square root
+    # Apply sqrt
     y = tl.sqrt(x)
     tl.store(out_ptr + offsets, y, mask=mask)
 
@@ -18,22 +18,35 @@ def relu_sqrt(input, inplace=False, out=None):
     if inplace:
         # Check if input is contiguous and can be modified in-place
         if not input.is_contiguous():
-            # If not contiguous, we can't do in-place modification safely
+            # If not contiguous, we can't do in-place modification
             inplace = False
         else:
             # For in-place operation, we modify the input tensor directly
-            out = input
+            # This requires the tensor to be writable and contiguous
+            pass
     
-    if out is None:
-        out = torch.empty_like(input)
-    
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    
-    _relu_sqrt_kernel[grid](input, out, n, BLOCK=block)
-    
-    return out
+    if inplace and not input.requires_grad:
+        # Perform in-place operation
+        out = input
+        n = input.numel()
+        block = 256
+        grid = (triton.cdiv(n, block),)
+        _relu_sqrt_kernel[grid](input, out, n, BLOCK=block)
+        return out
+    else:
+        # Create output tensor
+        if out is None:
+            out = torch.empty_like(input)
+        else:
+            # Ensure out has the same shape and dtype as input
+            if out.shape != input.shape or out.dtype != input.dtype:
+                raise ValueError("out tensor must have the same shape and dtype as input")
+        
+        n = input.numel()
+        block = 256
+        grid = (triton.cdiv(n, block),)
+        _relu_sqrt_kernel[grid](input, out, n, BLOCK=block)
+        return out
 
 ##################################################################################################################################################
 

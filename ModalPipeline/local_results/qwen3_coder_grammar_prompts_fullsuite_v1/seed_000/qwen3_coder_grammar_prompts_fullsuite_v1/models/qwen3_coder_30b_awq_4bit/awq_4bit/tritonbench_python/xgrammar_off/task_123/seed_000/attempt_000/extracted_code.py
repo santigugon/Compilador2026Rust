@@ -3,182 +3,177 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _conv2d_kernel(
+def conv2d_kernel(
     input_ptr, weight_ptr, bias_ptr, output_ptr,
-    batch_size, in_channels, out_channels, iH, iW, oH, oW,
-    kH, kW, stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w,
-    groups, BLOCK_SIZE: tl.constexpr
+    input_shape, weight_shape, output_shape,
+    conv_stride, conv_padding, conv_dilation,
+    conv_groups,
+    BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C, BLOCK_SIZE_K
 ):
+    # Get thread indices
     batch_idx = tl.program_id(0)
-    out_ch_idx = tl.program_id(1)
+    out_h_idx = tl.program_id(1)
+    out_w_idx = tl.program_id(2)
+    out_c_idx = tl.program_id(3)
     
-    # Calculate output dimensions
-    output_h = oH
-    output_w = oW
+    # Load input and weight
+    input_ptr += batch_idx * input_shape[1] * input_shape[2] * input_shape[3]
+    weight_ptr += out_c_idx * weight_shape[1] * weight_shape[2] * weight_shape[3]
     
-    # Load bias if available
-    bias_val = tl.load(bias_ptr + out_ch_idx) if bias_ptr is not None else 0.0
+    # Compute output
+    out_h = out_h_idx * BLOCK_SIZE_H
+    out_w = out_w_idx * BLOCK_SIZE_W
+    out_c = out_c_idx * BLOCK_SIZE_C
     
-    # Loop over output spatial dimensions
-    for oh in range(output_h):
-        for ow in range(output_w):
-            # Initialize accumulator
-            acc = 0.0
-            
-            # Loop over groups and input channels
-            for g in range(groups):
-                for ic in range(in_channels // groups):
-                    # Calculate input indices with padding
-                    ih_start = oh * stride_h - padding_h
-                    iw_start = ow * stride_w - padding_w
-                    
-                    # Loop over kernel dimensions
-                    for kh in range(kH):
-                        for kw in range(kW):
-                            ih = ih_start + kh * dilation_h
-                            iw = iw_start + kw * dilation_w
-                            
-                            # Check bounds
-                            if ih >= 0 and ih < iH and iw >= 0 and iw < iW:
-                                input_idx = batch_idx * (in_channels * iH * iW) + \
-                                           g * (in_channels // groups * iH * iW) + \
-                                           ic * (iH * iW) + \
-                                           ih * iW + iw
-                                weight_idx = out_ch_idx * (in_channels // groups * kH * kW) + \
-                                            g * (in_channels // groups * kH * kW) + \
-                                            ic * (kH * kW) + \
-                                            kh * kW + kw
-                                
-                                input_val = tl.load(input_ptr + input_idx)
-                                weight_val = tl.load(weight_ptr + weight_idx)
-                                acc += input_val * weight_val
-            
-            # Add bias and store result
-            output_idx = batch_idx * (out_channels * oH * oW) + \
-                        out_ch_idx * (oH * oW) + \
-                        oh * oW + ow
-            tl.store(output_ptr + output_idx, acc + bias_val)
+    # Simple convolution kernel (simplified for demonstration)
+    for h in range(BLOCK_SIZE_H):
+        for w in range(BLOCK_SIZE_W):
+            for c in range(BLOCK_SIZE_C):
+                acc = 0.0
+                for kh in range(weight_shape[2]):
+                    for kw in range(weight_shape[3]):
+                        ih = out_h + h
+                        iw = out_w + w
+                        ic = c
+                        if ih < input_shape[2] and iw < input_shape[3]:
+                            input_val = tl.load(input_ptr + ic * input_shape[2] * input_shape[3] + ih * input_shape[3] + iw)
+                            weight_val = tl.load(weight_ptr + c * weight_shape[2] * weight_shape[3] + kh * weight_shape[3] + kw)
+                            acc += input_val * weight_val
+                tl.store(output_ptr + batch_idx * output_shape[1] * output_shape[2] * output_shape[3] + out_c * output_shape[2] * output_shape[3] + out_h * output_shape[3] + out_w, acc)
 
 @triton.jit
-def _max_pool2d_kernel(
+def max_pool2d_kernel(
     input_ptr, output_ptr,
-    batch_size, in_channels, oH, oW, kH, kW, stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w,
-    BLOCK_SIZE: tl.constexpr
+    input_shape, output_shape,
+    pool_kernel_size, pool_stride, pool_padding, pool_dilation, pool_ceil_mode,
+    BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C
 ):
+    # Get thread indices
     batch_idx = tl.program_id(0)
-    ch_idx = tl.program_id(1)
+    out_h_idx = tl.program_id(1)
+    out_w_idx = tl.program_id(2)
+    out_c_idx = tl.program_id(3)
     
-    # Loop over output spatial dimensions
-    for oh in range(oH):
-        for ow in range(oW):
-            # Initialize max value
-            max_val = -float('inf')
-            
-            # Loop over pooling kernel
-            for kh in range(kH):
-                for kw in range(kW):
-                    ih = oh * stride_h + kh * dilation_h - padding_h
-                    iw = ow * stride_w + kw * dilation_w - padding_w
-                    
-                    # Check bounds
-                    if ih >= 0 and ih < oH * stride_h and iw >= 0 and iw < oW * stride_w:
-                        input_idx = batch_idx * (in_channels * oH * oW) + \
-                                   ch_idx * (oH * oW) + \
-                                   ih * oW + iw
-                        input_val = tl.load(input_ptr + input_idx)
-                        max_val = tl.maximum(max_val, input_val)
-            
-            # Store result
-            output_idx = batch_idx * (in_channels * oH * oW) + \
-                        ch_idx * (oH * oW) + \
-                        oh * oW + ow
-            tl.store(output_ptr + output_idx, max_val)
+    # Load input
+    input_ptr += batch_idx * input_shape[1] * input_shape[2] * input_shape[3]
+    
+    # Simple max pooling kernel (simplified for demonstration)
+    out_h = out_h_idx * BLOCK_SIZE_H
+    out_w = out_w_idx * BLOCK_SIZE_W
+    out_c = out_c_idx * BLOCK_SIZE_C
+    
+    # Max pooling operation
+    max_val = -float('inf')
+    for kh in range(pool_kernel_size):
+        for kw in range(pool_kernel_size):
+            ih = out_h * pool_stride + kh * pool_dilation
+            iw = out_w * pool_stride + kw * pool_dilation
+            if ih < input_shape[2] and iw < input_shape[3]:
+                input_val = tl.load(input_ptr + out_c * input_shape[2] * input_shape[3] + ih * input_shape[3] + iw)
+                max_val = tl.maximum(max_val, input_val)
+    
+    tl.store(output_ptr + batch_idx * output_shape[1] * output_shape[2] * output_shape[3] + out_c * output_shape[2] * output_shape[3] + out_h * output_shape[3] + out_w, max_val)
 
 @triton.jit
-def _relu_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    y = tl.maximum(x, 0.0)
-    tl.store(out_ptr + offsets, y, mask=mask)
+def relu_kernel(
+    input_ptr, output_ptr,
+    input_shape,
+    BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C
+):
+    # Get thread indices
+    batch_idx = tl.program_id(0)
+    out_h_idx = tl.program_id(1)
+    out_w_idx = tl.program_id(2)
+    out_c_idx = tl.program_id(3)
+    
+    # Load input
+    input_ptr += batch_idx * input_shape[1] * input_shape[2] * input_shape[3]
+    
+    # Simple ReLU operation
+    out_h = out_h_idx * BLOCK_SIZE_H
+    out_w = out_w_idx * BLOCK_SIZE_W
+    out_c = out_c_idx * BLOCK_SIZE_C
+    
+    input_val = tl.load(input_ptr + out_c * input_shape[2] * input_shape[3] + out_h * input_shape[3] + out_w)
+    output_val = tl.maximum(0.0, input_val)
+    tl.store(output_ptr + batch_idx * input_shape[1] * input_shape[2] * input_shape[3] + out_c * input_shape[2] * input_shape[3] + out_h * input_shape[3] + out_w, output_val)
 
 def relu_max_pool2d_conv2d(
     input, weight, bias=None, conv_stride=1, conv_padding=0, conv_dilation=1, conv_groups=1,
     pool_kernel_size=2, pool_stride=None, pool_padding=0, pool_dilation=1, pool_ceil_mode=False, inplace=False
 ):
-    # Handle scalar inputs
-    if not isinstance(conv_stride, tuple):
-        conv_stride = (conv_stride, conv_stride)
-    if not isinstance(conv_padding, tuple):
-        conv_padding = (conv_padding, conv_padding)
-    if not isinstance(conv_dilation, tuple):
-        conv_dilation = (conv_dilation, conv_dilation)
-    if not isinstance(pool_kernel_size, tuple):
-        pool_kernel_size = (pool_kernel_size, pool_kernel_size)
+    # Set default pool_stride
     if pool_stride is None:
         pool_stride = pool_kernel_size
-    if not isinstance(pool_padding, tuple):
-        pool_padding = (pool_padding, pool_padding)
-    if not isinstance(pool_dilation, tuple):
-        pool_dilation = (pool_dilation, pool_dilation)
     
-    # Get dimensions
+    # Get input dimensions
     batch_size, in_channels, iH, iW = input.shape
     out_channels, _, kH, kW = weight.shape
     
-    # Calculate output dimensions for convolution
-    stride_h, stride_w = conv_stride
-    padding_h, padding_w = conv_padding
-    dilation_h, dilation_w = conv_dilation
+    # Compute output dimensions for convolution
+    oH = (iH + 2 * conv_padding - (kH - 1) * conv_dilation - 1) // conv_stride + 1
+    oW = (iW + 2 * conv_padding - (kW - 1) * conv_dilation - 1) // conv_stride + 1
     
-    oH = (iH + 2 * padding_h - (kH - 1) * dilation_h - 1) // stride_h + 1
-    oW = (iW + 2 * padding_w - (kW - 1) * dilation_w - 1) // stride_w + 1
+    # Compute output dimensions for pooling
+    pH = (oH + 2 * pool_padding - (pool_kernel_size - 1) * pool_dilation - 1) // pool_stride + 1
+    pW = (oW + 2 * pool_padding - (pool_kernel_size - 1) * pool_dilation - 1) // pool_stride + 1
     
-    # Calculate output dimensions for pooling
-    pool_stride_h, pool_stride_w = pool_stride
-    pool_padding_h, pool_padding_w = pool_padding
-    pool_dilation_h, pool_dilation_w = pool_dilation
+    # Allocate output tensor
+    output = torch.empty(batch_size, out_channels, pH, pW, device=input.device, dtype=input.dtype)
     
-    if pool_ceil_mode:
-        pool_oH = (oH + 2 * pool_padding_h - (pool_kernel_size[0] - 1) * pool_dilation_h - 1) // pool_stride_h + 1
-        pool_oW = (oW + 2 * pool_padding_w - (pool_kernel_size[1] - 1) * pool_dilation_w - 1) // pool_stride_w + 1
-    else:
-        pool_oH = (oH + 2 * pool_padding_h - (pool_kernel_size[0] - 1) * pool_dilation_h - 1) // pool_stride_h + 1
-        pool_oW = (oW + 2 * pool_padding_w - (pool_kernel_size[1] - 1) * pool_dilation_w - 1) // pool_stride_w + 1
+    # Define block sizes
+    BLOCK_SIZE_H = 16
+    BLOCK_SIZE_W = 16
+    BLOCK_SIZE_C = 16
+    BLOCK_SIZE_K = 16
     
-    # Allocate intermediate and output tensors
-    conv_out = torch.empty(batch_size, out_channels, oH, oW, device=input.device, dtype=input.dtype)
-    pool_out = torch.empty(batch_size, out_channels, pool_oH, pool_oW, device=input.device, dtype=input.dtype)
-    
-    # Perform convolution
-    if bias is not None:
-        bias_ptr = bias
-    else:
-        bias_ptr = None
-    
-    # Convolution kernel launch
-    block = 256
+    # Launch kernels
+    # Convolution kernel
     grid_conv = (
         batch_size,
-        out_channels
+        (oH + BLOCK_SIZE_H - 1) // BLOCK_SIZE_H,
+        (oW + BLOCK_SIZE_W - 1) // BLOCK_SIZE_W,
+        (out_channels + BLOCK_SIZE_C - 1) // BLOCK_SIZE_C
     )
     
-    # For simplicity, we'll use PyTorch's native implementation for convolution
-    # since it's complex to implement a full 2D convolution kernel in Triton
-    conv_out = torch.nn.functional.conv2d(
-        input, weight, bias, conv_stride, conv_padding, conv_dilation, conv_groups
+    # Max pooling kernel
+    grid_pool = (
+        batch_size,
+        (pH + BLOCK_SIZE_H - 1) // BLOCK_SIZE_H,
+        (pW + BLOCK_SIZE_W - 1) // BLOCK_SIZE_W,
+        (out_channels + BLOCK_SIZE_C - 1) // BLOCK_SIZE_C
     )
     
-    # Perform max pooling
-    pool_out = torch.nn.functional.max_pool2d(
-        conv_out, pool_kernel_size, pool_stride, pool_padding, pool_dilation, pool_ceil_mode
+    # ReLU kernel
+    grid_relu = (
+        batch_size,
+        (pH + BLOCK_SIZE_H - 1) // BLOCK_SIZE_H,
+        (pW + BLOCK_SIZE_W - 1) // BLOCK_SIZE_W,
+        (out_channels + BLOCK_SIZE_C - 1) // BLOCK_SIZE_C
     )
     
-    # Apply ReLU
-    if inplace:
-        pool_out = torch.nn.functional.relu_(pool_out)
-    else:
-        pool_out = torch.nn.functional.relu(pool_out)
+    # Launch convolution kernel
+    conv2d_kernel[grid_conv](
+        input, weight, bias, output,
+        input.shape, weight.shape, output.shape,
+        conv_stride, conv_padding, conv_dilation,
+        conv_groups,
+        BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C, BLOCK_SIZE_K
+    )
     
-    return pool_out
+    # Launch max pooling kernel
+    max_pool2d_kernel[grid_pool](
+        output, output,
+        output.shape, output.shape,
+        pool_kernel_size, pool_stride, pool_padding, pool_dilation, pool_ceil_mode,
+        BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C
+    )
+    
+    # Launch ReLU kernel
+    relu_kernel[grid_relu](
+        output, output,
+        output.shape,
+        BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C
+    )
+    
+    return output

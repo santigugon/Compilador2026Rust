@@ -20,11 +20,8 @@ def sqrt(input, *, out=None):
             raise ValueError("Output tensor must have the same shape as input tensor")
     
     n_elements = input.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    sqrt_kernel[grid](input, out, n_elements, BLOCK_SIZE)
-    
+    grid = (triton.cdiv(n_elements, 1024),)
+    sqrt_kernel[grid](input, out, n_elements, BLOCK_SIZE=1024)
     return out
 
 ##################################################################################################################################################

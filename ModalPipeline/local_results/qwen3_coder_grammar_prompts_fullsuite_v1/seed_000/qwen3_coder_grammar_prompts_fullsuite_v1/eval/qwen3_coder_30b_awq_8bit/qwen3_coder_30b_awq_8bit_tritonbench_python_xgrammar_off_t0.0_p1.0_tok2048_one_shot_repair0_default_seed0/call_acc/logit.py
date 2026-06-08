@@ -19,25 +19,30 @@ def logit_kernel(
     if eps is not None:
         input = tl.clamp(input, eps, 1.0 - eps)
     
-    output = tl.math.log(input / (1.0 - input))
+    output = tl.log(input / (1.0 - input))
     tl.store(output_ptr + offsets, output, mask=mask)
 
 def logit(input, eps=None, *, out=None):
     if out is None:
         out = torch.empty_like(input, dtype=torch.float32)
     
-    if eps is not None:
-        eps = float(eps)
+    if input.numel() == 0:
+        return out
     
     n_elements = input.numel()
     BLOCK_SIZE = 1024
     grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
     
+    if eps is not None:
+        eps = eps
+    else:
+        eps = None
+    
     logit_kernel[grid](
-        input,
-        out,
-        eps,
-        n_elements,
+        input_ptr=input,
+        output_ptr=out,
+        eps=eps,
+        n_elements=n_elements,
         BLOCK_SIZE=BLOCK_SIZE
     )
     

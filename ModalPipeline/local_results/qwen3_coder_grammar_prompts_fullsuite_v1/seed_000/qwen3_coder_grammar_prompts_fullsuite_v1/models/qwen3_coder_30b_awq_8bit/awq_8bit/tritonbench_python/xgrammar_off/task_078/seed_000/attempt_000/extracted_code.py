@@ -3,96 +3,190 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def fused_cross_entropy_log_softmax_kernel(
-    input_ptr, target_ptr, weight_ptr, output_ptr,
-    N, C, dim, ignore_index, reduction, label_smoothing,
-    BLOCK_SIZE: tl.constexpr
+def _log_softmax_kernel(
+    input_ptr, 
+    output_ptr, 
+    n_elements, 
+    dim_size, 
+    dim_stride, 
+    BLOCK: tl.constexpr
 ):
-    # Get the thread index
     pid = tl.program_id(0)
-    # Each block processes one row
     row = pid
+    offsets = row * dim_stride + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
     
-    # Shared memory for reduction
-    shared_max = tl.shared_memory(shape=(BLOCK_SIZE,), dtype=tl.float32)
-    shared_sum = tl.shared_memory(shape=(BLOCK_SIZE,), dtype=tl.float32)
+    # Load input values
+    x = tl.load(input_ptr + offsets, mask=mask, other=-float('inf'))
     
-    # Load input data for this row
-    input_row = tl.load(input_ptr + row * C + tl.arange(0, BLOCK_SIZE))
-    
-    # Apply log softmax
     # Compute max for numerical stability
-    max_val = tl.max(input_row)
-    input_row = input_row - max_val
+    max_val = tl.max(x, axis=0)
+    max_val = tl.broadcast_to(max_val, x.shape)
     
-    # Compute log sum exp
-    exp_row = tl.exp(input_row)
-    sum_exp = tl.sum(exp_row)
-    log_sum_exp = tl.log(sum_exp)
+    # Compute logsumexp
+    shifted = x - max_val
+    exp_x = tl.exp(shifted)
+    sum_exp = tl.sum(exp_x, axis=0)
+    sum_exp = tl.broadcast_to(sum_exp, x.shape)
     
-    # Compute log softmax
-    log_softmax_row = input_row - log_sum_exp
-    
-    # Apply label smoothing if needed
-    if label_smoothing > 0.0:
-        smooth_log_softmax = log_softmax_row * (1.0 - label_smoothing) - label_smoothing * tl.log(C)
-        log_softmax_row = smooth_log_softmax
-    
-    # Load target
-    target_val = tl.load(target_ptr + row)
-    
-    # Check if target is ignore_index
-    if target_val == ignore_index:
-        loss_val = 0.0
-    else:
-        # Compute cross entropy loss
-        loss_val = -log_softmax_row[target_val]
-        
-        # Apply weight if provided
-        if weight_ptr is not None:
-            weight_val = tl.load(weight_ptr + target_val)
-            loss_val = loss_val * weight_val
+    # Compute log_softmax
+    log_softmax = shifted - tl.log(sum_exp)
     
     # Store result
-    tl.store(output_ptr + row, loss_val)
+    tl.store(output_ptr + offsets, log_softmax, mask=mask)
 
-def fused_cross_entropy_log_softmax(input: torch.Tensor, target: torch.Tensor, dim: int = 1, weight: torch.Tensor = None, ignore_index: int = -100, reduction: str = 'mean', label_smoothing: float = 0.0) -> torch.Tensor:
+@triton.jit
+def _cross_entropy_kernel(
+    log_softmax_ptr,
+    target_ptr,
+    output_ptr,
+    n_elements,
+    dim_size,
+    dim_stride,
+    weight_ptr,
+    ignore_index,
+    label_smoothing,
+    BLOCK: tl.constexpr
+):
+    pid = tl.program_id(0)
+    row = pid
+    offsets = row * dim_stride + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
+    
+    # Load log_softmax values
+    log_probs = tl.load(log_softmax_ptr + offsets, mask=mask, other=0.0)
+    
+    # Load target values
+    targets = tl.load(target_ptr + row * dim_stride, mask=tl.arange(0, BLOCK) < dim_size, other=0)
+    
+    # Initialize loss
+    loss = 0.0
+    
+    # Compute cross entropy
+    for i in range(dim_size):
+        if i == ignore_index:
+            continue
+            
+        target_idx = targets[i] if i < dim_size else 0
+        if target_idx == ignore_index:
+            continue
+            
+        # Apply label smoothing
+        smooth_prob = label_smoothing / dim_size
+        if target_idx < dim_size:
+            prob = log_probs[i]  # This is already log prob
+            # Apply smoothing: (1 - label_smoothing) * prob + label_smoothing / num_classes
+            smooth_prob = (1.0 - label_smoothing) * prob + label_smoothing / dim_size
+            loss += -smooth_prob
+        else:
+            loss += 0.0
+    
+    # Store result
+    tl.store(output_ptr + row, loss)
+
+def fused_cross_entropy_log_softmax(
+    input: torch.Tensor, 
+    target: torch.Tensor, 
+    dim: int = 1, 
+    weight: torch.Tensor = None, 
+    ignore_index: int = -100, 
+    reduction: str = 'mean', 
+    label_smoothing: float = 0.0
+) -> torch.Tensor:
     # Validate inputs
-    assert input.dim() == target.dim() + 1 or input.dim() == target.dim(), "Input and target dimensions mismatch"
-    assert dim < input.dim(), "dim must be less than input dimensions"
+    if input.dim() != target.dim() and input.dim() != target.dim() + 1:
+        raise ValueError("input and target must have compatible dimensions")
+    
+    # Handle scalar targets
+    if target.dim() == 0:
+        target = target.unsqueeze(0)
     
     # Get dimensions
-    N = input.shape[0]  # batch size
-    C = input.shape[dim]  # number of classes
+    input_shape = input.shape
+    target_shape = target.shape
+    dim_size = input_shape[dim]
     
-    # Ensure target has the same number of dimensions as input
-    if target.dim() < input.dim():
-        target = target.unsqueeze(-1)
+    # Create output tensor
+    if reduction == 'none':
+        output = torch.empty(target_shape, dtype=torch.float32, device=input.device)
+    else:
+        output = torch.empty((), dtype=torch.float32, device=input.device)
     
-    # Prepare output tensor
-    output = torch.empty(N, dtype=torch.float32, device=input.device)
+    # Compute log softmax
+    log_softmax = torch.empty_like(input)
     
-    # Launch kernel
-    BLOCK_SIZE = 1024
-    grid = (N,)
+    # Flatten input for processing
+    if dim == -1:
+        dim = input.dim() - 1
     
-    # Handle weight tensor
-    weight_ptr = weight.data_ptr() if weight is not None else None
+    # Compute block size
+    BLOCK = 256
+    n_elements = input.numel()
+    dim_stride = input.stride(dim)
     
-    # Launch kernel
-    fused_cross_entropy_log_softmax_kernel[grid](
-        input.data_ptr(),
-        target.data_ptr(),
-        weight_ptr,
-        output.data_ptr(),
-        N, C, dim, ignore_index, reduction, label_smoothing,
-        BLOCK_SIZE=BLOCK_SIZE
+    # Launch log softmax kernel
+    grid = (input_shape[0],)
+    _log_softmax_kernel[grid](
+        input, 
+        log_softmax, 
+        n_elements, 
+        dim_size, 
+        dim_stride, 
+        BLOCK=BLOCK
     )
     
-    # Apply reduction
-    if reduction == 'mean':
-        return output.mean()
-    elif reduction == 'sum':
-        return output.sum()
-    else:  # reduction == 'none'
-        return output
+    # Compute cross entropy
+    if reduction == 'none':
+        # For each sample, compute the loss
+        if target.dim() == 1:
+            # Single target per sample
+            grid = (input_shape[0],)
+            _cross_entropy_kernel[grid](
+                log_softmax, 
+                target, 
+                output, 
+                n_elements, 
+                dim_size, 
+                dim_stride, 
+                weight, 
+                ignore_index, 
+                label_smoothing, 
+                BLOCK=BLOCK
+            )
+        else:
+            # Multi-target case (e.g., for label smoothing with probabilities)
+            # This is a simplified version - full implementation would be more complex
+            output = torch.empty(target_shape, dtype=torch.float32, device=input.device)
+            # For now, we'll compute a basic version
+            for i in range(input_shape[0]):
+                sample_loss = 0.0
+                for j in range(dim_size):
+                    if j == ignore_index:
+                        continue
+                    target_val = target[i, j] if target.dim() > 1 else target[i]
+                    if target_val != ignore_index:
+                        # Apply label smoothing
+                        smooth_prob = (1.0 - label_smoothing) * log_softmax[i, j] + label_smoothing / dim_size
+                        sample_loss += -smooth_prob
+                output[i] = sample_loss
+    else:
+        # Compute total loss
+        total_loss = 0.0
+        for i in range(input_shape[0]):
+            sample_loss = 0.0
+            for j in range(dim_size):
+                if j == ignore_index:
+                    continue
+                target_val = target[i] if target.dim() == 1 else target[i, j]
+                if target_val != ignore_index:
+                    # Apply label smoothing
+                    smooth_prob = (1.0 - label_smoothing) * log_softmax[i, j] + label_smoothing / dim_size
+                    sample_loss += -smooth_prob
+            total_loss += sample_loss
+        
+        if reduction == 'mean':
+            output = total_loss / input_shape[0]
+        else:  # sum
+            output = total_loss
+    
+    return output

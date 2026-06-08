@@ -3,44 +3,99 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _qr_decomp_kernel(A_ptr, Q_ptr, R_ptr, m: tl.constexpr, n: tl.constexpr, k: tl.constexpr, BLOCK: tl.constexpr):
-    # Compute QR decomposition using Givens rotations
-    # This is a simplified implementation for demonstration
-    # In practice, a more sophisticated algorithm would be used
-    
-    # Initialize Q and R matrices
+def _qr_decomp_kernel(A, Q, R, m, n, k, stride_A, stride_Q, stride_R, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
     if pid >= m * n:
         return
-    
-    # For simplicity, we'll use a basic approach
-    # In a real implementation, this would be more complex
-    pass
+    row = pid // n
+    col = pid % n
+    if row < m and col < n:
+        A_row = A + row * stride_A + col * stride_A
+        Q_row = Q + row * stride_Q + col * stride_Q
+        R_row = R + row * stride_R + col * stride_R
+        for i in range(n):
+            if i < col:
+                R_row[i] = 0.0
+            else:
+                R_row[i] = A_row[i]
 
 @triton.jit
-def _solve_triangular_kernel(QTb_ptr, R_ptr, x_ptr, m: tl.constexpr, n: tl.constexpr, k: tl.constexpr, BLOCK: tl.constexpr):
-    # Solve the triangular system R x = QTb
-    # This is a simplified version for demonstration
-    pass
+def _solve_triangular_kernel(R, b, x, m, n, k, stride_R, stride_b, stride_x, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    if pid >= n * k:
+        return
+    row = pid // k
+    col = pid % k
+    if row < n and col < k:
+        x_row = x + row * stride_x + col * stride_x
+        R_row = R + row * stride_R + col * stride_R
+        b_row = b + row * stride_b + col * stride_b
+        x_row[col] = b_row[col]
+        for i in range(row - 1, -1, -1):
+            x_row[col] -= R_row[i] * x_row[col]
 
 def fused_qr_solve(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    # Validate input shapes
     m, n = A.shape
-    if m < n:
-        raise ValueError("Matrix A must have m >= n")
+    k = b.shape[1]
     
-    # Use torch's built-in QR solve for correctness
-    # This is a placeholder for a full Triton implementation
-    # A full implementation would require a more complex QR decomposition
-    # and triangular solve kernel
+    # Allocate output tensors
+    Q = torch.zeros((m, n), dtype=torch.float32, device=A.device)
+    R = torch.zeros((n, n), dtype=torch.float32, device=A.device)
+    Qb = torch.zeros((n, k), dtype=torch.float32, device=A.device)
+    x = torch.zeros((n, k), dtype=torch.float32, device=A.device)
     
-    # For now, we'll use torch's implementation to ensure correctness
-    # and demonstrate the structure
-    return torch.linalg.solve(A.T @ A, A.T @ b)
-
-# Note: A complete Triton implementation would require:
-# 1. A proper QR decomposition kernel using Givens rotations
-# 2. A triangular solve kernel
-# 3. Proper memory management and kernel launching
-# The current implementation uses torch.linalg.solve for correctness
-# but demonstrates the expected structure and function signature.
+    # QR decomposition
+    A_copy = A.clone()
+    for i in range(n):
+        # Compute norm of column
+        norm = 0.0
+        for j in range(i, m):
+            norm += A_copy[j, i] * A_copy[j, i]
+        norm = torch.sqrt(norm)
+        
+        # Compute sign
+        sign = 1.0 if A_copy[i, i] >= 0 else -1.0
+        
+        # Compute alpha
+        alpha = sign * norm
+        
+        # Compute v
+        v = torch.zeros(m, dtype=torch.float32, device=A.device)
+        v[i] = A_copy[i, i] + alpha
+        for j in range(i + 1, m):
+            v[j] = A_copy[j, i]
+        
+        # Compute beta
+        beta = 2.0 / (alpha * alpha + v[i] * v[i])
+        
+        # Apply Householder transformation
+        for j in range(i, n):
+            dot_product = 0.0
+            for l in range(i, m):
+                dot_product += v[l] * A_copy[l, j]
+            for l in range(i, m):
+                A_copy[l, j] -= beta * v[l] * dot_product
+        
+        # Store Q and R
+        for j in range(m):
+            Q[j, i] = v[j] if j >= i else 0.0
+        for j in range(i, n):
+            R[i, j] = A_copy[i, j] if i < m else 0.0
+    
+    # Compute Q^T * b
+    for i in range(n):
+        for j in range(k):
+            dot_product = 0.0
+            for l in range(m):
+                dot_product += Q[i, l] * b[l, j]
+            Qb[i, j] = dot_product
+    
+    # Solve Rx = Q^T * b
+    for i in range(n - 1, -1, -1):
+        for j in range(k):
+            x[i, j] = Qb[i, j]
+            for l in range(i + 1, n):
+                x[i, j] -= R[i, l] * x[l, j]
+            x[i, j] /= R[i, i]
+    
+    return x

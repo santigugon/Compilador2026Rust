@@ -3,53 +3,100 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def softplus_linear_kernel(
+def _softplus_linear_kernel(
     input_ptr,
     weight_ptr,
     bias_ptr,
     output_ptr,
-    n_cols,
-    beta,
-    threshold,
+    n_rows: tl.constexpr,
+    n_cols: tl.constexpr,
+    weight_stride_0: tl.constexpr,
+    weight_stride_1: tl.constexpr,
+    input_stride_0: tl.constexpr,
+    input_stride_1: tl.constexpr,
+    output_stride_0: tl.constexpr,
+    output_stride_1: tl.constexpr,
+    beta: tl.constexpr,
+    threshold: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_cols
-    input = tl.load(input_ptr + offsets, mask=mask)
-    weight = tl.load(weight_ptr + offsets, mask=mask)
-    bias = tl.load(bias_ptr + offsets, mask=mask) if bias_ptr is not None else 0
-    linear_output = input * weight + bias
+    row = pid
+    if row >= n_rows:
+        return
+    
+    # Load input row
+    input_row = tl.load(input_ptr + row * input_stride_0 + tl.arange(0, BLOCK_SIZE), mask=row < n_rows)
+    
+    # Compute linear transformation: input @ weight.T + bias
+    output_row = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    
+    for i in range(0, n_cols, BLOCK_SIZE):
+        # Load weight column
+        weight_col = tl.load(weight_ptr + i * weight_stride_1 + tl.arange(0, BLOCK_SIZE), mask=(i + tl.arange(0, BLOCK_SIZE)) < n_cols)
+        
+        # Compute dot product
+        output_row += tl.sum(input_row * weight_col, axis=0)
+    
+    # Add bias if present
+    if bias_ptr != 0:
+        bias = tl.load(bias_ptr + tl.arange(0, BLOCK_SIZE), mask=tl.arange(0, BLOCK_SIZE) < n_cols)
+        output_row += bias
+    
+    # Apply softplus activation
+    # Softplus = log(1 + exp(beta * x)) / beta
+    # For numerical stability, when x > threshold, use x instead of softplus
     softplus_output = tl.where(
-        linear_output > threshold,
-        linear_output,
-        tl.log(1.0 + tl.exp(beta * linear_output)) / beta
+        output_row > threshold,
+        output_row,
+        tl.log(1.0 + tl.exp(beta * output_row)) / beta
     )
-    tl.store(output_ptr + offsets, softplus_output, mask=mask)
+    
+    # Store result
+    tl.store(output_ptr + row * output_stride_0 + tl.arange(0, BLOCK_SIZE), softplus_output, mask=row < n_rows)
 
 def softplus_linear(input, weight, bias=None, beta=1, threshold=20):
-    assert input.dim() == 2, "Input must be a 2D tensor"
-    assert weight.dim() == 1, "Weight must be a 1D tensor"
-    assert input.size(1) == weight.size(0), "Input and weight dimensions must match"
-    if bias is not None:
-        assert bias.dim() == 1, "Bias must be a 1D tensor"
-        assert bias.size(0) == weight.size(0), "Bias and weight dimensions must match"
+    # Validate input dimensions
+    assert input.dim() == 2, "input must be a 2D tensor"
+    assert weight.dim() == 2, "weight must be a 2D tensor"
+    assert input.size(1) == weight.size(1), "input and weight must have compatible dimensions"
     
-    n_rows, n_cols = input.size()
-    output = torch.empty(n_rows, n_cols, device=input.device, dtype=input.dtype)
+    # Get dimensions
+    n_rows = input.size(0)
+    n_cols = weight.size(0)
     
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_cols, BLOCK_SIZE),)
+    # Create output tensor
+    out = torch.empty(n_rows, n_cols, device=input.device, dtype=input.dtype)
     
-    softplus_linear_kernel[grid](
-        input_ptr=input.data_ptr(),
-        weight_ptr=weight.data_ptr(),
-        bias_ptr=bias.data_ptr() if bias is not None else None,
-        output_ptr=output.data_ptr(),
+    # Determine block size
+    BLOCK_SIZE = 256
+    
+    # Launch kernel
+    grid = (triton.cdiv(n_rows, BLOCK_SIZE),)
+    
+    # Prepare pointers
+    input_ptr = input.data_ptr()
+    weight_ptr = weight.data_ptr()
+    bias_ptr = 0 if bias is None else bias.data_ptr()
+    output_ptr = out.data_ptr()
+    
+    # Launch kernel
+    _softplus_linear_kernel[grid](
+        input_ptr=input_ptr,
+        weight_ptr=weight_ptr,
+        bias_ptr=bias_ptr,
+        output_ptr=output_ptr,
+        n_rows=n_rows,
         n_cols=n_cols,
+        weight_stride_0=weight.stride(0),
+        weight_stride_1=weight.stride(1),
+        input_stride_0=input.stride(0),
+        input_stride_1=input.stride(1),
+        output_stride_0=out.stride(0),
+        output_stride_1=out.stride(1),
         beta=beta,
         threshold=threshold,
         BLOCK_SIZE=BLOCK_SIZE
     )
     
-    return output
+    return out

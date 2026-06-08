@@ -4,60 +4,66 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def softmax_kernel(
-    output_ptr,
-    input_ptr,
-    n_cols,
-    BLOCK_SIZE: tl.constexpr,
+def _softmax_kernel(
+    input_ptr, 
+    output_ptr, 
+    n_elements, 
+    dim_size: tl.constexpr, 
+    BLOCK: tl.constexpr
 ):
-    row = tl.program_id(0)
-    output_row = output_ptr + row * n_cols
-    input_row = input_ptr + row * n_cols
+    # Get the program ID
+    pid = tl.program_id(0)
+    
+    # Calculate the starting offset for this block
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    
+    # Create mask for valid elements
+    mask = offsets < n_elements
     
     # Load input data
-    values = tl.load(input_row + tl.arange(0, BLOCK_SIZE), mask=tl.arange(0, BLOCK_SIZE) < n_cols)
+    input_data = tl.load(input_ptr + offsets, mask=mask, other=0.0)
     
     # Compute softmax
-    max_val = tl.max(values, axis=0)
-    exp_vals = tl.exp(values - max_val)
-    sum_exp = tl.sum(exp_vals, axis=0)
-    softmax_vals = exp_vals / sum_exp
+    # First, subtract the maximum for numerical stability
+    max_val = tl.max(input_data, axis=0)
+    input_data = input_data - max_val
+    
+    # Compute exponentials
+    exp_data = tl.exp(input_data)
+    
+    # Compute sum of exponentials
+    sum_exp = tl.sum(exp_data, axis=0)
+    
+    # Compute softmax
+    softmax_data = exp_data / sum_exp
     
     # Store result
-    tl.store(output_row + tl.arange(0, BLOCK_SIZE), softmax_vals, mask=tl.arange(0, BLOCK_SIZE) < n_cols)
+    tl.store(output_ptr + offsets, softmax_data, mask=mask)
 
 def softmax(input, dim, dtype=None):
+    # Handle dtype casting if specified
     if dtype is not None:
         input = input.to(dtype)
     
-    # Ensure input is contiguous
-    input = input.contiguous()
+    # Get the shape of the input tensor
+    shape = input.shape
+    dim_size = shape[dim]
+    total_elements = input.numel()
     
-    # Get output tensor
+    # Create output tensor
     output = torch.empty_like(input)
     
-    # Get dimensions
-    shape = input.shape
-    n_rows = 1
-    n_cols = shape[dim]
-    
-    # Compute total number of rows
-    for i in range(len(shape)):
-        if i != dim:
-            n_rows *= shape[i]
-    
-    # Set block size
-    BLOCK_SIZE = 1024
-    if n_cols > BLOCK_SIZE:
-        BLOCK_SIZE = triton.next_power_of_2(n_cols)
+    # Determine block size and grid size
+    BLOCK = 256
+    grid = (triton.cdiv(total_elements, BLOCK),)
     
     # Launch kernel
-    grid = (n_rows,)
-    softmax_kernel[grid](
-        output,
-        input,
-        n_cols,
-        BLOCK_SIZE=BLOCK_SIZE
+    _softmax_kernel[grid](
+        input, 
+        output, 
+        total_elements, 
+        dim_size, 
+        BLOCK=BLOCK
     )
     
     return output

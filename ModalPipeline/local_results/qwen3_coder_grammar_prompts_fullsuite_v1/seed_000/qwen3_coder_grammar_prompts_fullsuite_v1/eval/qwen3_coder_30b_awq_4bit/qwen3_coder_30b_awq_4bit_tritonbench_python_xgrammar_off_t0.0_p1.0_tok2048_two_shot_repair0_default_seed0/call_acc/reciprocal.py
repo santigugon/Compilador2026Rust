@@ -13,18 +13,27 @@ def _reciprocal_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
 
 def reciprocal(input, *, out=None):
     if out is None:
-        out = torch.empty_like(input, dtype=input.dtype)
+        out = torch.empty_like(input, dtype=torch.float32)
     else:
-        if out.shape != input.shape:
-            raise ValueError("Output tensor must have the same shape as input tensor")
-        if out.dtype != input.dtype:
-            raise ValueError("Output tensor must have the same dtype as input tensor")
+        if out.dtype != torch.float32:
+            out = out.to(torch.float32)
     
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
     
+    # Handle scalar input case
+    if input.dim() == 0:
+        input = input.unsqueeze(0)
+        out = out.unsqueeze(0)
+        n = 1
+    
     _reciprocal_kernel[grid](input, out, n, BLOCK=block)
+    
+    # Squeeze back if needed
+    if input.dim() == 0:
+        out = out.squeeze(0)
+    
     return out
 
 ##################################################################################################################################################

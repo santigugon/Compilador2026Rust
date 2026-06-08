@@ -4,7 +4,7 @@
   "hostname": "modal",
   "modal_app_name": null,
   "modal_function": "run_generation_condition",
-  "vllm_version": "0.22.0",
+  "vllm_version": "0.22.1",
   "torch_version": "2.11.0+cu130",
   "triton_version": "3.6.0",
   "xgrammar_version": "unknown",

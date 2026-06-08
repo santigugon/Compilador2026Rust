@@ -31,37 +31,33 @@ def _fused_embedding_add_tanh_kernel(
     
     # Embedding lookup
     # Create a block of indices for embedding lookup
-    indices_expanded = indices[:, None]  # Shape: [BLOCK, 1]
+    indices_expanded = indices[:, None]  # [BLOCK, 1]
     
-    # Create embedding indices
-    weight_offsets = indices_expanded * embedding_dim + tl.arange(0, embedding_dim)[None, :]  # Shape: [BLOCK, D]
+    # Load embedding vectors
+    weight_offsets = indices_expanded * embedding_dim + tl.arange(0, embedding_dim)[None, :]
+    weight_mask = (indices >= 0) & (indices < embedding_dim)  # Simple check for valid indices
     
-    # Load embeddings
-    embeddings = tl.load(weight_ptr + weight_offsets, mask=mask[:, None], other=0.0)  # Shape: [BLOCK, D]
+    # Load weight values
+    weight_values = tl.load(weight_ptr + weight_offsets, mask=weight_mask[:, None], other=0.0)
     
     # Load other tensor (broadcasting)
-    other = tl.load(other_ptr + offsets[:, None], mask=mask[:, None], other=0.0)  # Shape: [BLOCK, D]
+    other_values = tl.load(other_ptr + offsets, mask=mask, other=0.0)
     
     # Element-wise addition
-    result = embeddings + other
+    result = weight_values + other_values[:, None]
     
     # Apply tanh
     result = 2.0 / (1.0 + tl.exp(-2.0 * result)) - 1.0
     
     # Apply max_norm if specified
     if max_norm > 0:
-        # Compute norm
-        if norm_type == 2.0:
-            norms = tl.sqrt(tl.sum(result * result, axis=1, keepdims=True))
-        else:
-            norms = tl.pow(tl.sum(tl.pow(tl.abs(result), norm_type), axis=1, keepdims=True), 1.0 / norm_type)
-        
-        # Normalize if needed
+        norms = tl.sqrt(tl.sum(result * result, axis=1, keepdims=True))
         scale = tl.where(norms > max_norm, max_norm / (norms + 1e-8), 1.0)
         result = result * scale
     
     # Store result
-    tl.store(out_ptr + weight_offsets, result, mask=mask[:, None])
+    out_offsets = offsets[:, None] * embedding_dim + tl.arange(0, embedding_dim)[None, :]
+    tl.store(out_ptr + out_offsets, result, mask=mask[:, None])
 
 def fused_embedding_add_tanh(
     input_indices,
@@ -83,9 +79,9 @@ def fused_embedding_add_tanh(
     if max_norm is not None and not isinstance(max_norm, (int, float)):
         max_norm = float(max_norm)
     
-    # Handle scalar norm_type
-    if not isinstance(norm_type, (int, float)):
-        norm_type = float(norm_type)
+    # Validate inputs
+    if input_indices.dim() == 0:
+        input_indices = input_indices.unsqueeze(0)
     
     # Determine output shape
     input_shape = input_indices.shape

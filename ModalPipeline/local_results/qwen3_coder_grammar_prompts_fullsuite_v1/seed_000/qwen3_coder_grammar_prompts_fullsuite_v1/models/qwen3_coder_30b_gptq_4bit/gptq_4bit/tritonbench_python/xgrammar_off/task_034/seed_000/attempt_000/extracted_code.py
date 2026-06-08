@@ -3,57 +3,65 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def fused_embedding_add_tanh_kernel(
-    input_indices_ptr,
+def _fused_embedding_add_tanh_kernel(
+    indices_ptr,
     weight_ptr,
     other_ptr,
-    output_ptr,
-    padding_idx,
-    max_norm,
-    norm_type,
-    scale_grad_by_freq,
-    sparse,
-    input_indices_size,
-    weight_size_0,
-    weight_size_1,
-    other_size_0,
-    other_size_1,
-    other_size_2,
-    BLOCK_SIZE: tl.constexpr,
+    out_ptr,
+    n_indices: tl.constexpr,
+    embedding_dim: tl.constexpr,
+    padding_idx: tl.constexpr,
+    max_norm: tl.constexpr,
+    norm_type: tl.constexpr,
+    BLOCK: tl.constexpr
 ):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    block_end = min(block_start + BLOCK_SIZE, input_indices_size)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_indices
     
     # Load indices
-    indices = tl.load(input_indices_ptr + block_start, mask=block_start < block_end)
+    indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
     
-    # Process each index
-    for i in range(block_start, block_end):
-        idx = indices[i - block_start]
-        if idx == padding_idx:
-            continue
-            
-        # Load embedding
-        embedding = tl.load(weight_ptr + idx * weight_size_1, mask=idx < weight_size_0)
-        
-        # Load other tensor (broadcasting)
-        other_val = tl.load(other_ptr + (i % other_size_0) * other_size_1 + (i % other_size_1) * other_size_2, mask=True)
-        
-        # Add other tensor
-        result = embedding + other_val
-        
-        # Apply max_norm if needed
-        if max_norm > 0:
-            norm = tl.sqrt(tl.sum(result * result))
-            scale = tl.where(norm > max_norm, max_norm / (norm + 1e-8), 1.0)
-            result = result * scale
-            
-        # Apply tanh
-        result = tl.tanh(result)
-        
-        # Store result
-        tl.store(output_ptr + i * weight_size_1, result)
+    # Check for padding index
+    if padding_idx >= 0:
+        padding_mask = indices == padding_idx
+        indices = tl.where(padding_mask, 0, indices)
+    
+    # Compute embedding lookup
+    # Each index maps to a row in weight matrix
+    embedding_offsets = indices * embedding_dim
+    embeddings = tl.zeros((BLOCK, embedding_dim), dtype=tl.float32)
+    
+    # Load embeddings with proper masking
+    for i in range(embedding_dim):
+        # Load weight values for each embedding dimension
+        weight_offsets = embedding_offsets + i
+        weight_values = tl.load(weight_ptr + weight_offsets, mask=mask, other=0.0)
+        embeddings = tl.where(mask, embeddings + weight_values, embeddings)
+    
+    # Load other tensor (broadcasting)
+    other_values = tl.load(other_ptr + offsets, mask=mask, other=0.0)
+    
+    # Add other tensor to embeddings
+    result = embeddings + other_values
+    
+    # Apply tanh activation
+    result = 2.0 / (1.0 + tl.exp(-2.0 * result)) - 1.0
+    
+    # Apply max_norm if specified
+    if max_norm > 0:
+        # Compute norm
+        norm = tl.sqrt(tl.sum(result * result, axis=1))
+        # Normalize if norm exceeds max_norm
+        scale = max_norm / (norm + 1e-8)
+        scale = tl.where(norm > max_norm, scale, 1.0)
+        result = result * scale[:, None]
+    
+    # Store result
+    out_offsets = offsets * embedding_dim
+    for i in range(embedding_dim):
+        out_offsets_i = out_offsets + i
+        tl.store(out_ptr + out_offsets_i, result[:, i], mask=mask)
 
 def fused_embedding_add_tanh(
     input_indices,
@@ -67,48 +75,52 @@ def fused_embedding_add_tanh(
     sparse=False,
     out=None
 ):
+    # Handle scalar padding_idx
+    if padding_idx is not None and not isinstance(padding_idx, int):
+        padding_idx = int(padding_idx)
+    
+    # Handle scalar max_norm
+    if max_norm is not None and not isinstance(max_norm, (int, float)):
+        max_norm = float(max_norm)
+    
     # Validate inputs
     if input_indices.dim() == 0:
         input_indices = input_indices.unsqueeze(0)
     
-    # Flatten input indices for processing
-    input_indices_flat = input_indices.view(-1)
+    # Compute output shape
+    output_shape = list(input_indices.shape)
+    output_shape.append(weight.shape[1])
     
-    # Get dimensions
-    V, D = weight.shape
-    other_shape = other.shape
-    
-    # Determine output shape
-    output_shape = list(input_indices.shape) + [D]
-    
-    # Create output tensor if not provided
-    if out is None:
+    # Create output tensor
+    if out is not None:
+        out = torch.empty_like(out)
+    else:
         out = torch.empty(output_shape, dtype=torch.float32, device=weight.device)
     
-    # Set up kernel parameters
-    BLOCK_SIZE = 1024
-    num_blocks = (input_indices_flat.size(0) + BLOCK_SIZE - 1) // BLOCK_SIZE
+    # Get dimensions
+    n_indices = input_indices.numel()
+    embedding_dim = weight.shape[1]
+    
+    # Handle special cases
+    if n_indices == 0:
+        return out
+    
+    # Set up kernel launch parameters
+    BLOCK = 256
+    grid = (triton.cdiv(n_indices, BLOCK),)
     
     # Launch kernel
-    fused_embedding_add_tanh_kernel[
-        num_blocks
-    ](
-        input_indices_flat,
+    _fused_embedding_add_tanh_kernel[grid](
+        input_indices,
         weight,
         other,
         out,
+        n_indices,
+        embedding_dim,
         padding_idx if padding_idx is not None else -1,
         max_norm if max_norm is not None else 0.0,
         norm_type,
-        scale_grad_by_freq,
-        sparse,
-        input_indices_flat.size(0),
-        V,
-        D,
-        other_shape[0],
-        other_shape[1],
-        other_shape[2] if len(other_shape) > 2 else 1,
-        BLOCK_SIZE=BLOCK_SIZE
+        BLOCK=BLOCK
     )
     
     return out

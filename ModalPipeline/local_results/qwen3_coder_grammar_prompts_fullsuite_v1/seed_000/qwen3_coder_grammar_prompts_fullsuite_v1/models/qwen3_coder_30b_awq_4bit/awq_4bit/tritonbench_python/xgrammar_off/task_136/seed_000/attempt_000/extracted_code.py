@@ -3,240 +3,76 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _softmax_kernel(x_ptr, out_ptr, dim_size: tl.constexpr, n: tl.constexpr, BLOCK: tl.constexpr):
+def softmax_kernel(
+    input_ptr,
+    output_ptr,
+    dim_size,
+    num_elements,
+    BLOCK_SIZE: tl.constexpr,
+    dtype: tl.constexpr
+):
+    # Compute the global thread index
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
+    num_blocks = tl.cdiv(num_elements, BLOCK_SIZE)
     
-    # Load input data
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    # Each block handles one slice along the specified dimension
+    if pid >= num_blocks:
+        return
+    
+    # Calculate the starting index for this block
+    start_idx = pid * BLOCK_SIZE
+    end_idx = min(start_idx + BLOCK_SIZE, num_elements)
+    
+    # Load data into shared memory
+    input_block = tl.load(input_ptr + start_idx, mask=(start_idx + tl.arange(0, BLOCK_SIZE) < num_elements))
     
     # Compute softmax
-    # For numerical stability, subtract the maximum value
-    max_val = tl.max(x, axis=0)
-    x_shifted = x - max_val
-    exp_x = tl.exp(x_shifted)
-    sum_exp = tl.sum(exp_x, axis=0)
-    softmax_x = exp_x / sum_exp
+    max_val = tl.max(input_block, axis=0)
+    exp_vals = tl.exp(input_block - max_val)
+    sum_exp = tl.sum(exp_vals, axis=0)
+    softmax_vals = exp_vals / sum_exp
     
-    tl.store(out_ptr + offsets, softmax_x, mask=mask)
+    # Store result
+    tl.store(output_ptr + start_idx, softmax_vals, mask=(start_idx + tl.arange(0, BLOCK_SIZE) < num_elements))
 
-def softmax(input, dim, dtype=None):
+def softmax(input, dim, dtype=None) -> torch.Tensor:
     if dtype is not None:
         input = input.to(dtype)
     
-    # Create output tensor
-    out = torch.empty_like(input)
+    # Ensure input is contiguous
+    input = input.contiguous()
     
     # Get the size of the specified dimension
     dim_size = input.size(dim)
-    n = input.numel()
     
-    # Handle the case where dim is negative
-    if dim < 0:
-        dim = input.dim() + dim
-    
-    # For simplicity, we'll use a single block for now
-    # In practice, you might want to handle larger tensors differently
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    
-    # Flatten the tensor for easier processing
-    # We'll compute softmax along the specified dimension
-    input_flat = input.flatten()
-    out_flat = out.flatten()
-    
-    # Compute softmax
-    _softmax_kernel[grid](input_flat, out_flat, dim_size, n, BLOCK=block)
-    
-    # Reshape back to original shape
-    return out
-
-# Note: The above implementation has a simplification issue.
-# For a proper softmax along a specific dimension, we need to handle
-# the multi-dimensional case more carefully. Here's a corrected version:
-
-@triton.jit
-def _softmax_kernel_correct(x_ptr, out_ptr, stride_x, stride_out, dim_size: tl.constexpr, n: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    
-    # Load input data
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    
-    # For numerical stability, subtract the maximum value
-    max_val = tl.max(x, axis=0)
-    x_shifted = x - max_val
-    exp_x = tl.exp(x_shifted)
-    sum_exp = tl.sum(exp_x, axis=0)
-    softmax_x = exp_x / sum_exp
-    
-    tl.store(out_ptr + offsets, softmax_x, mask=mask)
-
-def softmax(input, dim, dtype=None):
-    if dtype is not None:
-        input = input.to(dtype)
+    # Flatten the tensor to 1D for processing
+    original_shape = input.shape
+    flattened_input = input.view(-1, dim_size)
     
     # Create output tensor
-    out = torch.empty_like(input)
+    output = torch.empty_like(flattened_input)
     
-    # Get the size of the specified dimension
-    dim_size = input.size(dim)
-    n = input.numel()
+    # Calculate number of elements
+    num_elements = flattened_input.numel()
     
-    # Handle the case where dim is negative
-    if dim < 0:
-        dim = input.dim() + dim
+    # Launch kernel
+    BLOCK_SIZE = 1024
+    num_blocks = (num_elements + BLOCK_SIZE - 1) // BLOCK_SIZE
     
-    # For a proper implementation, we need to handle the multi-dimensional case
-    # This is a simplified version that works for the basic case
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    # Get the appropriate dtype for Triton
+    triton_dtype = tl.float32 if input.dtype == torch.float32 else tl.float64
     
-    # Flatten the tensor for easier processing
-    input_flat = input.flatten()
-    out_flat = out.flatten()
+    # Launch kernel
+    softmax_kernel[(num_blocks,)](
+        flattened_input,
+        output,
+        dim_size,
+        num_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        dtype=triton_dtype
+    )
     
-    # Compute softmax
-    _softmax_kernel_correct[grid](input_flat, out_flat, input.stride(0) if input.numel() > 0 else 1, out.stride(0) if out.numel() > 0 else 1, dim_size, n, BLOCK=block)
+    # Reshape output to match original shape
+    output = output.view(original_shape)
     
-    # Reshape back to original shape
-    return out
-
-# Actually, let's implement a cleaner version that properly handles the dimension:
-def softmax(input, dim, dtype=None):
-    if dtype is not None:
-        input = input.to(dtype)
-    
-    # Create output tensor
-    out = torch.empty_like(input)
-    
-    # Get the size of the specified dimension
-    dim_size = input.size(dim)
-    n = input.numel()
-    
-    # Handle the case where dim is negative
-    if dim < 0:
-        dim = input.dim() + dim
-    
-    # For a proper softmax along a specific dimension, we need to handle
-    # the multi-dimensional case properly. Let's use a simpler approach:
-    # We'll compute the softmax along the last dimension for now
-    # and then reshape appropriately
-    
-    # For now, let's just compute it directly with a single kernel
-    # This is a simplified version that works for basic cases
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    
-    # Use torch's native softmax for correctness
-    # But we'll implement the kernel to match the expected behavior
-    if dim == -1 or dim == input.dim() - 1:
-        # Simple case: last dimension
-        input_flat = input.flatten()
-        out_flat = out.flatten()
-        
-        @triton.jit
-        def _softmax_kernel_simple(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
-            pid = tl.program_id(0)
-            offsets = pid * BLOCK + tl.arange(0, BLOCK)
-            mask = offsets < n
-            x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-            # Numerical stability
-            max_val = tl.max(x, axis=0)
-            x_shifted = x - max_val
-            exp_x = tl.exp(x_shifted)
-            sum_exp = tl.sum(exp_x, axis=0)
-            softmax_x = exp_x / sum_exp
-            tl.store(out_ptr + offsets, softmax_x, mask=mask)
-        
-        _softmax_kernel_simple[grid](input_flat, out_flat, n, BLOCK=block)
-        return out
-    else:
-        # For other dimensions, we'll use torch's implementation for correctness
-        # and just verify the kernel works for the right case
-        return torch.softmax(input, dim=dim)
-
-# Let's write a proper implementation:
-def softmax(input, dim, dtype=None):
-    if dtype is not None:
-        input = input.to(dtype)
-    
-    # Create output tensor
-    out = torch.empty_like(input)
-    
-    # Get the size of the specified dimension
-    dim_size = input.size(dim)
-    n = input.numel()
-    
-    # Handle the case where dim is negative
-    if dim < 0:
-        dim = input.dim() + dim
-    
-    # For a proper Triton implementation, we need to handle the dimension properly
-    # Let's use a more robust approach:
-    if dim == -1:
-        dim = input.dim() - 1
-    
-    # Use torch's implementation for correctness
-    # But we'll implement the kernel for the specific case
-    if input.numel() > 0:
-        # Simple case: compute softmax along the last dimension
-        block = 256
-        grid = (triton.cdiv(n, block),)
-        
-        # For a proper kernel, we'd need to handle the dimension properly
-        # But for now, let's just use torch's implementation to ensure correctness
-        return torch.softmax(input, dim)
-    else:
-        return torch.softmax(input, dim)
-
-# Let's write a proper kernel that handles the dimension correctly:
-@triton.jit
-def _softmax_kernel_final(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    
-    # For numerical stability, subtract the maximum value
-    max_val = tl.max(x, axis=0)
-    x_shifted = x - max_val
-    exp_x = tl.exp(x_shifted)
-    sum_exp = tl.sum(exp_x, axis=0)
-    softmax_x = exp_x / sum_exp
-    
-    tl.store(out_ptr + offsets, softmax_x, mask=mask)
-
-def softmax(input, dim, dtype=None):
-    if dtype is not None:
-        input = input.to(dtype)
-    
-    # Create output tensor
-    out = torch.empty_like(input)
-    
-    # Get the size of the specified dimension
-    dim_size = input.size(dim)
-    n = input.numel()
-    
-    # Handle the case where dim is negative
-    if dim < 0:
-        dim = input.dim() + dim
-    
-    # For a proper implementation, we need to handle the multi-dimensional case
-    # But for now, let's use torch's implementation to ensure correctness
-    # and just make sure our kernel works for the right case
-    
-    # If we're computing softmax along the last dimension, we can use our kernel
-    if dim == input.dim() - 1 or dim == -1:
-        block = 256
-        grid = (triton.cdiv(n, block),)
-        
-        # Flatten for processing
-        input_flat = input.flatten()
-        out_flat = out.flatten()
-        
-        _softmax_kernel_final[grid](input_flat, out_flat, n, BLOCK=block)
-        return out
-    else:
+    return output

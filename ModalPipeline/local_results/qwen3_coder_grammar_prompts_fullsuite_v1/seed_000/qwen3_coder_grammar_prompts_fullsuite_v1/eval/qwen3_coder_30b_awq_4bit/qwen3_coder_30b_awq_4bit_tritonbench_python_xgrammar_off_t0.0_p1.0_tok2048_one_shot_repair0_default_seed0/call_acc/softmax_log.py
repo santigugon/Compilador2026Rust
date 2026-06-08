@@ -20,26 +20,30 @@ def softmax_log_kernel(
     
     # Load input data
     input_ptrs = input_ptr + row_start + col_offsets
-    input_data = tl.load(input_ptrs, mask=col_offsets < n_cols, other=-float('inf'))
+    input_vals = tl.load(input_ptrs, mask=col_offsets < n_cols)
     
-    # Apply log and softmax
+    # Apply log
+    input_vals = tl.log(input_vals)
+    
+    # Compute max for numerical stability
     if dim == -1 or dim == 1:
-        # For last dimension, we compute softmax along columns
-        max_val = tl.max(input_data, axis=0)
-        exp_data = tl.exp(input_data - max_val)
-        sum_exp = tl.sum(exp_data, axis=0)
-        softmax_data = exp_data / sum_exp
+        max_val = tl.max(input_vals, axis=0)
+        input_vals = input_vals - max_val
+        exp_vals = tl.exp(input_vals)
+        sum_exp = tl.sum(exp_vals, axis=0)
+        output_vals = exp_vals / sum_exp
     else:
         # For other dimensions, we need to handle differently
-        # This is a simplified version for demonstration
-        max_val = tl.max(input_data, axis=0)
-        exp_data = tl.exp(input_data - max_val)
-        sum_exp = tl.sum(exp_data, axis=0)
-        softmax_data = exp_data / sum_exp
+        # This is a simplified version for 2D tensors
+        max_val = tl.max(input_vals, axis=0)
+        input_vals = input_vals - max_val
+        exp_vals = tl.exp(input_vals)
+        sum_exp = tl.sum(exp_vals, axis=0)
+        output_vals = exp_vals / sum_exp
     
-    # Write output
+    # Store output
     output_ptrs = output_ptr + row_start + col_offsets
-    tl.store(output_ptrs, softmax_data, mask=col_offsets < n_cols)
+    tl.store(output_ptrs, output_vals, mask=col_offsets < n_cols)
 
 def softmax_log(input, dim=-1, dtype=None):
     if dtype is not None:
@@ -60,16 +64,14 @@ def softmax_log(input, dim=-1, dtype=None):
     BLOCK_SIZE = 1024
     grid = (n_rows, 1, 1)
     
-    # For simplicity, we'll use a basic implementation
-    # In practice, you'd want to handle the dimension properly
-    if dim == -1 or dim == 1:
-        # Apply log and softmax along the last dimension
-        input_log = torch.log(input)
-        output = torch.softmax(input_log, dim=1)
-    else:
-        # For other dimensions, apply log and softmax along that dimension
-        input_log = torch.log(input)
-        output = torch.softmax(input_log, dim=dim)
+    softmax_log_kernel[grid](
+        input,
+        output,
+        n_rows,
+        n_cols,
+        dim,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
     
     return output
 

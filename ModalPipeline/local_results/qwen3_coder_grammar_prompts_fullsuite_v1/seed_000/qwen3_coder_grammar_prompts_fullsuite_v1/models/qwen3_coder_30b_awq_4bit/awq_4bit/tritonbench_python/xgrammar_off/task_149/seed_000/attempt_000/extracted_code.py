@@ -3,46 +3,52 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _hstack_div_kernel(
-    stacked_ptr, 
-    divisor_ptr, 
-    out_ptr, 
-    n: tl.constexpr, 
-    rounding_mode: tl.constexpr,
-    BLOCK: tl.constexpr
+def hstack_div_kernel(
+    input_ptr,
+    divisor_ptr,
+    output_ptr,
+    num_elements,
+    rounding_mode,
+    BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    divisor = tl.load(divisor_ptr + offsets, mask=mask)
+    result = input / divisor
     
-    stacked = tl.load(stacked_ptr + offsets, mask=mask, other=0.0)
-    divisor = tl.load(divisor_ptr + offsets, mask=mask, other=1.0)
-    
-    # Perform division
-    result = stacked / divisor
-    
-    # Apply rounding if specified
     if rounding_mode == 1:  # trunc
         result = tl.where(result >= 0, tl.floor(result), tl.ceil(result))
     elif rounding_mode == 2:  # floor
         result = tl.floor(result)
     
-    tl.store(out_ptr + offsets, result, mask=mask)
+    tl.store(output_ptr + offsets, result, mask=mask)
 
 def fused_hstack_div(tensors, divisor, *, rounding_mode=None, out=None):
-    # Handle scalar divisor
-    if not torch.is_tensor(divisor):
-        divisor = torch.tensor(divisor, dtype=torch.float32, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    if not tensors:
+        raise ValueError("tensors must not be empty")
     
     # Stack tensors horizontally
-    stacked = torch.hstack(tensors)
+    stacked = torch.cat(tensors, dim=-1)
     
-    # Handle output tensor
+    # Handle divisor
+    if isinstance(divisor, (int, float)):
+        divisor = torch.tensor(divisor, dtype=stacked.dtype, device=stacked.device)
+    else:
+        divisor = divisor.to(stacked.dtype).to(stacked.device)
+    
+    # Broadcast divisor to match stacked shape
+    if divisor.shape != stacked.shape:
+        divisor = divisor.expand_as(stacked)
+    
+    # Prepare output
     if out is None:
         out = torch.empty_like(stacked)
     else:
         if out.shape != stacked.shape:
-            raise ValueError("Output tensor shape must match the stacked tensor shape")
+            raise ValueError("out tensor must have the same shape as the stacked tensor")
     
     # Determine rounding mode
     rounding_mode_code = 0
@@ -52,17 +58,17 @@ def fused_hstack_div(tensors, divisor, *, rounding_mode=None, out=None):
         rounding_mode_code = 2
     
     # Launch kernel
-    n = stacked.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    num_elements = stacked.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(num_elements, BLOCK_SIZE),)
     
-    _hstack_div_kernel[grid](
-        stacked, 
-        divisor, 
-        out, 
-        n, 
-        rounding_mode_code, 
-        BLOCK=block
+    hstack_div_kernel[grid](
+        stacked.data_ptr(),
+        divisor.data_ptr(),
+        out.data_ptr(),
+        num_elements,
+        rounding_mode_code,
+        BLOCK_SIZE
     )
     
     return out

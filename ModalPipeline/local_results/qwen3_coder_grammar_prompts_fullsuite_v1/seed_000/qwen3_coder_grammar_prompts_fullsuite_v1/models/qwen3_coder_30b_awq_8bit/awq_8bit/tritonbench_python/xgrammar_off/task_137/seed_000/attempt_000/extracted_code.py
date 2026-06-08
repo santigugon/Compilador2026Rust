@@ -3,37 +3,23 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def leaky_relu_kernel(
-    input_ptr,
-    output_ptr,
-    n_elements,
-    negative_slope,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    input = tl.load(input_ptr + offsets, mask=mask)
-    output = tl.where(input > 0, input, input * negative_slope)
-    tl.store(output_ptr + offsets, output, mask=mask)
+def _leaky_relu_kernel(x_ptr, out_ptr, n: tl.constexpr, negative_slope: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.where(x > 0, x, negative_slope * x)
+    tl.store(out_ptr + offsets, y, mask=mask)
 
 def leaky_relu(input, negative_slope=0.01, inplace=False):
-    if not inplace:
-        output = torch.empty_like(input)
+    if inplace:
+        out = input
     else:
-        output = input
-        
-    n_elements = output.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+        out = torch.empty_like(input)
     
-    leaky_relu_kernel[grid](
-        input,
-        output,
-        n_elements,
-        negative_slope,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
     
-    return output
+    _leaky_relu_kernel[grid](input, out, n, negative_slope, BLOCK=block)
+    return out

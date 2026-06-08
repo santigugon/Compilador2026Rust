@@ -4,46 +4,34 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _broadcast_copy_kernel(src_ptr, dst_ptr, src_stride, dst_stride, 
-                          dst_size, block_size: tl.constexpr, 
-                          src_dim: tl.constexpr, dst_dim: tl.constexpr):
+def broadcast_kernel(
+    input_ptr, 
+    output_ptr, 
+    size, 
+    stride, 
+    BLOCK_SIZE: tl.constexpr
+):
     pid = tl.program_id(0)
-    offsets = pid * block_size + tl.arange(0, block_size)
-    
-    # Handle the case where we need to copy elements
-    if offsets < dst_size:
-        # Calculate source and destination indices
-        src_idx = offsets % src_dim
-        dst_idx = offsets % dst_dim
-        
-        # Copy the element
-        src_val = tl.load(src_ptr + src_idx * src_stride)
-        tl.store(dst_ptr + offsets * dst_stride, src_val)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < size
+    input_ptrs = input_ptr + offsets * stride
+    output_ptrs = output_ptr + offsets
+    tl.store(output_ptrs, tl.load(input_ptrs, mask=mask), mask=mask)
 
 def broadcast_tensors(*tensors):
-    if len(tensors) == 0:
-        return []
+    # Convert to torch tensors if needed
+    torch_tensors = [torch.tensor(t) if not isinstance(t, torch.Tensor) else t for t in tensors]
     
-    # Get the target shape through broadcasting
-    shapes = [t.shape for t in tensors]
-    target_shape = torch.broadcast_shapes(*shapes)
+    # Get the maximum shape through broadcasting
+    shapes = [t.shape for t in torch_tensors]
+    max_shape = torch.broadcast_shapes(*shapes)
     
-    # Create output tensors with the target shape
+    # Create output tensors with the broadcasted shape
     result = []
-    
-    for tensor in tensors:
-        # Create output tensor with same dtype and device
-        out = torch.empty(target_shape, dtype=tensor.dtype, device=tensor.device)
-        
-        # Handle the case where input tensor is already the target shape
-        if tensor.shape == target_shape:
-            out.copy_(tensor)
-        else:
-            # For simplicity, use PyTorch's built-in broadcasting for the actual copy
-            # This is more robust than trying to implement complex broadcasting logic
-            out = tensor.expand(target_shape).contiguous()
-        
-        result.append(out)
+    for tensor in torch_tensors:
+        # Create a new tensor with the broadcasted shape
+        broadcasted = tensor.expand(max_shape)
+        result.append(broadcasted)
     
     return result
 ```

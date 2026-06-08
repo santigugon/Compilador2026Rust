@@ -2,142 +2,154 @@
 import torch
 import triton
 import triton.language as tl
-import math
 
 @triton.jit
-def _leaky_relu_conv2d_kernel(
-    input_ptr, weight_ptr, bias_ptr, output_ptr,
-    input_height, input_width, output_height, output_width,
-    weight_height, weight_width, channels, num_filters,
-    stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w,
-    groups, negative_slope,
-    BLOCK_SIZE: tl.constexpr
+def conv2d_kernel(
+    input_ptr, weight_ptr, output_ptr, 
+    input_stride_0, input_stride_1, input_stride_2, input_stride_3,
+    weight_stride_0, weight_stride_1, weight_stride_2, weight_stride_3,
+    output_stride_0, output_stride_1, output_stride_2, output_stride_3,
+    batch_size, channels_in, channels_out, height_in, width_in,
+    height_out, width_out, kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w,
+    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
 ):
-    # Get program ID
-    pid = tl.program_id(0)
+    # Get the block indices
+    block_idx_m = tl.program_id(0)
+    block_idx_n = tl.program_id(1)
+    block_idx_k = tl.program_id(2)
     
-    # Calculate output indices
-    batch_idx = pid // (output_height * output_width * num_filters)
-    out_h = (pid % (output_height * output_width * num_filters)) // (output_width * num_filters)
-    out_w = (pid % (output_height * output_width * num_filters)) % (output_width * num_filters) // num_filters
-    filter_idx = (pid % (output_height * output_width * num_filters)) % num_filters
+    # Compute the output indices
+    output_m = block_idx_m * BLOCK_SIZE_M
+    output_n = block_idx_n * BLOCK_SIZE_N
+    output_k = block_idx_k * BLOCK_SIZE_K
     
-    # Calculate input indices
-    in_h_start = out_h * stride_h - padding_h
-    in_w_start = out_w * stride_w - padding_w
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     
-    # Initialize output value
-    out_val = 0.0
+    # Loop over the kernel
+    for k in range(0, channels_in * kernel_h * kernel_w, BLOCK_SIZE_K):
+        # Load input and weight
+        input_block = tl.load(
+            input_ptr + 
+            output_m * input_stride_0 + 
+            (output_k // (kernel_h * kernel_w)) * input_stride_1 + 
+            (output_k % (kernel_h * kernel_w)) // kernel_w * input_stride_2 + 
+            (output_k % (kernel_h * kernel_w)) % kernel_w * input_stride_3
+        )
+        weight_block = tl.load(
+            weight_ptr + 
+            output_n * weight_stride_0 + 
+            (output_k // (kernel_h * kernel_w)) * weight_stride_1 + 
+            (output_k % (kernel_h * kernel_w)) // kernel_w * weight_stride_2 + 
+            (output_k % (kernel_h * kernel_w)) % kernel_w * weight_stride_3
+        )
+        # Compute the dot product
+        acc += tl.sum(input_block * weight_block)
     
-    # Perform convolution
-    for g in range(groups):
-        group_offset = g * (channels // groups) * num_filters
-        for c in range(channels // groups):
-            for kh in range(weight_height):
-                for kw in range(weight_width):
-                    in_h = in_h_start + kh * dilation_h
-                    in_w = in_w_start + kw * dilation_w
-                    
-                    # Check bounds
-                    if in_h >= 0 and in_h < input_height and in_w >= 0 and in_w < input_width:
-                        # Calculate input and weight indices
-                        input_idx = batch_idx * (input_height * input_width * channels) + \
-                                   in_h * (input_width * channels) + \
-                                   in_w * channels + \
-                                   g * (channels // groups) + c
-                        
-                        weight_idx = g * (channels // groups) * num_filters * weight_height * weight_width + \
-                                    c * num_filters * weight_height * weight_width + \
-                                    filter_idx * weight_height * weight_width + \
-                                    kh * weight_width + kw
-                        
-                        # Load values
-                        input_val = tl.load(input_ptr + input_idx, mask=True)
-                        weight_val = tl.load(weight_ptr + weight_idx, mask=True)
-                        
-                        # Accumulate
-                        out_val += input_val * weight_val
+    # Store the result
+    tl.store(
+        output_ptr + 
+        output_m * output_stride_0 + 
+        output_n * output_stride_1 + 
+        output_k * output_stride_2,
+        acc
+    )
+
+@triton.jit
+def leaky_relu_kernel(
+    input_ptr, output_ptr, 
+    input_stride_0, input_stride_1, input_stride_2, input_stride_3,
+    output_stride_0, output_stride_1, output_stride_2, output_stride_3,
+    batch_size, channels, height, width, negative_slope
+):
+    # Get the block indices
+    block_idx_m = tl.program_id(0)
+    block_idx_n = tl.program_id(1)
+    block_idx_k = tl.program_id(2)
     
-    # Add bias if present
-    if bias_ptr is not None:
-        bias_idx = filter_idx
-        bias_val = tl.load(bias_ptr + bias_idx, mask=True)
-        out_val += bias_val
+    # Compute the output indices
+    output_m = block_idx_m * 16
+    output_n = block_idx_n * 16
+    output_k = block_idx_k * 16
+    
+    # Load the input
+    input_block = tl.load(
+        input_ptr + 
+        output_m * input_stride_0 + 
+        output_n * input_stride_1 + 
+        output_k * input_stride_2
+    )
     
     # Apply Leaky ReLU
-    if out_val < 0:
-        out_val = out_val * negative_slope
+    output_block = tl.where(input_block > 0, input_block, negative_slope * input_block)
     
-    # Store result
-    output_idx = batch_idx * (output_height * output_width * num_filters) + \
-                out_h * (output_width * num_filters) + \
-                out_w * num_filters + \
-                filter_idx
-    
-    tl.store(output_ptr + output_idx, out_val, mask=True)
+    # Store the result
+    tl.store(
+        output_ptr + 
+        output_m * output_stride_0 + 
+        output_n * output_stride_1 + 
+        output_k * output_stride_2,
+        output_block
+    )
 
 def leaky_relu_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, negative_slope=0.01, inplace=False):
-    # Handle scalar inputs
-    if not isinstance(stride, (tuple, list)):
-        stride = (stride, stride)
-    if not isinstance(padding, (tuple, list)):
-        padding = (padding, padding)
-    if not isinstance(dilation, (tuple, list)):
-        dilation = (dilation, dilation)
+    # Input shape: (batch_size, channels_in, height, width)
+    # Weight shape: (channels_out, channels_in, kernel_h, kernel_w)
+    # Output shape: (batch_size, channels_out, height_out, width_out)
     
-    stride_h, stride_w = stride
-    padding_h, padding_w = padding
-    dilation_h, dilation_w = dilation
-    
-    # Get dimensions
-    batch_size, channels, input_height, input_width = input.shape
-    num_filters, _, weight_height, weight_width = weight.shape
+    batch_size, channels_in, height_in, width_in = input.shape
+    channels_out, _, kernel_h, kernel_w = weight.shape
     
     # Calculate output dimensions
-    output_height = (input_height + 2 * padding_h - (dilation_h * (weight_height - 1) + 1)) // stride_h + 1
-    output_width = (input_width + 2 * padding_w - (dilation_w * (weight_width - 1) + 1)) // stride_w + 1
+    height_out = (height_in + 2 * padding - (dilation * (kernel_h - 1) + 1)) // stride + 1
+    width_out = (width_in + 2 * padding - (dilation * (kernel_w - 1) + 1)) // stride + 1
     
     # Create output tensor
-    output = torch.empty(batch_size, num_filters, output_height, output_width, device=input.device, dtype=input.dtype)
+    output = torch.empty(
+        batch_size, channels_out, height_out, width_out,
+        dtype=input.dtype, device=input.device
+    )
     
-    # Handle bias
+    # Initialize the output with bias if provided
     if bias is not None:
-        bias_ptr = bias.data_ptr()
-    else:
-        bias_ptr = None
+        output = output + bias.view(1, -1, 1, 1)
     
-    # Launch kernel
-    block_size = 256
-    total_elements = batch_size * output_height * output_width * num_filters
-    grid_size = triton.cdiv(total_elements, block_size)
+    # Define block sizes
+    BLOCK_SIZE_M = 16
+    BLOCK_SIZE_N = 16
+    BLOCK_SIZE_K = 16
     
-    # Create kernel arguments
-    kernel_args = {
-        'input_ptr': input.data_ptr(),
-        'weight_ptr': weight.data_ptr(),
-        'bias_ptr': bias_ptr,
-        'output_ptr': output.data_ptr(),
-        'input_height': input_height,
-        'input_width': input_width,
-        'output_height': output_height,
-        'output_width': output_width,
-        'weight_height': weight_height,
-        'weight_width': weight_width,
-        'channels': channels,
-        'num_filters': num_filters,
-        'stride_h': stride_h,
-        'stride_w': stride_w,
-        'padding_h': padding_h,
-        'padding_w': padding_w,
-        'dilation_h': dilation_h,
-        'dilation_w': dilation_w,
-        'groups': groups,
-        'negative_slope': negative_slope,
-        'BLOCK_SIZE': block_size
-    }
+    # Launch the kernel
+    grid = (
+        triton.cdiv(height_out, BLOCK_SIZE_M),
+        triton.cdiv(width_out, BLOCK_SIZE_N),
+        triton.cdiv(channels_in * kernel_h * kernel_w, BLOCK_SIZE_K)
+    )
     
-    # Launch kernel
-    _leaky_relu_conv2d_kernel[grid_size](**kernel_args)
+    # Launch convolution kernel
+    conv2d_kernel[grid](
+        input, weight, output,
+        input.stride(0), input.stride(1), input.stride(2), input.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+        batch_size, channels_in, channels_out, height_in, width_in,
+        height_out, width_out, kernel_h, kernel_w, stride, stride, padding, padding, dilation, dilation,
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
+    )
+    
+    # Launch Leaky ReLU kernel
+    grid = (
+        triton.cdiv(height_out, 16),
+        triton.cdiv(width_out, 16),
+        triton.cdiv(channels_out, 16)
+    )
+    
+    leaky_relu_kernel[grid](
+        output, output,
+        output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+        output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+        batch_size, channels_out, height_out, width_out, negative_slope
+    )
     
     return output
 ```

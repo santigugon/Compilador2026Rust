@@ -4,217 +4,95 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _fused_add_mul_groupnorm_kernel(
-    x_ptr, y_ptr, weight_ptr, bias_ptr, out_ptr,
-    n_elements, num_groups, channels, groups, eps,
-    x_stride, y_stride, weight_stride, bias_stride, out_stride,
+def fused_add_mul_groupnorm_kernel(
+    X_ptr, Y_ptr, weight_ptr, bias_ptr, output_ptr,
+    N, C, G, eps,
     BLOCK_SIZE: tl.constexpr
 ):
-    pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
+    # Get the block index
+    block_idx = tl.program_id(0)
     
-    # Load inputs
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+    # Calculate the starting position for this block
+    start_pos = block_idx * BLOCK_SIZE
+    
+    # Load data
+    X = tl.load(X_ptr + start_pos, mask=(start_pos + tl.arange(0, BLOCK_SIZE) < N))
+    Y = tl.load(Y_ptr + start_pos, mask=(start_pos + tl.arange(0, BLOCK_SIZE) < N))
+    output = tl.load(output_ptr + start_pos, mask=(start_pos + tl.arange(0, BLOCK_SIZE) < N))
     
     # Element-wise addition and multiplication
-    xy = x + y
-    xy = xy * y  # y is used as multiplier
+    result = (X + Y) * output
     
-    # Reshape for group normalization
-    # For simplicity, we'll compute group norm on the flattened tensor
-    # and reshape back to original shape
-    xy_reshaped = xy.reshape(groups, channels, -1)
+    # Group normalization
+    # For simplicity, we assume C is divisible by G
+    group_size = C // G
+    group_idx = (start_pos // C) % G
     
-    # Compute mean and variance for group normalization
-    mean = tl.sum(xy_reshaped, axis=2, keepdims=True) / (channels * xy_reshaped.shape[2])
-    var = tl.sum((xy_reshaped - mean)**2, axis=2, keepdims=True) / (channels * xy_reshaped.shape[2])
+    # Calculate mean and variance for the group
+    mean = tl.sum(result, axis=0) / group_size
+    var = tl.sum((result - mean) ** 2, axis=0) / group_size
     
     # Normalize
-    normalized = (xy_reshaped - mean) / tl.sqrt(var + eps)
+    normalized = (result - mean) / tl.sqrt(var + eps)
     
     # Apply weight and bias
-    weight = tl.load(weight_ptr + tl.arange(0, channels), mask=tl.arange(0, channels) < channels, other=0.0)
-    bias = tl.load(bias_ptr + tl.arange(0, channels), mask=tl.arange(0, channels) < channels, other=0.0)
+    weight = tl.load(weight_ptr + (start_pos % C), mask=(start_pos % C < C))
+    bias = tl.load(bias_ptr + (start_pos % C), mask=(start_pos % C < C))
     
-    # Expand weight and bias to match the group structure
-    weight_expanded = weight.reshape(1, channels, 1)
-    bias_expanded = bias.reshape(1, channels, 1)
-    
-    # Apply normalization
-    normalized = normalized * weight_expanded + bias_expanded
-    
-    # Reshape back to original shape
-    out = normalized.reshape(-1)
+    output = normalized * weight + bias
     
     # Store result
-    tl.store(out_ptr + offsets, out, mask=mask)
+    tl.store(output_ptr + start_pos, output, mask=(start_pos + tl.arange(0, BLOCK_SIZE) < N))
 
 def fused_add_mul_groupnorm(input1, input2, weight, bias, num_groups, eps=1e-5, *, out=None):
-    # Validate inputs
-    if input1.shape != input2.shape:
-        # Check if they are broadcastable
-        try:
-            torch.broadcast_tensors(input1, input2)
-        except RuntimeError:
-            raise ValueError("input1 and input2 must be broadcastable")
+    # Ensure inputs are contiguous
+    input1 = input1.contiguous()
+    input2 = input2.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
     
-    # Ensure input1 and input2 have the same shape
-    if input1.shape != input2.shape:
-        # Broadcast input2 to match input1 shape
-        input2 = input2.expand(input1.shape)
+    # Check shapes
+    assert input1.shape == input2.shape, "input1 and input2 must have the same shape"
+    assert weight.shape == (input1.shape[1],), "weight must have shape (C,)"
+    assert bias.shape == (input1.shape[1],), "bias must have shape (C,)"
     
-    # Validate weight and bias shapes
-    if weight.shape != bias.shape:
-        raise ValueError("weight and bias must have the same shape")
+    # Flatten inputs for easier processing
+    input1_flat = input1.view(-1)
+    input2_flat = input2.view(-1)
+    output_flat = input1_flat + input2_flat
     
-    # Validate num_groups
-    if num_groups <= 0:
-        raise ValueError("num_groups must be positive")
-    
-    # Get output tensor
+    # Prepare output tensor
     if out is None:
         out = torch.empty_like(input1)
     else:
-        if out.shape != input1.shape:
-            raise ValueError("out tensor must have the same shape as input1")
+        assert out.shape == input1.shape, "out must have the same shape as input1"
     
-    # Flatten tensors for processing
-    input1_flat = input1.flatten()
-    input2_flat = input2.flatten()
-    out_flat = out.flatten()
+    # Flatten output for processing
+    out_flat = out.view(-1)
     
-    # Get dimensions
-    n_elements = input1_flat.numel()
-    channels = input1_flat.shape[-1]  # Assuming last dimension is channels
-    
-    # Validate group normalization parameters
-    if channels % num_groups != 0:
-        raise ValueError("Number of channels must be divisible by num_groups")
-    
-    # Set up kernel launch parameters
-    BLOCK_SIZE = 256
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    # Create stride tensors
-    x_stride = input1.stride(-1) if input1.dim() > 0 else 1
-    y_stride = input2.stride(-1) if input2.dim() > 0 else 1
-    weight_stride = weight.stride(-1) if weight.dim() > 0 else 1
-    bias_stride = bias.stride(-1) if bias.dim() > 0 else 1
-    out_stride = out.stride(-1) if out.dim() > 0 else 1
+    # Get total number of elements
+    N = input1_flat.numel()
+    C = input1.shape[1]
+    G = num_groups
     
     # Launch kernel
-    _fused_add_mul_groupnorm_kernel[grid](
-        input1_flat, input2_flat, weight, bias, out_flat,
-        n_elements, num_groups, channels, channels // num_groups, eps,
-        x_stride, y_stride, weight_stride, bias_stride, out_stride,
-        BLOCK_SIZE=BLOCK_SIZE
+    BLOCK_SIZE = 1024
+    num_blocks = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
+    
+    fused_add_mul_groupnorm_kernel[
+        num_blocks,
+        1,
+        (N, C, G, eps),
+        BLOCK_SIZE
+    ](
+        input1_flat,
+        input2_flat,
+        weight,
+        bias,
+        out_flat,
+        N, C, G, eps,
+        BLOCK_SIZE
     )
     
-    return out
-
-# Simplified version that handles the core operations correctly
-@triton.jit
-def _fused_add_mul_groupnorm_kernel_simple(
-    x_ptr, y_ptr, weight_ptr, bias_ptr, out_ptr,
-    n_elements, num_groups, channels, eps,
-    BLOCK_SIZE: tl.constexpr
-):
-    pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    
-    # Load inputs
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
-    
-    # Element-wise addition and multiplication
-    xy = x + y
-    xy = xy * y  # y is used as multiplier
-    
-    # For group normalization, we'll compute it on the flattened tensor
-    # This is a simplified version - in practice, we'd need to handle
-    # the group structure more carefully
-    
-    # For now, we'll just do a simple normalization
-    # In a real implementation, we'd need to properly group the channels
-    
-    # Simple normalization (this is a placeholder)
-    # In a real implementation, we'd compute group mean and variance
-    # and apply group normalization properly
-    
-    # Placeholder for group normalization
-    # This is a simplified version that doesn't fully implement group norm
-    # but shows the structure
-    mean = tl.sum(xy) / n_elements
-    var = tl.sum((xy - mean)**2) / n_elements
-    normalized = (xy - mean) / tl.sqrt(var + eps)
-    
-    # Apply weight and bias
-    weight = tl.load(weight_ptr + tl.arange(0, channels), mask=tl.arange(0, channels) < channels, other=0.0)
-    bias = tl.load(bias_ptr + tl.arange(0, channels), mask=tl.arange(0, channels) < channels, other=0.0)
-    
-    # For simplicity, we'll just apply the first weight and bias
-    # In a real implementation, we'd need to properly handle the group structure
-    out = normalized * weight[0] + bias[0]
-    
-    tl.store(out_ptr + offsets, out, mask=mask)
-
-def fused_add_mul_groupnorm(input1, input2, weight, bias, num_groups, eps=1e-5, *, out=None):
-    # Validate inputs
-    if input1.shape != input2.shape:
-        # Check if they are broadcastable
-        try:
-            torch.broadcast_tensors(input1, input2)
-        except RuntimeError:
-            raise ValueError("input1 and input2 must be broadcastable")
-    
-    # Ensure input1 and input2 have the same shape
-    if input1.shape != input2.shape:
-        # Broadcast input2 to match input1 shape
-        input2 = input2.expand(input1.shape)
-    
-    # Validate weight and bias shapes
-    if weight.shape != bias.shape:
-        raise ValueError("weight and bias must have the same shape")
-    
-    # Validate num_groups
-    if num_groups <= 0:
-        raise ValueError("num_groups must be positive")
-    
-    # Get output tensor
-    if out is None:
-        out = torch.empty_like(input1)
-    else:
-        if out.shape != input1.shape:
-            raise ValueError("out tensor must have the same shape as input1")
-    
-    # Flatten tensors for processing
-    input1_flat = input1.flatten()
-    input2_flat = input2.flatten()
-    out_flat = out.flatten()
-    
-    # Get dimensions
-    n_elements = input1_flat.numel()
-    channels = weight.shape[0]  # Assuming weight has channel dimension
-    
-    # Validate group normalization parameters
-    if channels % num_groups != 0:
-        raise ValueError("Number of channels must be divisible by num_groups")
-    
-    # Set up kernel launch parameters
-    BLOCK_SIZE = 256
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    # Launch kernel
-    _fused_add_mul_groupnorm_kernel_simple[grid](
-        input1_flat, input2_flat, weight, bias, out_flat,
-        n_elements, num_groups, channels, eps,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    
-    return out
+    return out.view(input1.shape)
 ```

@@ -5,173 +5,169 @@ import triton.language as tl
 import math
 
 @triton.jit
-def affine_grid_kernel(
-    theta_ptr,
-    grid_ptr,
-    N,
-    H_out,
-    W_out,
-    H_in,
-    W_in,
-    BLOCK_SIZE: tl.constexpr,
+def _affine_grid_kernel(
+    theta_ptr, 
+    grid_ptr, 
+    N: tl.constexpr, 
+    H_out: tl.constexpr, 
+    W_out: tl.constexpr, 
+    BLOCK: tl.constexpr
 ):
     pid = tl.program_id(0)
     batch_idx = pid // (H_out * W_out)
     if batch_idx >= N:
         return
+    
     out_idx = pid % (H_out * W_out)
-    h_out = out_idx // W_out
-    w_out = out_idx % W_out
+    h_idx = out_idx // W_out
+    w_idx = out_idx % W_out
+    
+    # Load theta for this batch
+    theta_row0 = tl.load(theta_ptr + batch_idx * 6 + 0)
+    theta_row1 = tl.load(theta_ptr + batch_idx * 6 + 3)
     
     # Compute grid coordinates
     if not align_corners:
-        x_out = (w_out + 0.5) / W_out * 2 - 1
-        y_out = (h_out + 0.5) / H_out * 2 - 1
+        # Standard grid sampling
+        x = (w_idx + 0.5) / W_out * 2.0 - 1.0
+        y = (h_idx + 0.5) / H_out * 2.0 - 1.0
     else:
-        x_out = w_out / (W_out - 1) * 2 - 1
-        y_out = h_out / (H_out - 1) * 2 - 1
+        # Align corners
+        x = w_idx / (W_out - 1) * 2.0 - 1.0
+        y = h_idx / (H_out - 1) * 2.0 - 1.0
     
     # Apply affine transformation
-    theta_00 = tl.load(theta_ptr + batch_idx * 6 + 0)
-    theta_01 = tl.load(theta_ptr + batch_idx * 6 + 1)
-    theta_02 = tl.load(theta_ptr + batch_idx * 6 + 2)
-    theta_10 = tl.load(theta_ptr + batch_idx * 6 + 3)
-    theta_11 = tl.load(theta_ptr + batch_idx * 6 + 4)
-    theta_12 = tl.load(theta_ptr + batch_idx * 6 + 5)
+    x_out = theta_row0 * x + theta_row0 * y + theta_row0 * 1.0
+    y_out = theta_row1 * x + theta_row1 * y + theta_row1 * 1.0
     
-    x_in = x_out * theta_00 + y_out * theta_01 + theta_02
-    y_in = x_out * theta_10 + y_out * theta_11 + theta_12
-    
-    # Normalize to input image coordinates
-    x_in = (x_in + 1) * (W_in - 1) / 2
-    y_in = (y_in + 1) * (H_in - 1) / 2
-    
-    # Store grid values
-    tl.store(grid_ptr + batch_idx * H_out * W_out * 2 + out_idx * 2 + 0, x_in)
-    tl.store(grid_ptr + batch_idx * H_out * W_out * 2 + out_idx * 2 + 1, y_in)
+    # Store results
+    tl.store(grid_ptr + pid * 2 + 0, x_out)
+    tl.store(grid_ptr + pid * 2 + 1, y_out)
 
 @triton.jit
-def grid_sample_kernel(
-    input_ptr,
-    grid_ptr,
-    output_ptr,
-    N,
-    C,
-    H_out,
-    W_out,
-    H_in,
-    W_in,
-    mode,
-    padding_mode,
-    BLOCK_SIZE: tl.constexpr,
+def _grid_sample_bilinear_kernel(
+    input_ptr, 
+    grid_ptr, 
+    output_ptr, 
+    N: tl.constexpr, 
+    C: tl.constexpr, 
+    H_in: tl.constexpr, 
+    W_in: tl.constexpr, 
+    H_out: tl.constexpr, 
+    W_out: tl.constexpr, 
+    BLOCK: tl.constexpr
 ):
     pid = tl.program_id(0)
     batch_idx = pid // (H_out * W_out * C)
     if batch_idx >= N:
         return
+    
     out_idx = pid % (H_out * W_out * C)
-    c = out_idx // (H_out * W_out)
-    h_out = (out_idx % (H_out * W_out)) // W_out
-    w_out = (out_idx % (H_out * W_out)) % W_out
+    c_idx = out_idx // (H_out * W_out)
+    h_idx = (out_idx % (H_out * W_out)) // W_out
+    w_idx = (out_idx % (H_out * W_out)) % W_out
     
-    # Get grid coordinates
-    x_in = tl.load(grid_ptr + batch_idx * H_out * W_out * 2 + h_out * W_out * 2 + w_out * 2 + 0)
-    y_in = tl.load(grid_ptr + batch_idx * H_out * W_out * 2 + h_out * W_out * 2 + w_out * 2 + 1)
+    # Load grid coordinates
+    grid_x = tl.load(grid_ptr + pid * 2 + 0)
+    grid_y = tl.load(grid_ptr + pid * 2 + 1)
     
-    # Handle padding modes
-    if padding_mode == 0:  # zeros
-        if x_in < 0 or x_in >= W_in or y_in < 0 or y_in >= H_in:
-            tl.store(output_ptr + batch_idx * H_out * W_out * C + out_idx, 0.0)
-            return
-    elif padding_mode == 1:  # border
-        x_in = tl.maximum(0.0, tl.minimum(x_in, W_in - 1.0))
-        y_in = tl.maximum(0.0, tl.minimum(y_in, H_in - 1.0))
-    elif padding_mode == 2:  # reflection
-        x_in = tl.abs(x_in)
-        y_in = tl.abs(y_in)
-        x_in = tl.fmod(x_in, 2 * W_in)
-        y_in = tl.fmod(y_in, 2 * H_in)
-        x_in = tl.where(x_in > W_in, 2 * W_in - x_in, x_in)
-        y_in = tl.where(y_in > H_in, 2 * H_in - y_in, y_in)
+    # Normalize grid coordinates to image coordinates
+    x = (grid_x + 1.0) * (W_in - 1) / 2.0
+    y = (grid_y + 1.0) * (H_in - 1) / 2.0
     
-    # Interpolation
-    if mode == 0:  # bilinear
-        x_f = tl.floor(x_in)
-        y_f = tl.floor(y_in)
-        x_d = x_in - x_f
-        y_d = y_in - y_f
-        
-        # Sample four points
-        x0 = x_f
-        x1 = x_f + 1
-        y0 = y_f
-        y1 = y_f + 1
-        
-        # Clamp coordinates
-        x0 = tl.maximum(0.0, tl.minimum(x0, W_in - 1.0))
-        x1 = tl.maximum(0.0, tl.minimum(x1, W_in - 1.0))
-        y0 = tl.maximum(0.0, tl.minimum(y0, H_in - 1.0))
-        y1 = tl.maximum(0.0, tl.minimum(y1, H_in - 1.0))
-        
-        # Get values
-        v00 = tl.load(input_ptr + batch_idx * H_in * W_in * C + c * H_in * W_in + y0 * W_in + x0)
-        v01 = tl.load(input_ptr + batch_idx * H_in * W_in * C + c * H_in * W_in + y0 * W_in + x1)
-        v10 = tl.load(input_ptr + batch_idx * H_in * W_in * C + c * H_in * W_in + y1 * W_in + x0)
-        v11 = tl.load(input_ptr + batch_idx * H_in * W_in * C + c * H_in * W_in + y1 * W_in + x1)
-        
-        # Interpolate
-        v0 = v00 * (1 - x_d) + v01 * x_d
-        v1 = v10 * (1 - x_d) + v11 * x_d
-        result = v0 * (1 - y_d) + v1 * y_d
-        tl.store(output_ptr + batch_idx * H_out * W_out * C + out_idx, result)
-    elif mode == 1:  # nearest
-        x_r = tl.round(x_in)
-        y_r = tl.round(y_in)
-        x_r = tl.maximum(0.0, tl.minimum(x_r, W_in - 1.0))
-        y_r = tl.maximum(0.0, tl.minimum(y_r, H_in - 1.0))
-        result = tl.load(input_ptr + batch_idx * H_in * W_in * C + c * H_in * W_in + y_r * W_in + x_r)
-        tl.store(output_ptr + batch_idx * H_out * W_out * C + out_idx, result)
+    # Clamp coordinates to valid range
+    x = tl.maximum(0.0, tl.minimum(x, W_in - 1.0))
+    y = tl.maximum(0.0, tl.minimum(y, H_in - 1.0))
+    
+    # Get integer coordinates
+    x0 = tl.floor(x)
+    y0 = tl.floor(y)
+    x1 = x0 + 1.0
+    y1 = y0 + 1.0
+    
+    # Compute weights
+    wx = x - x0
+    wy = y - y0
+    
+    # Load input values
+    input_ptr_base = input_ptr + batch_idx * C * H_in * W_in
+    
+    # Bilinear interpolation
+    val00 = tl.load(input_ptr_base + c_idx * H_in * W_in + y0 * W_in + x0, mask=(x0 >= 0) & (y0 >= 0) & (x0 < W_in) & (y0 < H_in), other=0.0)
+    val01 = tl.load(input_ptr_base + c_idx * H_in * W_in + y0 * W_in + x1, mask=(x1 >= 0) & (y0 >= 0) & (x1 < W_in) & (y0 < H_in), other=0.0)
+    val10 = tl.load(input_ptr_base + c_idx * H_in * W_in + y1 * W_in + x0, mask=(x0 >= 0) & (y1 >= 0) & (x0 < W_in) & (y1 < H_in), other=0.0)
+    val11 = tl.load(input_ptr_base + c_idx * H_in * W_in + y1 * W_in + x1, mask=(x1 >= 0) & (y1 >= 0) & (x1 < W_in) & (y1 < H_in), other=0.0)
+    
+    # Interpolate
+    val0 = val00 * (1.0 - wx) + val01 * wx
+    val1 = val10 * (1.0 - wx) + val11 * wx
+    result = val0 * (1.0 - wy) + val1 * wy
+    
+    # Store output
+    tl.store(output_ptr + pid, result)
 
 def grid_sample_with_affine(input: torch.Tensor, theta: torch.Tensor, size: torch.Size, mode: str = 'bilinear', padding_mode: str = 'zeros', align_corners: bool = False) -> torch.Tensor:
     # Validate inputs
-    assert input.dim() == 4, "Input tensor must be 4D"
-    assert theta.dim() == 3, "Theta tensor must be 3D"
-    assert theta.size(1) == 2 and theta.size(2) == 3, "Theta must be of shape (N, 2, 3)"
-    assert input.size(0) == theta.size(0), "Batch size must match"
+    assert input.dim() == 4, "input must be 4D tensor (N, C, H_in, W_in)"
+    assert theta.dim() == 3, "theta must be 3D tensor (N, 2, 3)"
+    assert input.size(0) == theta.size(0), "Batch size must match between input and theta"
+    assert len(size) == 4, "size must be 4D (N, C, H_out, W_out)"
     
-    # Get dimensions
+    # Extract dimensions
     N, C, H_in, W_in = input.shape
-    H_out, W_out = size[2], size[3]
+    _, H_out, W_out = size[0], size[2], size[3]
     
-    # Map string modes to integers
-    mode_map = {'bilinear': 0, 'nearest': 1, 'bicubic': 2}
-    padding_map = {'zeros': 0, 'border': 1, 'reflection': 2}
+    # Create output tensor
+    output = torch.empty(size, dtype=input.dtype, device=input.device)
     
-    mode_int = mode_map.get(mode, 0)
-    padding_int = padding_map.get(padding_mode, 0)
+    # Generate grid using affine transformation
+    grid = torch.empty(N, H_out, W_out, 2, dtype=torch.float32, device=input.device)
     
-    # Allocate output tensor
-    output = torch.empty(N, C, H_out, W_out, device=input.device, dtype=input.dtype)
-    
-    # Create grid tensor
-    grid = torch.empty(N, H_out, W_out, 2, device=input.device, dtype=torch.float32)
+    # Compute grid using Triton kernel
+    block = 256
+    total_elements = N * H_out * W_out
+    grid_size = triton.cdiv(total_elements, block)
     
     # Launch affine grid kernel
-    grid_size = N * H_out * W_out
-    block_size = 256
-    num_blocks = (grid_size + block_size - 1) // block_size
-    
-    affine_grid_kernel[(num_blocks,)](
-        theta,
-        grid,
-        N,
-        H_out,
-        W_out,
-        H_in,
-        W_in,
-        BLOCK_SIZE=block_size
+    _affine_grid_kernel[grid_size](
+        theta, 
+        grid.view(N * H_out * W_out, 2), 
+        N, 
+        H_out, 
+        W_out, 
+        BLOCK=block
     )
     
-    # Launch grid sample kernel
-    output_size = N * C * H_out * W_out
-    num_blocks = (output_size + block_size - 
+    # Apply grid sampling
+    if mode == 'bilinear':
+        # Launch bilinear sampling kernel
+        total_elements = N * C * H_out * W_out
+        grid_size = triton.cdiv(total_elements, block)
+        _grid_sample_bilinear_kernel[grid_size](
+            input, 
+            grid, 
+            output, 
+            N, 
+            C, 
+            H_in, 
+            W_in, 
+            H_out, 
+            W_out, 
+            BLOCK=block
+        )
+    else:
+        # For other modes, fall back to PyTorch implementation
+        # This is a simplified version - in practice, you'd implement other modes
+        # like nearest or bicubic with their own kernels
+        grid_sample_input = input.permute(0, 2, 3, 1).contiguous()
+        grid_sample_grid = grid.permute(0, 3, 1, 2).contiguous()
+        output = torch.nn.functional.grid_sample(
+            grid_sample_input, 
+            grid_sample_grid, 
+            mode=mode, 
+            padding_mode=padding_mode, 
+            align_corners=align_corners
+        ).permute(0, 3, 1, 2)
+    
+    return output
+```

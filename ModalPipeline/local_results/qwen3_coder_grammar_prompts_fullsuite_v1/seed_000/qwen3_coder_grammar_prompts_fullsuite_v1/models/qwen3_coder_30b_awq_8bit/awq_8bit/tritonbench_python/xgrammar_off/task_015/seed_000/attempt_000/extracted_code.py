@@ -17,31 +17,19 @@ def add(input, other, *, alpha=1, out=None):
         return input + alpha * other
     
     # Ensure tensors have the same dtype for computation
-    if input.dtype != other.dtype:
-        # Promote to common dtype
-        common_dtype = torch.result_type(input, other)
-        input = input.to(common_dtype)
-        other = other.to(common_dtype)
-    
-    # Handle broadcasting by computing output shape
-    output_shape = torch.broadcast_shapes(input.shape, other.shape)
-    
-    # Create output tensor
-    if out is not None:
-        if out.shape != output_shape:
-            raise ValueError(f"Output tensor shape {out.shape} does not match expected broadcast shape {output_shape}")
-        out = out.to(input.dtype)
+    # PyTorch's add handles type promotion automatically
+    if out is None:
+        out = torch.empty_like(input)
     else:
-        out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+        # Ensure out has the correct shape and dtype
+        out = torch.empty_like(input, dtype=input.dtype)
     
-    # Flatten tensors for kernel execution
-    input_flat = input.reshape(-1)
-    other_flat = other.reshape(-1)
-    out_flat = out.reshape(-1)
+    # Get the total number of elements
+    n = input.numel()
     
-    n = out_flat.numel()
+    # Launch kernel
     block = 256
     grid = (triton.cdiv(n, block),)
+    _add_kernel[grid](input, other, out, n, alpha, BLOCK=block)
     
-    _add_kernel[grid](input_flat, other_flat, out_flat, n, alpha, BLOCK=block)
     return out

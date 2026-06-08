@@ -4,157 +4,117 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _relu_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    y = tl.maximum(x, 0.0)
-    tl.store(out_ptr + offsets, y, mask=mask)
-
-@triton.jit
-def _fractional_max_pool2d_kernel(
-    input_ptr, 
-    output_ptr, 
+def relu_and_pool2d_kernel(
+    input_ptr,
+    output_ptr,
     indices_ptr,
-    input_height, 
-    input_width, 
-    output_height, 
-    output_width,
-    kernel_height, 
-    kernel_width,
-    BLOCK_HEIGHT: tl.constexpr, 
-    BLOCK_WIDTH: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr
+    input_shape,
+    output_shape,
+    kernel_size,
+    output_ratio,
+    return_indices,
+    BLOCK_SIZE_H=16,
+    BLOCK_SIZE_W=16,
 ):
-    pid_h = tl.program_id(0)
-    pid_w = tl.program_id(1)
+    # Get block indices
+    block_idx_h = tl.program_id(0)
+    block_idx_w = tl.program_id(1)
     
-    if pid_h >= output_height or pid_w >= output_width:
-        return
+    # Calculate output indices
+    out_h = block_idx_h * BLOCK_SIZE_H
+    out_w = block_idx_w * BLOCK_SIZE_W
     
-    # Calculate the start position in the input tensor
-    start_h = pid_h * kernel_height
-    start_w = pid_w * kernel_width
+    # Load input data
+    input_ptr = input_ptr + out_h * input_shape[2] + out_w
     
-    # Load the kernel_size for this block
-    max_val = -float('inf')
-    max_idx = 0
-    
-    # Loop through the kernel window to find max
-    for h in range(kernel_height):
-        for w in range(kernel_width):
-            input_h = start_h + h
-            input_w = start_w + w
-            if input_h < input_height and input_w < input_width:
-                input_offset = input_h * input_width + input_w
-                val = tl.load(input_ptr + input_offset)
-                if val > max_val:
-                    max_val = val
-                    max_idx = input_offset
-    
-    # Store the result
-    output_offset = pid_h * output_width + pid_w
-    tl.store(output_ptr + output_offset, max_val)
-    
-    if indices_ptr is not None:
-        tl.store(indices_ptr + output_offset, max_idx)
+    # Apply ReLU and perform fractional max pooling
+    for i in range(BLOCK_SIZE_H):
+        for j in range(BLOCK_SIZE_W):
+            if out_h + i < output_shape[0] and out_w + j < output_shape[1]:
+                # Apply ReLU
+                input_val = tl.load(input_ptr + i * input_shape[2] + j)
+                relu_val = tl.maximum(input_val, 0.0)
+                
+                # Fractional max pooling
+                max_val = relu_val
+                max_idx_h = 0
+                max_idx_w = 0
+                
+                # Simple fractional max pooling logic
+                for kh in range(kernel_size):
+                    for kw in range(kernel_size):
+                        h = out_h + i + kh
+                        w = out_w + j + kw
+                        if h < input_shape[0] and w < input_shape[1]:
+                            val = tl.load(input_ptr + h * input_shape[2] + w)
+                            relu_val = tl.maximum(val, 0.0)
+                            if relu_val > max_val:
+                                max_val = relu_val
+                                max_idx_h = h
+                                max_idx_w = w
+                
+                # Store output
+                output_ptr = output_ptr + out_h * output_shape[2] + out_w
+                tl.store(output_ptr + i * output_shape[2] + j, max_val)
+                
+                # Store indices if needed
+                if return_indices:
+                    indices_ptr = indices_ptr + out_h * output_shape[2] + out_w
+                    tl.store(indices_ptr + i * output_shape[2] + j, max_idx_h * output_shape[2] + max_idx_w)
 
-def fused_fractional_max_pool2d_with_relu(input: torch.Tensor, kernel_size, output_size=None, output_ratio=None, return_indices=False):
-    # Handle kernel_size
-    if isinstance(kernel_size, int):
-        kernel_height = kernel_size
-        kernel_width = kernel_size
-    else:
-        kernel_height, kernel_width = kernel_size
-    
-    # Apply ReLU first
-    input_re = torch.relu(input)
+def fused_fractional_max_pool2d_with_relu(input: torch.Tensor, kernel_size, output_size=None, output_ratio=None, return_indices=False) -> torch.Tensor:
+    # Validate input
+    if input.dim() != 4:
+        raise ValueError("Input tensor must be 4-dimensional (N, C, H, W)")
     
     # Get input dimensions
-    input_height, input_width = input_re.shape[-2], input_re.shape[-1]
+    batch_size, channels, height, width = input.shape
     
-    # Calculate output size if not provided
+    # Determine output size
     if output_size is not None:
-        output_height, output_width = output_size
+        output_h, output_w = output_size
     elif output_ratio is not None:
-        output_height = int(input_height * output_ratio[0])
-        output_width = int(input_width * output_ratio[1])
+        output_h = int(height * output_ratio[0])
+        output_w = int(width * output_ratio[1])
     else:
-        # Default to kernel size
-        output_height = input_height // kernel_height
-        output_width = input_width // kernel_width
+        # Default to 1x1 output
+        output_h, output_w = 1, 1
     
     # Create output tensor
-    out = torch.empty(input_re.shape[:-2] + (output_height, output_width), device=input.device, dtype=input.dtype)
+    output = torch.empty(batch_size, channels, output_h, output_w, device=input.device, dtype=input.dtype)
     
     # Create indices tensor if needed
     indices = None
     if return_indices:
-        indices = torch.empty(input_re.shape[:-2] + (output_height, output_width), device=input.device, dtype=torch.long)
+        indices = torch.empty(batch_size, channels, output_h, output_w, device=input.device, dtype=torch.long)
     
-    # Handle batch dimensions
-    batch_size = input_re.shape[:-2]
-    total_batch_elements = 1
-    for dim in batch_size:
-        total_batch_elements *= dim
-    
-    # Flatten batch dimensions for processing
-    if len(batch_size) > 0:
-        input_flat = input_re.view(-1, input_height, input_width)
-        out_flat = out.view(-1, output_height, output_width)
-        if return_indices:
-            indices_flat = indices.view(-1, output_height, output_width)
+    # Launch kernel
+    if return_indices:
+        relu_and_pool2d_kernel[(output_h, output_w)](
+            input,
+            output,
+            indices,
+            input.shape,
+            output.shape,
+            kernel_size,
+            output_ratio,
+            return_indices
+        )
     else:
-        input_flat = input_re.unsqueeze(0)
-        out_flat = out.unsqueeze(0)
-        if return_indices:
-            indices_flat = indices.unsqueeze(0)
-    
-    # Process each batch element
-    for i in range(total_batch_elements):
-        # Get the current batch element
-        if len(batch_size) > 0:
-            input_batch = input_flat[i]
-            out_batch = out_flat[i]
-            if return_indices:
-                indices_batch = indices_flat[i]
-        else:
-            input_batch = input_flat[0]
-            out_batch = out_flat[0]
-            if return_indices:
-                indices_batch = indices_flat[0]
-        
-        # Launch kernel
-        grid_h = triton.cdiv(output_height, 16)
-        grid_w = triton.cdiv(output_width, 16)
-        grid = (grid_h, grid_w)
-        
-        # For simplicity, we'll use a single block size for now
-        BLOCK_SIZE = 256
-        _fractional_max_pool2d_kernel[grid](
-            input_batch, 
-            out_batch, 
-            indices_batch if return_indices else None,
-            input_height, 
-            input_width, 
-            output_height, 
-            output_width,
-            kernel_height, 
-            kernel_width,
-            BLOCK_HEIGHT=16, 
-            BLOCK_WIDTH=16,
-            BLOCK_SIZE=BLOCK_SIZE
+        relu_and_pool2d_kernel[(output_h, output_w)](
+            input,
+            output,
+            None,
+            input.shape,
+            output.shape,
+            kernel_size,
+            output_ratio,
+            return_indices
         )
     
-    # Reshape back to original batch dimensions
-    if len(batch_size) > 0:
-        out = out.view(input.shape[:-2] + (output_height, output_width,))
-        if return_indices:
-            indices = indices.view(input.shape[:-2] + (output_height, output_width,))
-    
+    # Return appropriate output
     if return_indices:
-        return out, indices
+        return output, indices
     else:
-        return out
+        return output
 ```

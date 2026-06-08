@@ -4,7 +4,7 @@ import triton.language as tl
 from typing import Tuple
 
 @triton.jit
-def _rad2deg_sqrt_kernel(x_ptr, out_deg_ptr, out_sqrt_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+def _rad2deg_sqrt_kernel(x_ptr, deg_ptr, sqrt_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
@@ -14,10 +14,10 @@ def _rad2deg_sqrt_kernel(x_ptr, out_deg_ptr, out_sqrt_ptr, n: tl.constexpr, BLOC
     deg = x * (180.0 / 3.141592653589793)
     
     # Calculate square root
-    sqrt_val = tl.sqrt(x)
+    sqrt = tl.sqrt(x)
     
-    tl.store(out_deg_ptr + offsets, deg, mask=mask)
-    tl.store(out_sqrt_ptr + offsets, sqrt_val, mask=mask)
+    tl.store(deg_ptr + offsets, deg, mask=mask)
+    tl.store(sqrt_ptr + offsets, sqrt, mask=mask)
 
 def rad2deg_sqrt(input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     out_deg = torch.empty_like(input)

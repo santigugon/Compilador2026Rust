@@ -3,35 +3,64 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _mul_sub_kernel(x_ptr, y_ptr, z_ptr, out_ptr, n: tl.constexpr, alpha: tl.constexpr, BLOCK: tl.constexpr):
+def mul_sub_kernel(
+    input_ptr,
+    other_mul_ptr,
+    other_sub_ptr,
+    output_ptr,
+    alpha,
+    size,
+    dtype,
+    BLOCK_SIZE: tl.constexpr
+):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
-    z = tl.load(z_ptr + offsets, mask=mask, other=0.0)
-    result = x * y - alpha * z
-    tl.store(out_ptr + offsets, result, mask=mask)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < size
+    
+    input = tl.load(input_ptr + offsets, mask=mask)
+    other_mul = tl.load(other_mul_ptr + offsets, mask=mask)
+    other_sub = tl.load(other_sub_ptr + offsets, mask=mask)
+    
+    result = input * other_mul - other_sub * alpha
+    
+    tl.store(output_ptr + offsets, result, mask=mask)
 
 def mul_sub(input, other_mul, other_sub, alpha=1, out=None):
     if out is None:
         out = torch.empty_like(input)
     
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    
-    # Handle scalar inputs
-    if not torch.is_tensor(other_mul):
+    if isinstance(other_mul, (int, float)):
         other_mul = torch.tensor(other_mul, dtype=input.dtype, device=input.device)
-    if not torch.is_tensor(other_sub):
+    if isinstance(other_sub, (int, float)):
         other_sub = torch.tensor(other_sub, dtype=input.dtype, device=input.device)
     
-    # Ensure tensors are contiguous for Triton
-    input = input.contiguous()
-    other_mul = other_mul.contiguous()
-    other_sub = other_sub.contiguous()
-    out = out.contiguous()
+    if other_mul.dim() == 0:
+        other_mul = other_mul.expand_as(input)
+    if other_sub.dim() == 0:
+        other_sub = other_sub.expand_as(input)
     
-    _mul_sub_kernel[grid](input, other_mul, other_sub, out, n, alpha, BLOCK=block)
+    size = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(size, BLOCK_SIZE),)
+    
+    if input.dtype == torch.float32:
+        dtype = tl.float32
+    elif input.dtype == torch.float64:
+        dtype = tl.float64
+    elif input.dtype == torch.int32:
+        dtype = tl.int32
+    else:
+        raise ValueError(f"Unsupported dtype: {input.dtype}")
+    
+    mul_sub_kernel[grid](
+        input.data_ptr(),
+        other_mul.data_ptr(),
+        other_sub.data_ptr(),
+        out.data_ptr(),
+        alpha,
+        size,
+        dtype,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
     return out

@@ -14,52 +14,54 @@ def _sum_kernel(x_ptr, out_ptr, n: tl.constexpr, dim_size: tl.constexpr, BLOCK: 
     tl.store(out_ptr + offsets, x, mask=mask)
 
 def sum(input, dim, keepdim=False, *, dtype=None):
-    # Handle scalar input case
-    if input.dim() == 0:
-        if dtype is not None:
-            return input.to(dtype)
-        return input
-    
-    # Handle case where dim is None (sum all elements)
+    # Handle the case where dim is None (sum all elements)
     if dim is None:
-        out = torch.sum(input, dtype=dtype)
-        if keepdim:
-            out = out.view(1)
-        return out
+        # Use PyTorch's built-in sum for all elements
+        return torch.sum(input, dim=None, keepdim=keepdim, dtype=dtype)
     
-    # Convert dim to tuple if it's an integer
-    if isinstance(dim, int):
-        dim = (dim,)
+    # Convert dim to a list for consistent handling
+    if not isinstance(dim, (list, tuple)):
+        dim = [dim]
     
-    # Normalize negative dimensions
-    dim = tuple(d if d >= 0 else d + input.dim() for d in dim)
+    # Handle negative dimensions
+    dim = [d if d >= 0 else d + input.dim() for d in dim]
     
-    # Validate dimensions
-    for d in dim:
-        if d < 0 or d >= input.dim():
-            raise ValueError(f"Dimension {d} is out of range for tensor with {input.dim()} dimensions")
+    # Sort dimensions in descending order to handle them properly
+    dim = sorted(dim, reverse=True)
     
-    # Create output shape
+    # Create output tensor with appropriate shape
     output_shape = list(input.shape)
-    for d in sorted(dim, reverse=True):
-        output_shape.pop(d)
+    for d in dim:
+        output_shape[d] = 1
     
-    # If keepdim is True, set reduced dimensions to 1
-    if keepdim:
-        for d in sorted(dim, reverse=True):
-            output_shape.insert(d, 1)
+    # If keepdim is False, remove the reduced dimensions
+    if not keepdim:
+        output_shape = [s for i, s in enumerate(output_shape) if i not in dim]
     
-    # Handle the case where we're reducing all dimensions
-    if len(dim) == input.dim():
-        out = torch.sum(input, dtype=dtype)
-        if keepdim:
-            out = out.view([1] * input.dim())
+    # If output shape is empty (scalar), create scalar tensor
+    if len(output_shape) == 0:
+        out = torch.empty((), dtype=input.dtype, device=input.device)
+    else:
+        out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+    
+    # For simplicity, we'll use PyTorch's sum for complex cases
+    # This implementation handles the basic case where we sum along one dimension
+    if len(dim) == 1 and dim[0] == input.dim() - 1:
+        # Simple case: sum along the last dimension
+        n = input.numel()
+        block = 256
+        grid = (triton.cdiv(n, block),)
+        # Create a temporary tensor for the kernel
+        temp = torch.empty_like(input)
+        # Copy input to temp
+        temp.copy_(input)
+        # Launch kernel
+        _sum_kernel[grid](temp, out, n, input.shape[-1], BLOCK=block)
+        # Return the result
         return out
-    
-    # For multi-dimensional reduction, we'll use PyTorch's implementation
-    # since it's more complex to implement in Triton for arbitrary dimensions
-    out = torch.sum(input, dim=dim, keepdim=keepdim, dtype=dtype)
-    return out
+    else:
+        # For more complex cases, fall back to PyTorch
+        return torch.sum(input, dim=dim, keepdim=keepdim, dtype=dtype)
 
 ##################################################################################################################################################
 

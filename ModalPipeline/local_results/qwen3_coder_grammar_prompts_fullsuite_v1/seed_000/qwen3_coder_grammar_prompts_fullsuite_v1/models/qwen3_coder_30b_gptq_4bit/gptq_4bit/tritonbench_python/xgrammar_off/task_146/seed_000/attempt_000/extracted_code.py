@@ -3,67 +3,84 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def elu_linear_kernel(
+def _elu_linear_kernel(
     input_ptr, weight_ptr, bias_ptr, output_ptr,
-    input_row_stride, weight_row_stride, weight_col_stride,
-    output_row_stride, output_col_stride,
-    n_cols, alpha, BLOCK_SIZE: tl.constexpr
+    n_rows: tl.constexpr, n_cols: tl.constexpr, n_features: tl.constexpr,
+    alpha: tl.constexpr, BLOCK_SIZE: tl.constexpr
 ):
-    row = tl.program_id(0)
-    input_row = input_ptr + row * input_row_stride
-    weight_row = weight_ptr + row * weight_row_stride
-    output_row = output_ptr + row * output_row_stride
+    pid = tl.program_id(0)
+    row = pid
+    if row >= n_rows:
+        return
     
-    for col in range(0, n_cols, BLOCK_SIZE):
-        mask = col + tl.arange(0, BLOCK_SIZE) < n_cols
-        input_vals = tl.load(input_row + col + tl.arange(0, BLOCK_SIZE), mask=mask)
-        weight_vals = tl.load(weight_row + col + tl.arange(0, BLOCK_SIZE), mask=mask)
-        output_vals = tl.load(output_row + col + tl.arange(0, BLOCK_SIZE), mask=mask)
+    # Load input row
+    input_row = tl.load(input_ptr + row * n_features, mask=tl.arange(0, n_features) < n_features)
+    
+    # Compute linear transformation: input @ weight.T + bias
+    output_row = tl.zeros((n_cols,), dtype=tl.float32)
+    for i in range(0, n_features, BLOCK_SIZE):
+        # Load weight column slice
+        weight_offsets = tl.arange(i, i + BLOCK_SIZE)
+        weight_mask = weight_offsets < n_features
+        weight_col = tl.load(weight_ptr + tl.arange(0, n_cols)[:, None] * n_features + weight_offsets[None, :], mask=weight_mask[None, :], other=0.0)
         
-        # Linear transformation
-        linear_out = tl.sum(input_vals * weight_vals, axis=0)
+        # Load input slice
+        input_slice = tl.load(input_row + weight_offsets, mask=weight_mask, other=0.0)
         
-        # Add bias if present
-        if bias_ptr is not None:
-            bias_vals = tl.load(bias_ptr + tl.arange(0, BLOCK_SIZE), mask=mask)
-            linear_out += bias_vals
-        
-        # Apply ELU activation
-        elu_out = tl.where(linear_out > 0, linear_out, alpha * tl.exp(linear_out) - alpha)
-        
-        # Store result
-        tl.store(output_row + col + tl.arange(0, BLOCK_SIZE), elu_out, mask=mask)
+        # Compute dot product
+        output_row += tl.sum(input_slice[None, :] * weight_col, axis=1)
+    
+    # Add bias if present
+    if bias_ptr is not None:
+        bias = tl.load(bias_ptr + tl.arange(0, n_cols), mask=tl.arange(0, n_cols) < n_cols)
+        output_row += bias
+    
+    # Apply ELU activation
+    output_row = tl.where(output_row > 0, output_row, alpha * tl.exp(output_row) - alpha)
+    
+    # Store result
+    tl.store(output_ptr + row * n_cols, output_row, mask=tl.arange(0, n_cols) < n_cols)
 
 def elu_linear(input, weight, bias=None, alpha=1.0, inplace=False):
-    assert input.dim() == 2, "Input must be a 2D tensor"
-    assert weight.dim() == 2, "Weight must be a 2D tensor"
-    assert input.size(1) == weight.size(1), "Input and weight dimensions must match"
+    # Validate inputs
+    if input.dim() != 2:
+        raise ValueError("Input tensor must be 2-dimensional")
+    if weight.dim() != 2:
+        raise ValueError("Weight tensor must be 2-dimensional")
+    if input.size(1) != weight.size(1):
+        raise ValueError("Input size and weight size mismatch")
+    if bias is not None and bias.size(0) != weight.size(0):
+        raise ValueError("Bias size must match weight output size")
     
-    if bias is not None:
-        assert bias.dim() == 1, "Bias must be a 1D tensor"
-        assert bias.size(0) == weight.size(0), "Bias size must match weight output size"
+    # Get dimensions
+    n_rows, n_features = input.shape
+    n_cols = weight.size(0)
     
-    output = torch.empty(input.size(0), weight.size(0), dtype=input.dtype, device=input.device)
+    # Create output tensor
+    out = torch.empty(n_rows, n_cols, dtype=input.dtype, device=input.device)
     
-    # Determine block size
-    BLOCK_SIZE = 128
-    n_cols = weight.size(1)
+    # Handle inplace operation
+    if inplace:
+        out = input
+    
+    # Set up kernel launch parameters
+    BLOCK_SIZE = 256
+    grid = (n_rows,)
     
     # Launch kernel
-    grid = (input.size(0),)
-    elu_linear_kernel[grid](
-        input_ptr=input.data_ptr(),
-        weight_ptr=weight.data_ptr(),
-        bias_ptr=bias.data_ptr() if bias is not None else None,
-        output_ptr=output.data_ptr(),
-        input_row_stride=input.stride(0),
-        weight_row_stride=weight.stride(0),
-        weight_col_stride=weight.stride(1),
-        output_row_stride=output.stride(0),
-        output_col_stride=output.stride(1),
-        n_cols=n_cols,
-        alpha=alpha,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
+    if bias is not None:
+        _elu_linear_kernel[grid](
+            input, weight, bias, out,
+            n_rows, n_cols, n_features,
+            alpha, BLOCK_SIZE
+        )
+    else:
+        # Create a zero bias tensor for the kernel
+        zero_bias = torch.zeros(n_cols, dtype=weight.dtype, device=weight.device)
+        _elu_linear_kernel[grid](
+            input, weight, zero_bias, out,
+            n_rows, n_cols, n_features,
+            alpha, BLOCK_SIZE
+        )
     
-    return output
+    return out

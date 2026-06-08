@@ -3,85 +3,81 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _softmax_mul_kernel(
-    input_ptr, other_ptr, out_ptr,
-    input_stride, other_stride, out_stride,
-    dim_size: tl.constexpr,
-    numel: tl.constexpr,
-    BLOCK: tl.constexpr,
-    is_other_tensor: tl.constexpr
+def softmax_kernel(
+    input_ptr, other_ptr, output_ptr,
+    input_row_stride, other_row_stride, output_row_stride,
+    n_cols, n_rows,
+    BLOCK_SIZE: tl.constexpr,
+    dtype: tl.constexpr
 ):
-    pid = tl.program_id(0)
-    block_start = pid * BLOCK
-    offsets = block_start + tl.arange(0, BLOCK)
-    mask = offsets < numel
+    row_idx = tl.program_id(0)
+    if row_idx >= n_rows:
+        return
     
-    # Load input
-    input_offsets = offsets
-    input = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
+    input_row_start = input_ptr + row_idx * input_row_stride
+    other_row_start = other_ptr + row_idx * other_row_stride
+    output_row_start = output_ptr + row_idx * output_row_stride
+    
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    row_mask = col_offsets < n_cols
+    
+    input_ptrs = input_row_start + col_offsets
+    other_ptrs = other_row_start + col_offsets
+    output_ptrs = output_row_start + col_offsets
+    
+    input_vals = tl.load(input_ptrs, mask=row_mask, other=0.0)
     
     # Compute softmax
-    # For numerical stability, subtract the max
-    max_val = tl.max(input, axis=0)
-    exp_input = tl.exp(input - max_val)
-    sum_exp = tl.sum(exp_input, axis=0)
-    softmax = exp_input / sum_exp
+    max_val = tl.max(input_vals, axis=0)
+    exp_vals = tl.exp(input_vals - max_val)
+    sum_exp = tl.sum(exp_vals, axis=0)
+    softmax_vals = exp_vals / sum_exp
     
-    # Load other (either tensor or scalar)
-    if is_other_tensor:
-        other_offsets = offsets
-        other = tl.load(other_ptr + other_offsets, mask=mask, other=0.0)
-    else:
-        other = tl.load(other_ptr, mask=mask, other=0.0)
+    # Multiply with other
+    other_vals = tl.load(other_ptrs, mask=row_mask, other=0.0)
+    result_vals = softmax_vals * other_vals
     
-    # Compute output
-    out = softmax * other
-    tl.store(out_ptr + input_offsets, out, mask=mask)
+    # Store result
+    tl.store(output_ptrs, result_vals, mask=row_mask)
 
 def softmax_mul(input, other, dim, dtype=None, out=None):
-    # Handle dtype casting
     if dtype is not None:
         input = input.to(dtype)
-        if torch.is_tensor(other):
-            other = other.to(dtype)
+        other = other.to(dtype)
     
-    # Handle out parameter
     if out is None:
         out = torch.empty_like(input)
-    else:
-        if out.shape != input.shape:
-            raise ValueError("out tensor must have the same shape as input")
     
-    # Handle scalar other
-    is_other_scalar = not torch.is_tensor(other)
-    if is_other_scalar:
-        other = torch.tensor(other, dtype=input.dtype, device=input.device)
+    # Ensure input and other are contiguous
+    input = input.contiguous()
+    other = other.contiguous()
     
-    # Get the size of the specified dimension
-    dim_size = input.size(dim)
-    numel = input.numel()
-    
-    # Create a block size
-    BLOCK = 256
-    
-    # Compute grid size
-    grid = (triton.cdiv(numel, BLOCK),)
-    
-    # Prepare strides
-    input_stride = input.stride()
-    other_stride = other.stride() if torch.is_tensor(other) else 0
-    out_stride = out.stride()
+    # Get dimensions
+    n_rows, n_cols = input.shape[0], input.shape[1]
     
     # Launch kernel
-    _softmax_mul_kernel[grid](
-        input, other, out,
-        input_stride[0] if len(input_stride) > 0 else 0,
-        other_stride if torch.is_tensor(other) else 0,
-        out_stride[0] if len(out_stride) > 0 else 0,
-        dim_size,
-        numel,
-        BLOCK,
-        is_other_tensor=torch.is_tensor(other)
+    BLOCK_SIZE = 1024
+    grid = (n_rows, 1, 1)
+    
+    # Determine appropriate dtype for kernel
+    if input.dtype == torch.float32:
+        triton_dtype = tl.float32
+    elif input.dtype == torch.float16:
+        triton_dtype = tl.float16
+    else:
+        triton_dtype = tl.float32
+    
+    softmax_kernel[grid](
+        input_ptr=input.data_ptr(),
+        other_ptr=other.data_ptr(),
+        output_ptr=out.data_ptr(),
+        input_row_stride=input.stride(0),
+        other_row_stride=other.stride(0),
+        output_row_stride=out.stride(0),
+        n_cols=n_cols,
+        n_rows=n_rows,
+        BLOCK_SIZE=BLOCK_SIZE,
+        dtype=triton_dtype
     )
     
     return out

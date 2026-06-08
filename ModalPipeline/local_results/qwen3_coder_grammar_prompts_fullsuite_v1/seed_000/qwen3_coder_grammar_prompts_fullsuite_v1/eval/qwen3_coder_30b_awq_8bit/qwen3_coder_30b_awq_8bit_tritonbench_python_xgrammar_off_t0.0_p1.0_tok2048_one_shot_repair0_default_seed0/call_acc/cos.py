@@ -20,8 +20,10 @@ def cos(input, *, out=None):
             raise ValueError("Output tensor must have the same shape as input tensor")
     
     n_elements = input.numel()
-    grid = (triton.cdiv(n_elements, 1024),)
-    cos_kernel[grid](input, out, n_elements, BLOCK_SIZE=1024)
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    cos_kernel[grid](input, out, n_elements, BLOCK_SIZE=BLOCK_SIZE)
     return out
 
 ##################################################################################################################################################

@@ -3,92 +3,88 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def fused_layer_norm_relu_linear_kernel(
+def _linear_relu_norm_kernel(
     input_ptr, weight_ptr, bias_ptr, output_ptr,
     input_row_stride, weight_row_stride, weight_col_stride,
     output_row_stride, output_col_stride,
-    in_features, out_features, normalized_shape,
-    eps, BLOCK_SIZE: tl.constexpr
+    n_rows, n_cols, out_features,
+    eps: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
 ):
-    # Get the row index
-    row_idx = tl.program_id(0)
+    pid = tl.program_id(0)
+    if pid >= n_rows:
+        return
     
     # Load input row
-    input_row = tl.load(input_ptr + row_idx * input_row_stride + tl.arange(0, in_features), mask=tl.arange(0, in_features) < in_features)
+    input_offsets = pid * input_row_stride + tl.arange(0, n_cols)
+    input_row = tl.load(input_ptr + input_offsets, mask=input_offsets < n_rows * input_row_stride, other=0.0)
     
     # Linear transformation
+    output_offsets = pid * output_row_stride + tl.arange(0, out_features)
     output_row = tl.zeros((out_features,), dtype=tl.float32)
-    for i in range(out_features):
-        weight_row = tl.load(weight_ptr + i * weight_row_stride + tl.arange(0, in_features), mask=tl.arange(0, in_features) < in_features)
-        output_row = tl.where(i == 0, tl.dot(input_row, weight_row), output_row + tl.dot(input_row, weight_row))
+    
+    for i in range(n_cols):
+        weight_offsets = i * weight_col_stride + tl.arange(0, out_features)
+        weight_vals = tl.load(weight_ptr + weight_offsets, mask=weight_offsets < weight_row_stride * weight_col_stride, other=0.0)
+        output_row += input_row[i] * weight_vals
     
     # Add bias
     if bias_ptr is not None:
-        bias_row = tl.load(bias_ptr + tl.arange(0, out_features), mask=tl.arange(0, out_features) < out_features)
-        output_row = output_row + bias_row
+        bias_offsets = tl.arange(0, out_features)
+        bias_vals = tl.load(bias_ptr + bias_offsets, mask=bias_offsets < out_features, other=0.0)
+        output_row += bias_vals
     
-    # ReLU activation
+    # Apply ReLU
     output_row = tl.where(output_row > 0, output_row, 0.0)
     
     # Layer normalization
-    if normalized_shape > 0:
-        # Compute mean and variance
-        mean = tl.sum(output_row) / out_features
-        var = tl.sum((output_row - mean) * (output_row - mean)) / out_features
-        # Normalize
-        output_row = (output_row - mean) / tl.sqrt(var + eps)
+    # Compute mean and variance
+    mean = tl.sum(output_row) / out_features
+    var = tl.sum((output_row - mean) * (output_row - mean)) / out_features
+    
+    # Normalize
+    normalized = (output_row - mean) / tl.sqrt(var + eps)
     
     # Store result
-    tl.store(output_ptr + row_idx * output_row_stride + tl.arange(0, out_features), output_row, mask=tl.arange(0, out_features) < out_features)
+    tl.store(output_ptr + output_offsets, normalized, mask=output_offsets < n_rows * output_row_stride)
 
-def fused_layer_norm_relu_linear(input: torch.Tensor, weight: torch.Tensor, bias=None, normalized_shape=None, eps=1e-5, elementwise_affine=True):
-    # Validate input dimensions
-    assert input.dim() >= 2, "Input tensor must have at least 2 dimensions"
-    assert weight.dim() == 2, "Weight tensor must be 2-dimensional"
-    assert weight.shape[1] == input.shape[-1], "Weight column count must match input feature count"
-    
-    # Handle bias
-    if bias is not None:
-        assert bias.shape[0] == weight.shape[0], "Bias length must match weight row count"
-    
+def fused_layer_norm_relu_linear(input, weight, bias=None, normalized_shape=None, eps=1e-5, elementwise_affine=True):
     # Handle normalized_shape
     if normalized_shape is None:
         normalized_shape = weight.shape[0]
-    elif isinstance(normalized_shape, (list, tuple)):
-        normalized_shape = normalized_shape[-1] if len(normalized_shape) > 0 else weight.shape[0]
+    if isinstance(normalized_shape, int):
+        normalized_shape = [normalized_shape]
+    
+    # Validate input dimensions
+    assert input.shape[-1] == weight.shape[1], "Input feature dimension must match weight dimension"
+    assert weight.shape[0] == len(normalized_shape), "Output features must match normalized shape"
+    
+    # Handle bias
+    if bias is not None:
+        assert bias.shape[0] == weight.shape[0], "Bias shape must match weight output dimension"
+    else:
+        bias = torch.zeros(weight.shape[0], device=weight.device, dtype=weight.dtype)
     
     # Prepare output tensor
-    output_shape = list(input.shape[:-1]) + [weight.shape[0]]
-    output = torch.empty(output_shape, dtype=torch.float32, device=input.device)
+    out = torch.empty(input.shape[:-1] + (weight.shape[0],), device=input.device, dtype=input.dtype)
     
     # Get dimensions
-    batch_size = input.numel() // input.shape[-1]
-    in_features = input.shape[-1]
+    n_rows = input.numel() // input.shape[-1]
+    n_cols = input.shape[-1]
     out_features = weight.shape[0]
     
+    # Set up kernel launch parameters
+    BLOCK_SIZE = 256
+    grid = (triton.cdiv(n_rows, BLOCK_SIZE),)
+    
     # Launch kernel
-    grid = (batch_size,)
-    BLOCK_SIZE = 1024
-    
-    # Ensure we have enough threads for the operation
-    if out_features > BLOCK_SIZE:
-        BLOCK_SIZE = out_features
-    
-    fused_layer_norm_relu_linear_kernel[grid](
-        input_ptr=input.data_ptr(),
-        weight_ptr=weight.data_ptr(),
-        bias_ptr=bias.data_ptr() if bias is not None else None,
-        output_ptr=output.data_ptr(),
-        input_row_stride=in_features,
-        weight_row_stride=weight.shape[1],
-        weight_col_stride=1,
-        output_row_stride=out_features,
-        output_col_stride=1,
-        in_features=in_features,
-        out_features=out_features,
-        normalized_shape=normalized_shape,
-        eps=eps,
-        BLOCK_SIZE=BLOCK_SIZE
+    _linear_relu_norm_kernel[grid](
+        input, weight, bias, out,
+        input.stride(0), weight.stride(0), weight.stride(1),
+        out.stride(0), out.stride(1),
+        n_rows, n_cols, out_features,
+        eps,
+        BLOCK_SIZE
     )
     
-    return output
+    return out

@@ -2,6 +2,7 @@
 import torch
 import triton
 import triton.language as tl
+from typing import Tuple, Optional, Union
 
 @triton.jit
 def _relu_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
@@ -23,46 +24,63 @@ def _fractional_max_pool2d_kernel(
     output_width,
     kernel_height, 
     kernel_width,
-    BLOCK_H: tl.constexpr, 
-    BLOCK_W: tl.constexpr
+    BLOCK: tl.constexpr
 ):
     pid_h = tl.program_id(0)
     pid_w = tl.program_id(1)
     
     if pid_h >= output_height or pid_w >= output_width:
         return
-        
+    
     # Calculate the start position in the input tensor
     start_h = pid_h * kernel_height
     start_w = pid_w * kernel_width
     
-    # Load the pooling window
+    # Calculate the actual pooling window size (may be smaller at the edges)
+    actual_h = tl.minimum(kernel_height, input_height - start_h)
+    actual_w = tl.minimum(kernel_width, input_width - start_w)
+    
+    # Initialize max value and index
     max_val = tl.full([1], -float('inf'), dtype=tl.float32)
     max_idx = tl.full([1], 0, dtype=tl.int32)
     
-    for h in range(kernel_height):
-        for w in range(kernel_width):
-            input_h = start_h + h
-            input_w = start_w + w
-            if input_h < input_height and input_w < input_width:
-                val = tl.load(input_ptr + input_h * input_width + input_w)
-                idx = input_h * input_width + input_w
-                if val > max_val:
-                    max_val = val
-                    max_idx = idx
+    # Perform max pooling within the window
+    for h in range(actual_h):
+        for w in range(actual_w):
+            input_idx = (start_h + h) * input_width + (start_w + w)
+            val = tl.load(input_ptr + input_idx)
+            # Update max if current value is greater
+            if val > max_val:
+                max_val = val
+                max_idx = input_idx
     
-    # Store the result
+    # Store output and indices
     output_idx = pid_h * output_width + pid_w
     tl.store(output_ptr + output_idx, max_val)
     if indices_ptr is not None:
         tl.store(indices_ptr + output_idx, max_idx)
 
-def fused_fractional_max_pool2d_with_relu(input: torch.Tensor, kernel_size, output_size=None, output_ratio=None, return_indices=False) -> torch.Tensor:
+def fused_fractional_max_pool2d_with_relu(
+    input: torch.Tensor, 
+    kernel_size: Union[int, Tuple[int, int]], 
+    output_size: Optional[Tuple[int, int]] = None, 
+    output_ratio: Optional[Tuple[float, float]] = None, 
+    return_indices: bool = False
+) -> torch.Tensor:
     # Handle input tensor
     if input.dim() != 4:
-        raise ValueError("Input tensor must be 4D (N, C, H, W)")
+        raise ValueError("Input tensor must be 4-dimensional (N, C, H, W)")
     
     N, C, H, W = input.shape
+    input_flat = input.view(-1)
+    
+    # Apply ReLU
+    relu_out = torch.empty_like(input_flat)
+    n = input_flat.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _relu_kernel[grid](input_flat, relu_out, n, BLOCK=block)
+    relu_out = relu_out.view(N, C, H, W)
     
     # Handle kernel size
     if isinstance(kernel_size, int):
@@ -80,32 +98,22 @@ def fused_fractional_max_pool2d_with_relu(input: torch.Tensor, kernel_size, outp
         output_width = int(W * ratio_w)
     else:
         # Default: use kernel size to determine output size
-        output_height = H // kernel_height
-        output_width = W // kernel_width
+        output_height = (H + kernel_height - 1) // kernel_height
+        output_width = (W + kernel_width - 1) // kernel_width
     
-    # Apply ReLU
-    relu_input = torch.empty_like(input)
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    _relu_kernel[grid](input, relu_input, n, BLOCK=block)
-    
-    # Prepare output tensors
+    # Create output tensor
     output = torch.empty(N, C, output_height, output_width, device=input.device, dtype=input.dtype)
     
+    # Create indices tensor if needed
+    indices = None
     if return_indices:
         indices = torch.empty(N, C, output_height, output_width, device=input.device, dtype=torch.int32)
-    else:
-        indices = None
     
-    # Apply fractional max pooling
+    # Perform fractional max pooling
     if output_height > 0 and output_width > 0:
-        grid_h = triton.cdiv(output_height, 16)
-        grid_w = triton.cdiv(output_width, 16)
-        grid = (grid_h, grid_w)
-        
+        grid = (triton.cdiv(output_height, 16), triton.cdiv(output_width, 16))
         _fractional_max_pool2d_kernel[grid](
-            relu_input,
+            relu_out,
             output,
             indices,
             H,
@@ -114,8 +122,7 @@ def fused_fractional_max_pool2d_with_relu(input: torch.Tensor, kernel_size, outp
             output_width,
             kernel_height,
             kernel_width,
-            BLOCK_H=16,
-            BLOCK_W=16
+            BLOCK=256
         )
     
     if return_indices:

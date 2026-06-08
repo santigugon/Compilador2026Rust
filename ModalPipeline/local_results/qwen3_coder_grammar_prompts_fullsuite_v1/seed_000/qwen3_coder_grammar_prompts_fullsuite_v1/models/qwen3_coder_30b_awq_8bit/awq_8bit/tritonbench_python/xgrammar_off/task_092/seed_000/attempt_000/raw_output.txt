@@ -4,31 +4,24 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _rsqrt_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+def _rsqrt_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask)
-    y = tl.rsqrt(x)
-    tl.store(y_ptr + offsets, y, mask=mask)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = 1.0 / tl.sqrt(x)
+    tl.store(out_ptr + offsets, y, mask=mask)
 
 def tensordot_rsqrt(a: torch.Tensor, b: torch.Tensor, dims) -> torch.Tensor:
-    # Compute tensordot product
-    tensordot_result = torch.tensordot(a, b, dims=dims)
+    # Compute the tensordot product
+    tensordot_result = torch.tensordot(a, b, dims)
     
-    # Apply reciprocal square root using Triton
-    output = torch.empty_like(tensordot_result)
-    n_elements = tensordot_result.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    # Apply reciprocal square root element-wise
+    out = torch.empty_like(tensordot_result)
+    n = tensordot_result.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
     
-    _rsqrt_kernel[grid](
-        tensordot_result,
-        output,
-        n_elements,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    
-    return output
+    _rsqrt_kernel[grid](tensordot_result, out, n, BLOCK=block)
+    return out
 ```

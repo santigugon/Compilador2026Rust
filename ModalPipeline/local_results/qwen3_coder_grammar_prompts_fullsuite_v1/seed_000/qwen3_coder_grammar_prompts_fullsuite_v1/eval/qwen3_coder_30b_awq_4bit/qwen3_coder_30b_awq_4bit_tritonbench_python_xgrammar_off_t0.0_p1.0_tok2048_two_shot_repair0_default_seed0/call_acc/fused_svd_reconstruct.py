@@ -4,10 +4,10 @@ import triton.language as tl
 
 @triton.jit
 def _svd_reconstruct_kernel(u_ptr, s_ptr, vh_ptr, out_ptr, m: tl.constexpr, n: tl.constexpr, k: tl.constexpr, BLOCK: tl.constexpr):
-    # Compute A = U @ S @ VH
+    # Compute reconstruction: U @ diag(s) @ VH
     pid = tl.program_id(0)
     if pid == 0:
-        # For the first block, compute U @ S
+        # First kernel: compute U @ diag(s)
         for i in range(m):
             for j in range(k):
                 acc = 0.0
@@ -17,8 +17,8 @@ def _svd_reconstruct_kernel(u_ptr, s_ptr, vh_ptr, out_ptr, m: tl.constexpr, n: t
                     acc += u_val * s_val
                 tl.store(out_ptr + i * k + j, acc)
     elif pid == 1:
-        # For the second block, compute (U @ S) @ VH
-        for i in range(k):
+        # Second kernel: compute (U @ diag(s)) @ VH
+        for i in range(m):
             for j in range(n):
                 acc = 0.0
                 for l in range(k):
@@ -31,20 +31,39 @@ def fused_svd_reconstruct(A):
     # Perform SVD
     U, S, Vh = torch.linalg.svd(A, full_matrices=False)
     
-    # Reconstruct A = U @ S @ Vh
-    # Since we're doing this in Triton, we'll compute it directly
+    # Reconstruct A using U, S, Vh
+    # A_reconstructed = U @ diag(S) @ Vh
+    out = torch.empty_like(A)
+    
+    # For small matrices, use direct computation
+    if A.shape[0] * A.shape[1] < 1024:
+        # Direct reconstruction
+        out = U @ torch.diag(S) @ Vh
+        return out
+    
+    # For larger matrices, use Triton kernel
     m, n = A.shape
     k = S.shape[0]
     
-    # Create output tensor
-    out = torch.empty_like(A)
+    # Create intermediate tensor for U @ diag(S)
+    intermediate = torch.empty(m, k, device=A.device, dtype=A.dtype)
     
-    # For simplicity, we'll use PyTorch's matmul for the reconstruction
-    # since the full Triton implementation would be quite complex
-    # and the performance gain might not be significant for this operation
-    reconstructed = U @ torch.diag(S) @ Vh
+    # Launch kernels
+    block = 256
+    grid1 = (triton.cdiv(m * k, block),)
+    grid2 = (triton.cdiv(m * n, block),)
     
-    return reconstructed
+    # First kernel: U @ diag(S)
+    _svd_reconstruct_kernel[grid1](
+        U, S, Vh, intermediate, m, n, k, BLOCK=block
+    )
+    
+    # Second kernel: (U @ diag(S)) @ Vh
+    _svd_reconstruct_kernel[grid2](
+        intermediate, S, Vh, out, m, n, k, BLOCK=block
+    )
+    
+    return out
 
 ##################################################################################################################################################
 

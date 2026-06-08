@@ -4,88 +4,106 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def min_kernel(
-    input_ptr, 
-    output_ptr, 
-    indices_ptr,
-    n_rows, 
-    n_cols,
-    BLOCK_SIZE: tl.constexpr
-):
+def _min_kernel(x_ptr, out_ptr, indices_ptr, n_rows, n_cols, dim: tl.constexpr, keepdim: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     row_id = tl.program_id(0)
+    
     if row_id >= n_rows:
         return
     
-    # Initialize min and index
-    min_val = tl.full([1], float('inf'), dtype=tl.float32)
-    min_idx = tl.full([1], 0, dtype=tl.int32)
+    # Load the row data
+    row_offsets = row_id * n_cols
+    row_ptr = x_ptr + row_offsets
     
-    # Load data in chunks
-    for col_start in range(0, n_cols, BLOCK_SIZE):
-        cols = tl.arange(0, BLOCK_SIZE)
-        mask = (cols + col_start) < n_cols
-        data = tl.load(input_ptr + row_id * n_cols + cols + col_start, mask=mask, other=float('inf'))
+    # Initialize min value and index
+    min_val = tl.full([1], float('inf'), dtype=tl.float32)
+    min_idx = tl.full([1], 0, dtype=tl.int64)
+    
+    # Iterate through columns to find minimum
+    for col in range(0, n_cols, BLOCK_SIZE):
+        col_offsets = col + tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < n_cols
         
-        # Find min in this chunk
-        chunk_min = tl.min(data)
-        chunk_min_idx = tl.argmin(data)
+        # Load values
+        values = tl.load(row_ptr + col_offsets, mask=mask, other=float('inf'))
         
-        # Update global min
-        if chunk_min < min_val:
-            min_val = chunk_min
-            min_idx = chunk_min_idx + col_start
+        # Find minimum in this block
+        block_min = tl.min(values)
+        block_min_idx = tl.argmin(values)
+        
+        # Update global minimum
+        if block_min < min_val:
+            min_val = block_min
+            min_idx = col_offsets[block_min_idx]
     
     # Store results
-    tl.store(output_ptr + row_id, min_val)
-    tl.store(indices_ptr + row_id, min_idx)
+    if keepdim:
+        out_ptr[row_id] = min_val
+        indices_ptr[row_id] = min_idx
+    else:
+        out_ptr[row_id] = min_val
+        indices_ptr[row_id] = min_idx
 
 def min(input, dim, keepdim=False, *, out=None):
+    # Handle negative dimension
     if dim < 0:
         dim = input.dim() + dim
     
-    if dim >= input.dim():
-        raise ValueError("dim out of range")
+    # Validate dimension
+    if dim < 0 or dim >= input.dim():
+        raise ValueError(f"Dimension {dim} is out of range for tensor with {input.dim()} dimensions")
     
-    # Get input shape
-    shape = input.shape
-    n_rows = 1
-    n_cols = shape[dim]
+    # Get output shape
+    input_shape = input.shape
+    output_shape = list(input_shape)
     
-    # Calculate number of rows (product of all dimensions except dim)
-    for i in range(input.dim()):
-        if i != dim:
-            n_rows *= shape[i]
+    if keepdim:
+        output_shape[dim] = 1
+    else:
+        output_shape.pop(dim)
     
     # Create output tensors
     if out is not None:
-        output, indices = out
+        min_out, indices_out = out
+        if min_out.shape != tuple(output_shape):
+            raise ValueError(f"Output tensor min_out has shape {min_out.shape}, expected {tuple(output_shape)}")
+        if indices_out.shape != tuple(output_shape):
+            raise ValueError(f"Output tensor indices_out has shape {indices_out.shape}, expected {tuple(output_shape)}")
     else:
-        output = torch.empty(n_rows, dtype=torch.float32, device=input.device)
-        indices = torch.empty(n_rows, dtype=torch.int64, device=input.device)
+        min_out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+        indices_out = torch.empty(output_shape, dtype=torch.long, device=input.device)
+    
+    # Handle scalar case
+    if input.numel() == 0:
+        return min_out, indices_out
+    
+    # Get dimensions
+    n_rows = 1
+    n_cols = 1
+    
+    # Calculate number of rows and columns
+    for i in range(input.dim()):
+        if i == dim:
+            n_cols = input.shape[i]
+        else:
+            n_rows *= input.shape[i]
     
     # Launch kernel
-    BLOCK_SIZE = 1024
-    grid_size = (n_rows + BLOCK_SIZE - 1) // BLOCK_SIZE
+    block_size = 256
+    grid_size = triton.cdiv(n_rows, block_size)
     
-    min_kernel[grid_size](
-        input_ptr=input.data_ptr(),
-        output_ptr=output.data_ptr(),
-        indices_ptr=indices.data_ptr(),
-        n_rows=n_rows,
-        n_cols=n_cols,
-        BLOCK_SIZE=BLOCK_SIZE
+    # Ensure we're working with contiguous tensors
+    input_contiguous = input.contiguous()
+    
+    _min_kernel[grid_size](
+        input_contiguous,
+        min_out,
+        indices_out,
+        n_rows,
+        n_cols,
+        dim,
+        keepdim,
+        BLOCK_SIZE=block_size
     )
     
-    # Reshape outputs if needed
-    if keepdim:
-        new_shape = list(shape)
-        new_shape[dim] = 1
-        output = output.view(new_shape)
-        indices = indices.view(new_shape)
-    else:
-        new_shape = [s for i, s in enumerate(shape) if i != dim]
-        output = output.view(new_shape)
-        indices = indices.view(new_shape)
-    
-    return output, indices
+    return min_out, indices_out
 ```

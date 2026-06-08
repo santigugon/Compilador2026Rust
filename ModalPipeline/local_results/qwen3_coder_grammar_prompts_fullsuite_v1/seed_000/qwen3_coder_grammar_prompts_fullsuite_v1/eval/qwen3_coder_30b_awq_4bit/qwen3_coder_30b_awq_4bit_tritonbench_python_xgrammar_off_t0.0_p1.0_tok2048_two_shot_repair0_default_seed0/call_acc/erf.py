@@ -18,12 +18,13 @@ def _erf_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     a5 = 1.061405429
     p = 0.3275911
     
-    # Apply error function approximation
+    # Apply the approximation
     sign = tl.where(x >= 0, 1.0, -1.0)
-    x_abs = tl.abs(x)
-    t = 1.0 / (1.0 + p * x_abs)
-    y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * tl.exp(-x_abs * x_abs)
+    x = tl.abs(x)
+    t = 1.0 / (1.0 + p * x)
+    y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * tl.exp(-x * x)
     
+    # Apply sign and return
     erf_x = sign * y
     tl.store(out_ptr + offsets, erf_x, mask=mask)
 
@@ -31,13 +32,12 @@ def erf(input, *, out=None):
     if out is None:
         out = torch.empty_like(input)
     else:
-        if out.shape != input.shape:
-            raise ValueError("Output tensor must have the same shape as input tensor")
+        assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
+        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input tensor"
     
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
-    
     _erf_kernel[grid](input, out, n, BLOCK=block)
     return out
 

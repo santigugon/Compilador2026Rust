@@ -1,0 +1,118 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _ifftshift_kernel(
+    input_ptr, 
+    output_ptr, 
+    n: tl.constexpr, 
+    dim_size: tl.constexpr, 
+    BLOCK: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+    
+    # For ifftshift, we need to move the zero frequency component back
+    # This is equivalent to shifting by -dim_size//2
+    shift = dim_size // 2
+    new_offsets = (offsets + shift) % dim_size
+    tl.store(output_ptr + new_offsets, x, mask=mask)
+
+def ifftshift(input, dim=None):
+    # Handle the case where dim is None (all dimensions)
+    if dim is None:
+        # Create output tensor with same shape as input
+        out = torch.empty_like(input)
+        n = input.numel()
+        
+        # For multi-dimensional case, we need to handle each dimension
+        # For simplicity, we'll handle the case where we shift all dimensions
+        # by treating the whole tensor as a 1D array
+        block = 256
+        grid = (triton.cdiv(n, block),)
+        
+        # Flatten the input and output tensors
+        input_flat = input.flatten()
+        out_flat = out.flatten()
+        
+        # Get the total size of the tensor
+        total_size = input_flat.numel()
+        
+        # If total_size is 0, return empty tensor
+        if total_size == 0:
+            return out
+        
+        # For ifftshift, we shift by -size//2 for each dimension
+        # Since we're treating the whole tensor as 1D, we shift by -total_size//2
+        _ifftshift_kernel[grid](input_flat, out_flat, total_size, total_size, BLOCK=block)
+        return out
+    
+    # Handle specific dimensions
+    else:
+        # Convert dim to list if it's a single integer
+        if isinstance(dim, int):
+            dim = [dim]
+        
+        # Create output tensor with same shape as input
+        out = torch.empty_like(input)
+        
+        # For each dimension, we need to shift it
+        # We'll process each dimension separately
+        input_copy = input.clone()
+        
+        for d in dim:
+            # Get the size of the dimension
+            dim_size = input.shape[d]
+            if dim_size == 0:
+                continue
+                
+            # Create a temporary tensor for the shifted dimension
+            temp = torch.empty_like(input_copy)
+            
+            # For ifftshift, we shift by -dim_size//2
+            shift = dim_size // 2
+            
+            # Create slice indices for the current dimension
+            slices = [slice(None)] * input.ndim
+            slices[d] = slice(shift, None)
+            temp[tuple(slices)] = input_copy[tuple(slices)]
+            
+            slices[d] = slice(None, shift)
+            temp[tuple(slices)] = input_copy[tuple(slices)]
+            
+            input_copy = temp
+            
+        # Copy the result to output
+        out = input_copy
+        return out
+
+##################################################################################################################################################
+
+
+
+import torch
+
+def test_ifftshift():
+    results = {}
+
+    # Test case 1: 1D tensor, default dim
+    input_tensor_1d = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], device='cuda')
+    results["test_case_1"] = ifftshift(input_tensor_1d)
+
+    # Test case 2: 2D tensor, default dim
+    input_tensor_2d = torch.tensor([[0, 1, 2], [3, 4, 5], [6, 7, 8]], device='cuda')
+    results["test_case_2"] = ifftshift(input_tensor_2d)
+
+    # Test case 3: 2D tensor, specific dim
+    results["test_case_3"] = ifftshift(input_tensor_2d, dim=0)
+
+    # Test case 4: 3D tensor, specific dim
+    input_tensor_3d = torch.tensor([[[0, 1], [2, 3]], [[4, 5], [6, 7]]], device='cuda')
+    results["test_case_4"] = ifftshift(input_tensor_3d, dim=(1, 2))
+
+    return results
+
+test_results = test_ifftshift()

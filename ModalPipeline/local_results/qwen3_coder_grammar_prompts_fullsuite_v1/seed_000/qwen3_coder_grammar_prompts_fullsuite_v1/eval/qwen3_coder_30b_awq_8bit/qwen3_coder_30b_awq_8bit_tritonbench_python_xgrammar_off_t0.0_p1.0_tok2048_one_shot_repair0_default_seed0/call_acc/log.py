@@ -18,7 +18,12 @@ def log(input, *, out=None):
     
     n_elements = input.numel()
     grid = (triton.cdiv(n_elements, 1024),)
-    log_kernel[grid](input, out, n_elements, BLOCK_SIZE=1024)
+    log_kernel[grid](
+        input,
+        out,
+        n_elements,
+        BLOCK_SIZE=1024
+    )
     return out
 
 ##################################################################################################################################################

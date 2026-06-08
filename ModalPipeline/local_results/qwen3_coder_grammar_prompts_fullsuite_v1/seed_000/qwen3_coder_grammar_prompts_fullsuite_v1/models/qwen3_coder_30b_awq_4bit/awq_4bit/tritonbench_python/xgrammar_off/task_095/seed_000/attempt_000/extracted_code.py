@@ -3,73 +3,101 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _batch_norm_kernel(x_ptr, weight_ptr, bias_ptr, mean_ptr, var_ptr, out_ptr, 
-                       batch_size: tl.constexpr, channels: tl.constexpr, 
-                       eps: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    batch_idx = pid // channels
-    channel_idx = pid % channels
+def batch_norm_kernel(
+    input_ptr, 
+    output_ptr, 
+    mean_ptr, 
+    var_ptr, 
+    weight_ptr, 
+    bias_ptr,
+    batch_size, 
+    channels, 
+    height, 
+    width,
+    training,
+    momentum,
+    eps,
+    BLOCK_SIZE,
+    CHANNELS_PER_BLOCK
+):
+    # Get the block index
+    block_idx = tl.program_id(0)
     
-    if batch_idx >= batch_size or channel_idx >= channels:
-        return
+    # Calculate the starting channel for this block
+    start_channel = block_idx * CHANNELS_PER_BLOCK
     
-    # Load data
-    x = tl.load(x_ptr + batch_idx * channels + channel_idx)
-    mean = tl.load(mean_ptr + channel_idx)
-    var = tl.load(var_ptr + channel_idx)
-    weight = tl.load(weight_ptr + channel_idx) if weight_ptr is not None else 1.0
-    bias = tl.load(bias_ptr + channel_idx) if bias_ptr is not None else 0.0
+    # Load mean and variance for this block of channels
+    mean = tl.load(mean_ptr + tl.arange(0, CHANNELS_PER_BLOCK) + start_channel)
+    var = tl.load(var_ptr + tl.arange(0, CHANNELS_PER_BLOCK) + start_channel)
     
-    # Normalize and apply affine transform
-    normalized = (x - mean) / tl.sqrt(var + eps)
-    out = normalized * weight + bias
+    # Load weight and bias if they exist
+    weight = None
+    bias = None
+    if weight_ptr is not None:
+        weight = tl.load(weight_ptr + tl.arange(0, CHANNELS_PER_BLOCK) + start_channel)
+    if bias_ptr is not None:
+        bias = tl.load(bias_ptr + tl.arange(0, CHANNELS_PER_BLOCK) + start_channel)
     
-    # Store result
-    tl.store(out_ptr + batch_idx * channels + channel_idx, out)
+    # Loop over batch and spatial dimensions
+    for batch in range(batch_size):
+        for h in range(height):
+            for w in range(width):
+                # Calculate the input index
+                input_idx = batch * channels * height * width + tl.arange(0, CHANNELS_PER_BLOCK) + start_channel
+                input_idx = input_idx + h * width * channels + w * channels
+                
+                # Load input data
+                input_data = tl.load(input_ptr + input_idx)
+                
+                # Normalize
+                normalized = (input_data - mean) / tl.sqrt(var + eps)
+                
+                # Scale and shift if weight and bias exist
+                if weight is not None:
+                    normalized = normalized * weight
+                if bias is not None:
+                    normalized = normalized + bias
+                
+                # Store output
+                output_idx = batch * channels * height * width + tl.arange(0, CHANNELS_PER_BLOCK) + start_channel
+                output_idx = output_idx + h * width * channels + w * channels
+                tl.store(output_ptr + output_idx, normalized)
 
-def batch_norm(input, running_mean, running_var, weight=None, bias=None, training=False, momentum=0.1, eps=1e-05):
-    # Handle scalar inputs
-    if not torch.is_tensor(input):
-        input = torch.tensor(input)
-    if not torch.is_tensor(running_mean):
-        running_mean = torch.tensor(running_mean)
-    if not torch.is_tensor(running_var):
-        running_var = torch.tensor(running_var)
-    if weight is not None and not torch.is_tensor(weight):
-        weight = torch.tensor(weight)
-    if bias is not None and not torch.is_tensor(bias):
-        bias = torch.tensor(bias)
+def batch_norm(input, running_mean, running_var, weight=None, bias=None, training=False, momentum=0.1, eps=1e-05) -> torch.Tensor:
+    # Ensure input is contiguous
+    input = input.contiguous()
+    
+    # Get input dimensions
+    batch_size, channels, height, width = input.shape
     
     # Create output tensor
-    out = torch.empty_like(input)
+    output = torch.empty_like(input)
     
-    # Get dimensions
-    batch_size = input.size(0)
-    channels = input.size(1)
+    # Define block size and channels per block
+    BLOCK_SIZE = 256
+    CHANNELS_PER_BLOCK = 32
     
-    # Handle training mode - for simplicity, we'll use the running stats
-    # In a full implementation, we'd compute batch statistics
-    if training:
-        # For this simplified version, we'll just use the running stats
-        # In a real implementation, we'd compute batch mean and var
-        pass
+    # Calculate number of blocks needed
+    num_blocks = (channels + CHANNELS_PER_BLOCK - 1) // CHANNELS_PER_BLOCK
     
     # Launch kernel
-    block = 256
-    grid = (triton.cdiv(batch_size * channels, block),)
-    
-    # Prepare pointers
-    x_ptr = input.data_ptr()
-    out_ptr = out.data_ptr()
-    mean_ptr = running_mean.data_ptr()
-    var_ptr = running_var.data_ptr()
-    weight_ptr = weight.data_ptr() if weight is not None else None
-    bias_ptr = bias.data_ptr() if bias is not None else None
-    
-    # Launch kernel
-    _batch_norm_kernel[grid](
-        x_ptr, weight_ptr, bias_ptr, mean_ptr, var_ptr, out_ptr,
-        batch_size, channels, eps, BLOCK=block
+    grid = (num_blocks,)
+    batch_norm_kernel[grid](
+        input_ptr=input,
+        output_ptr=output,
+        mean_ptr=running_mean,
+        var_ptr=running_var,
+        weight_ptr=weight,
+        bias_ptr=bias,
+        batch_size=batch_size,
+        channels=channels,
+        height=height,
+        width=width,
+        training=training,
+        momentum=momentum,
+        eps=eps,
+        BLOCK_SIZE=BLOCK_SIZE,
+        CHANNELS_PER_BLOCK=CHANNELS_PER_BLOCK
     )
     
-    return out
+    return output

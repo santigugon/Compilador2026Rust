@@ -9,103 +9,105 @@ def _matmul_kernel(
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
-    ACC_TYPE: tl.constexpr
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr
 ):
     # Create block pointers for A, B, C
     pid = tl.program_id(0)
-    grid_m = (M + BLOCK_M - 1) // BLOCK_M
-    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+    pid_m = pid // GROUP_M
+    pid_n = pid % GROUP_M
     
-    # Group blocks for better performance
-    group_id = pid // GROUP_M
-    group_size = min(GROUP_M, grid_n - group_id * GROUP_M)
-    pid_m = group_id * GROUP_M + (pid % group_size)
-    pid_n = pid % group_size
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     
-    # Load A and B
-    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-    
-    # Create pointers for A and B
-    A_block_ptr = tl.make_block_ptr(
-        base=A_ptr,
-        shape=(M, K),
-        strides=(stride_am, stride_ak),
-        offsets=(0, 0),
-        block_shape=(BLOCK_M, BLOCK_K),
-        order=(0, 1)
-    )
-    B_block_ptr = tl.make_block_ptr(
-        base=B_ptr,
-        shape=(K, N),
-        strides=(stride_bk, stride_bn),
-        offsets=(0, 0),
-        block_shape=(BLOCK_K, BLOCK_N),
-        order=(0, 1)
-    )
-    
-    # Compute matrix multiplication
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    # Loop over K dimension
     for k in range(0, K, BLOCK_K):
-        # Load A and B
-        a = tl.load(A_block_ptr, mask=(offs_am[:, None] < M) & (offs_k[None, :] < K), other=0.0)
-        b = tl.load(B_block_ptr, mask=(offs_k[:, None] < K) & (offs_bn[None, :] < N), other=0.0)
+        # Load A and B with appropriate masks
+        a = tl.load(A_ptr + (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] * stride_am +
+                    (k + tl.arange(0, BLOCK_K))[None, :] * stride_ak,
+                    mask=(k + tl.arange(0, BLOCK_K))[None, :] < K)
         
-        # Compute partial dot product
-        acc += tl.dot(a, b, allow_tf32=True)
+        b = tl.load(B_ptr + (k + tl.arange(0, BLOCK_K))[:, None] * stride_bk +
+                    (pid_n * BLOCK_N + tl.arange(0, BLOCK_N))[None, :] * stride_bn,
+                    mask=(k + tl.arange(0, BLOCK_K))[:, None] < K)
         
-        # Advance block pointers
-        A_block_ptr = tl.advance(A_block_ptr, (0, BLOCK_K))
-        B_block_ptr = tl.advance(B_block_ptr, (BLOCK_K, 0))
+        # Perform matrix multiplication
+        acc += tl.dot(a, b)
     
     # Store result
-    C_block_ptr = tl.make_block_ptr(
-        base=C_ptr,
-        shape=(M, N),
-        strides=(stride_cm, stride_cn),
-        offsets=(0, 0),
-        block_shape=(BLOCK_M, BLOCK_N),
-        order=(0, 1)
-    )
-    tl.store(C_block_ptr, acc, mask=(offs_am[:, None] < M) & (offs_bn[None, :] < N))
+    c = acc.to(tl.float32)
+    tl.store(C_ptr + (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] * stride_cm +
+             (pid_n * BLOCK_N + tl.arange(0, BLOCK_N))[None, :] * stride_cn,
+             c)
 
 def matmul(input, other, *, out=None):
-    # Handle scalar inputs
-    if input.dim() == 0 or other.dim() == 0:
-        return torch.matmul(input, other, out=out)
-    
-    # Handle 1D tensors (dot product)
+    # Handle 1D case (dot product)
     if input.dim() == 1 and other.dim() == 1:
         if out is not None:
             raise ValueError("1D dot product does not support out parameter")
         return torch.dot(input, other)
     
-    # Handle 2D tensors (matrix multiplication)
+    # Handle 2D case (matrix multiplication)
     if input.dim() == 2 and other.dim() == 2:
-        if out is not None:
-            torch.mm(input, other, out=out)
-            return out
-        return torch.mm(input, other)
+        if out is None:
+            out = torch.empty(input.size(0), other.size(1), dtype=input.dtype, device=input.device)
+        else:
+            assert out.shape == (input.size(0), other.size(1)), "Output tensor has incorrect shape"
+        
+        # Determine block size and grid size
+        BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+        GROUP_M = 8
+        
+        # Calculate grid size
+        grid = (triton.cdiv(input.size(0), BLOCK_M) * triton.cdiv(other.size(1), BLOCK_N),)
+        
+        # Launch kernel
+        _matmul_kernel[grid](
+            input, other, out,
+            input.size(0), other.size(1), input.size(1),
+            input.stride(0), input.stride(1),
+            other.stride(0), other.stride(1),
+            out.stride(0), out.stride(1),
+            BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M
+        )
+        return out
     
     # Handle batched matrix multiplication
-    if input.dim() >= 2 and other.dim() >= 2:
-        # For batched operations, we can use torch's built-in implementation
-        # which handles broadcasting and other complexities
-        if out is not None:
+    if input.dim() > 2 or other.dim() > 2:
+        # Use PyTorch's built-in matmul for higher dimensional cases
+        if out is None:
+            return torch.matmul(input, other)
+        else:
             torch.matmul(input, other, out=out)
             return out
-        return torch.matmul(input, other)
     
-    # For mixed dimensions, use torch's implementation
-    if out is not None:
+    # Handle mixed 1D and 2D case (matrix-vector product)
+    if input.dim() == 2 and other.dim() == 1:
+        if out is None:
+            out = torch.empty(input.size(0), dtype=input.dtype, device=input.device)
+        else:
+            assert out.shape == (input.size(0),), "Output tensor has incorrect shape"
+        
+        # Use PyTorch's built-in matmul for matrix-vector product
         torch.matmul(input, other, out=out)
         return out
-    return torch.matmul(input, other)
+    
+    if input.dim() == 1 and other.dim() == 2:
+        if out is None:
+            out = torch.empty(other.size(1), dtype=other.dtype, device=other.device)
+        else:
+            assert out.shape == (other.size(1),), "Output tensor has incorrect shape"
+        
+        # Use PyTorch's built-in matmul for vector-matrix product
+        torch.matmul(other, input, out=out)
+        return out
+    
+    # Fallback to PyTorch for unsupported cases
+    if out is None:
+        return torch.matmul(input, other)
+    else:
+        torch.matmul(input, other, out=out)
+        return out
 
 ##################################################################################################################################################
 

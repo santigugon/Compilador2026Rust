@@ -4,62 +4,39 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def erfc_sqrt_kernel(
-    input_ptr,
-    erfc_ptr,
-    sqrt_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    input = tl.load(input_ptr + offsets, mask=mask)
+def _erfc_sqrt_kernel(x_ptr, erfc_ptr, sqrt_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     
-    # Compute erfc
-    # Using approximation for erfc: erfc(x) ≈ 1 - erf(x)
-    # For simplicity, using a basic approximation
-    # A more accurate implementation would use the full erfc computation
-    x = input
-    # Approximation for erf using rational function
-    # This is a simplified version for demonstration
-    sign = tl.where(x >= 0, 1.0, -1.0)
-    x = tl.abs(x)
-    a1 = 0.254829592
-    a2 = -0.284496736
-    a3 = 1.421413741
-    a4 = -1.453152027
-    a5 = 1.061405429
-    p = 0.3275911
-    t = 1.0 / (1.0 + p * x)
-    y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * tl.exp(-x * x)
-    erf_val = sign * y
-    erfc_val = 1.0 - erf_val
+    # Compute erfc(x) using the approximation: erfc(x) = 1 - erf(x)
+    # For numerical stability, we use the relationship with the error function
+    # erf(x) can be approximated using a series expansion or lookup tables
+    # Here we use a simple approximation for demonstration
+    # A more accurate implementation would use a proper erfc approximation
     
-    # Compute sqrt
-    sqrt_val = tl.sqrt(input)
+    # Approximation for erf(x) using rational function (simplified)
+    # This is a basic approximation; a more accurate version would use
+    # the full error function implementation
+    t = 1.0 / (1.0 + 0.5 * tl.abs(x))
+    erf_approx = 1.0 - t * tl.exp(-x * x - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))))
     
-    tl.store(erfc_ptr + offsets, erfc_val, mask=mask)
+    # erfc(x) = 1 - erf(x)
+    erfc = 1.0 - erf_approx
+    
+    # Compute sqrt(x)
+    sqrt_val = tl.sqrt(x)
+    
+    tl.store(erfc_ptr + offsets, erfc, mask=mask)
     tl.store(sqrt_ptr + offsets, sqrt_val, mask=mask)
 
 def erfc_sqrt(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    assert input.is_contiguous(), "Input tensor must be contiguous"
-    n_elements = input.numel()
-    output_erfc = torch.empty_like(input)
-    output_sqrt = torch.empty_like(input)
-    
-    # Launch kernel
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    erfc_sqrt_kernel[grid](
-        input,
-        output_erfc,
-        output_sqrt,
-        n_elements,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    
-    return output_erfc, output_sqrt
+    out_erfc = torch.empty_like(input)
+    out_sqrt = torch.empty_like(input)
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _erfc_sqrt_kernel[grid](input, out_erfc, out_sqrt, n, BLOCK=block)
+    return (out_erfc, out_sqrt)
 ```

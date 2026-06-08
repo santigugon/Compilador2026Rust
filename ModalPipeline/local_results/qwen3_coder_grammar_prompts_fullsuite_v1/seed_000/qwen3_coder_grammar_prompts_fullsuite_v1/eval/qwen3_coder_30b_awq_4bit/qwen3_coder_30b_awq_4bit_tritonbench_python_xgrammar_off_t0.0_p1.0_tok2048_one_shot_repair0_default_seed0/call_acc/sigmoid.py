@@ -20,16 +20,13 @@ def sigmoid_kernel(
 def sigmoid(input, *, out=None):
     if out is None:
         out = torch.empty_like(input)
-    else:
-        assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
-    
     n_elements = input.numel()
-    grid = (triton.cdiv(n_elements, 1024),)
+    grid = (triton.cdiv(n_elements, 256),)
     sigmoid_kernel[grid](
         input,
         out,
         n_elements,
-        BLOCK_SIZE=1024,
+        BLOCK_SIZE=256,
     )
     return out
 

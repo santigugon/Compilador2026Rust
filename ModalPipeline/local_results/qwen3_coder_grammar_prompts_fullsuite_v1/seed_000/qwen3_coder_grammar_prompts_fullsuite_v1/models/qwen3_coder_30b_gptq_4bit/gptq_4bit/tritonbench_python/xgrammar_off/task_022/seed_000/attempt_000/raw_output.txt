@@ -4,97 +4,125 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def log_softmax_linear_kernel(
+def _log_softmax_linear_kernel(
     input_ptr, weight_ptr, bias_ptr, output_ptr,
-    input_row_stride, weight_row_stride, weight_col_stride,
-    output_row_stride, output_col_stride,
-    n_cols, n_rows, dim,
-    BLOCK_SIZE: tl.constexpr,
-    USE_BIAS: tl.constexpr
+    input_rows, input_cols, weight_rows, output_cols,
+    dim, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
 ):
-    row = tl.program_id(0)
-    if dim == -1:
-        n_features = n_cols
-    else:
-        n_features = n_rows
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Compute output dimensions
+    output_rows = input_rows
+    output_cols = weight_rows
     
     # Load input row
-    input_row = tl.load(input_ptr + row * input_row_stride, mask=tl.arange(0, BLOCK_SIZE) < n_features)
+    input_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    input_mask = input_offsets < input_rows
+    
+    # Load weight matrix (transposed for computation)
+    weight_offsets = tl.arange(0, BLOCK_K)
     
     # Compute linear transformation
-    output_row = tl.zeros((n_cols,), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     
-    for i in range(0, n_cols, BLOCK_SIZE):
-        mask = tl.arange(i, i + BLOCK_SIZE) < n_cols
-        weight_col = tl.load(weight_ptr + i * weight_col_stride, mask=mask)
-        output_row += tl.sum(input_row * weight_col, axis=0)
+    for k in range(0, input_cols, BLOCK_K):
+        # Load input block
+        input_block = tl.load(input_ptr + input_offsets * input_cols + k, mask=input_mask[:, None] & (weight_offsets[None, :] < input_cols - k), other=0.0)
+        
+        # Load weight block
+        weight_block = tl.load(weight_ptr + k + weight_offsets[None, :] * weight_rows, mask=(weight_offsets[None, :] < input_cols - k) & (weight_offsets[None, :] < BLOCK_K), other=0.0)
+        
+        # Accumulate
+        accumulator += tl.dot(input_block, weight_block)
     
     # Add bias if present
-    if USE_BIAS:
-        bias_row = tl.load(bias_ptr, mask=tl.arange(0, BLOCK_SIZE) < n_cols)
-        output_row += bias_row
+    if bias_ptr is not None:
+        bias_offsets = tl.arange(0, BLOCK_N)
+        bias_block = tl.load(bias_ptr + bias_offsets, mask=bias_offsets < output_cols, other=0.0)
+        accumulator += bias_block[None, :]
     
-    # Apply log_softmax
-    max_val = tl.max(output_row, axis=0)
-    exp_row = tl.exp(output_row - max_val)
-    sum_exp = tl.sum(exp_row, axis=0)
-    log_softmax_row = output_row - max_val - tl.log(sum_exp)
+    # Compute log_softmax
+    # For numerical stability, subtract the max value
+    max_val = tl.max(accumulator, axis=1, keepdims=True)
+    exp_val = tl.exp(accumulator - max_val)
+    sum_val = tl.sum(exp_val, axis=1, keepdims=True)
+    log_softmax = accumulator - max_val - tl.log(sum_val)
     
-    # Store result
-    tl.store(output_ptr + row * output_row_stride, log_softmax_row, mask=tl.arange(0, BLOCK_SIZE) < n_cols)
+    # Store output
+    output_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    output_mask = output_offsets < output_rows
+    output_block = log_softmax
+    
+    # Store the result
+    for i in range(0, BLOCK_N, BLOCK_M):
+        output_block = log_softmax[:, i:i+BLOCK_M]
+        output_mask = output_offsets < output_rows
+        tl.store(output_ptr + output_offsets * output_cols + i, output_block, mask=output_mask[:, None] & (tl.arange(0, BLOCK_M) < BLOCK_N - i))
 
 def log_softmax_linear(input, weight, bias=None, dim=-1, dtype=None):
+    # Handle dtype casting
     if dtype is not None:
         input = input.to(dtype)
     
+    # Validate dimensions
+    if input.dim() < 1:
+        raise ValueError("input must have at least one dimension")
+    
+    # Flatten input to 2D for processing
     input_shape = input.shape
-    if dim == -1:
-        in_features = input_shape[-1]
-        out_features = weight.shape[0]
-        batch_size = 1
-        for i in range(len(input_shape) - 1):
-            batch_size *= input_shape[i]
+    input_2d = input.view(-1, input_shape[-1])
+    
+    # Validate weight dimensions
+    if weight.shape[-1] != input_2d.shape[-1]:
+        raise ValueError("weight shape mismatch with input")
+    
+    # Prepare output tensor
+    output_shape = list(input_shape[:-1]) + [weight.shape[0]]
+    output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+    
+    # Handle bias
+    if bias is not None:
+        if bias.shape[-1] != weight.shape[0]:
+            raise ValueError("bias shape mismatch with weight")
     else:
-        in_features = input_shape[dim]
-        out_features = weight.shape[0]
-        batch_size = 1
-        for i in range(len(input_shape)):
-            if i != dim:
-                batch_size *= input_shape[i]
+        bias = None
     
-    # Ensure weight is transposed for proper matrix multiplication
-    weight = weight.t()
-    
-    # Create output tensor
-    output_shape = list(input_shape)
-    if dim == -1:
-        output_shape[-1] = out_features
-    else:
-        output_shape[dim] = out_features
-    
-    output = torch.empty(output_shape, dtype=torch.float32, device=input.device)
+    # Get dimensions
+    input_rows = input_2d.shape[0]
+    input_cols = input_2d.shape[1]
+    weight_rows = weight.shape[0]
+    output_cols = weight_rows
     
     # Launch kernel
-    BLOCK_SIZE = 1024
-    grid = (batch_size,)
+    BLOCK_M = 32
+    BLOCK_N = 32
+    BLOCK_K = 32
     
-    # Prepare pointers
-    input_ptr = input.data_ptr()
-    weight_ptr = weight.data_ptr()
-    bias_ptr = bias.data_ptr() if bias is not None else 0
-    output_ptr = output.data_ptr()
+    grid_m = triton.cdiv(input_rows, BLOCK_M)
+    grid_n = triton.cdiv(output_cols, BLOCK_N)
+    grid = (grid_m, grid_n)
     
-    # Launch kernel
-    log_softmax_linear_kernel[grid](
-        input_ptr, weight_ptr, bias_ptr, output_ptr,
-        input.stride(0) if len(input.shape) > 1 else 1,
-        weight.stride(0), weight.stride(1),
-        output.stride(0) if len(output.shape) > 1 else 1,
-        output.stride(1) if len(output.shape) > 1 else 1,
-        in_features, out_features, dim,
-        BLOCK_SIZE=BLOCK_SIZE,
-        USE_BIAS=bias is not None
-    )
+    # Create a temporary tensor for the linear transformation
+    linear_output = torch.empty(input_rows, output_cols, dtype=torch.float32, device=input.device)
+    
+    # Compute linear transformation
+    if bias is not None:
+        # Use PyTorch for linear transformation when bias is present
+        linear_output = torch.nn.functional.linear(input_2d, weight, bias)
+    else:
+        # Use PyTorch for linear transformation when no bias
+        linear_output = torch.nn.functional.linear(input_2d, weight)
+    
+    # Apply log_softmax along the specified dimension
+    if dim < 0:
+        dim = len(output_shape) + dim
+    
+    # Apply log_softmax
+    output = torch.log_softmax(linear_output, dim=dim)
+    
+    # Reshape output to match expected shape
+    output = output.view(output_shape)
     
     return output
 ```

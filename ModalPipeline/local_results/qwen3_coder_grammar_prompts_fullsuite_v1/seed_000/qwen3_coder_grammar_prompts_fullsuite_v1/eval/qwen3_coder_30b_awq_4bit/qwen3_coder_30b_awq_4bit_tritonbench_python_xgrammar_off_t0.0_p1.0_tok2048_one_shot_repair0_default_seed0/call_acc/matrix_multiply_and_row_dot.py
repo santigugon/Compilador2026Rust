@@ -33,6 +33,7 @@ def matmul_kernel(
     B_ptrs = B_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
     
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
     for k in range(0, K, BLOCK_SIZE_K):
         a = tl.load(A_ptrs)
         b = tl.load(B_ptrs)
@@ -57,34 +58,30 @@ def matrix_multiply_and_row_dot(A: torch.Tensor, B: torch.Tensor, alpha: float, 
         raise ValueError("All tensors must be of type torch.float32")
     
     # Get dimensions
-    n, m = A.shape
-    m2, p = B.shape
-    n2, p2 = C.shape
+    m, k = A.shape
+    k2, n = B.shape
+    m2, n2 = C.shape
     
-    if m != m2 or n != n2 or p != p2:
+    if k != k2 or m != m2 or n != n2:
         raise ValueError("Matrix dimensions are incompatible")
     
     # Create output tensor
-    output = torch.empty(n, p, device=device, dtype=torch.float32)
+    output = torch.empty(m, n, device=device, dtype=torch.float32)
     
     # Launch kernel
-    BLOCK_SIZE_M = 64
-    BLOCK_SIZE_N = 64
-    BLOCK_SIZE_K = 32
+    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 64, 32
     GROUP_SIZE_M = 8
     
     num_warps = 4
-    num_stages = 3
+    num_stages = 2
     
-    # Compute grid size
     grid = lambda META: (
-        triton.cdiv(n, META['BLOCK_SIZE_M']) * triton.cdiv(p, META['BLOCK_SIZE_N']),
+        triton.cdiv(m, META['BLOCK_SIZE_M']) * triton.cdiv(n, META['BLOCK_SIZE_N']),
     )
     
-    # Launch kernel
     matmul_kernel[grid](
         A, B, output,
-        n, p, m,
+        m, n, k,
         A.stride(0), A.stride(1),
         B.stride(0), B.stride(1),
         output.stride(0), output.stride(1),

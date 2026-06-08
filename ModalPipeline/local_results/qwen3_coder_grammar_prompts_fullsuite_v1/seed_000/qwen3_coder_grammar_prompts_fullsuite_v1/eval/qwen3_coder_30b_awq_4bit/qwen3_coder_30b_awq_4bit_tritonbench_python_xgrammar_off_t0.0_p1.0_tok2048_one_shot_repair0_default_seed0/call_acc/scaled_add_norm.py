@@ -25,28 +25,28 @@ def reduce_sum_kernel(input_ptr, output_ptr, n, BLOCK_SIZE: tl.constexpr):
     sum_val = tl.sum(input_vals, axis=0)
     tl.store(output_ptr + pid, sum_val, mask=pid < tl.cdiv(n, BLOCK_SIZE))
 
-def scaled_add_norm(y: torch.Tensor, x: torch.Tensor, alpha: float) -> torch.Tensor:
+def scaled_add_norm(y, x, alpha):
     assert y.shape == x.shape, "y and x must have the same shape"
     n = y.numel()
     if n == 0:
         return torch.tensor(0.0, dtype=torch.float32, device=y.device)
     
-    # Allocate output tensor for squared values
-    output_sq = torch.empty(n, dtype=torch.float32, device=y.device)
+    y = y.contiguous()
+    x = x.contiguous()
     
     # Launch kernel to compute y += alpha * x and store squared values
-    BLOCK_SIZE = 1024
-    num_blocks = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
-    scaled_add_norm_kernel[(num_blocks,)](y, x, alpha, output_sq, n, BLOCK_SIZE)
+    output = torch.empty(n, dtype=torch.float32, device=y.device)
+    grid = (triton.cdiv(n, 256),)
+    scaled_add_norm_kernel[grid](y, x, alpha, output, n, BLOCK_SIZE=256)
     
-    # Compute sum of squared values
-    sum_output = torch.empty(num_blocks, dtype=torch.float32, device=y.device)
-    reduce_sum_kernel[(num_blocks,)](output_sq, sum_output, n, BLOCK_SIZE)
+    # Launch kernel to compute sum of squared values
+    sum_output = torch.empty(triton.cdiv(n, 256), dtype=torch.float32, device=y.device)
+    reduce_sum_kernel[grid](output, sum_output, n, BLOCK_SIZE=256)
     
-    # Reduce to single value
+    # Reduce to get final sum
     total_sum = sum_output.sum()
     
-    # Return 2-norm
+    # Return sqrt of sum
     return torch.sqrt(total_sum)
 
 ##################################################################################################################################################

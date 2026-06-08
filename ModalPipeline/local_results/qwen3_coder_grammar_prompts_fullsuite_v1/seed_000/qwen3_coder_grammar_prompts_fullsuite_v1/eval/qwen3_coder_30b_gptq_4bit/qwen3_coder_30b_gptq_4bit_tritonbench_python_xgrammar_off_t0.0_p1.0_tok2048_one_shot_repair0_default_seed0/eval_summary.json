@@ -1,0 +1,117 @@
+{
+  "total_predictions": 166,
+  "phase1_call_acc": {
+    "passed": 24,
+    "rate": 14.46,
+    "duration_ms": 4236668.170607001
+  },
+  "phase2_exec_acc": {
+    "passed": 24,
+    "rate": 14.46
+  },
+  "phase3_efficiency": {
+    "speedup_vs_pytorch": 1.18,
+    "raw_output_tail": "================================================================================================================================================================\nabs.json: 0.9925\nadd_mean.json: 0.9992\nargmax.json failed\nautocast.json: 0.1105\ncos_signbit.json: 1.4189\nexp_sqrt.json: 1.9125\nfused_pairwise_distance_adaptive_avg_pool2d.json: 0.7364\ngelu_conv2d.json: 0.9995\nleaky_relu.json: 0.9985\nlogit.json: 3.2455\nmatrix_power_eig.json failed\nnormalized_cosine_similarity.json: 1.5796\npseudoinverse_svd.json: 0.9648\nrad2deg_sqrt.json: 1.2238\nrelu_batch_norm_conv2d.json: 0.986\nrelu_max_pool2d_conv2d.json: 1.0142\nrelu_sqrt.json: 1.9119\nsigmoid.json: 0.9932\nsoftmax.json failed\nsoftmax_log.json: 0.9957\nsolve_and_add_scaled_vector..json: 0.9798\nsum.json: 1.0033\nsum_std.json: 0.5048\n[0.9925, 0.9992, 0.1105, 1.4189, 1.9125, 0.7364, 0.9995, 0.9985, 3.2455, 1.5796, 0.9648, 1.2238, 0.986, 1.0142, 1.9119, 0.9932, 0.9957, 0.9798, 1.0033, 0.5048]\n\nperf_results\nspeed up: 1.18\n================================================================================================================================================================\n",
+    "duration_ms": 458.0772720000823
+  },
+  "per_op": {
+    "abs.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "add_mean.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "argmax.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "autocast.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "cos_signbit.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "exp_sqrt.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_pairwise_distance_adaptive_avg_pool2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "gelu_conv2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "gelu_std.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "leaky_relu.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "logit.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "matrix_power_eig.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "normalized_cosine_similarity.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "pseudoinverse_svd.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "rad2deg_sqrt.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "relu_batch_norm_conv2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "relu_max_pool2d_conv2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "relu_sqrt.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "sigmoid.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "softmax.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "softmax_log.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "solve_and_add_scaled_vector.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "sum.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "sum_std.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    }
+  },
+  "call_acc_dir": "/results/qwen3_coder_grammar_prompts_fullsuite_v1/eval/qwen3_coder_30b_gptq_4bit/qwen3_coder_30b_gptq_4bit_tritonbench_python_xgrammar_off_t0.0_p1.0_tok2048_one_shot_repair0_default_seed0/call_acc",
+  "perf_results_dir": "/results/qwen3_coder_grammar_prompts_fullsuite_v1/eval/qwen3_coder_30b_gptq_4bit/qwen3_coder_30b_gptq_4bit_tritonbench_python_xgrammar_off_t0.0_p1.0_tok2048_one_shot_repair0_default_seed0/perf_results"
+}

@@ -9,15 +9,12 @@ def _rand_kernel(out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     # Generate random numbers using a simple linear congruential generator
-    # Using a fixed seed for reproducibility
+    # Using a fixed seed for reproducibility in the kernel
     state = offsets + 12345  # Simple seed
-    # Simple LCG parameters
-    a = 1664525
-    c = 1013904223
-    m = 2**32
-    state = (a * state + c) % m
-    # Convert to [0, 1) range
-    rand_val = state / m
+    # Simple hash to generate pseudo-random numbers
+    state = (state * 1103515245 + 12345) & 0x7fffffff
+    # Convert to float in [0, 1)
+    rand_val = (state & 0x1fffff) / 0x200000
     tl.store(out_ptr + offsets, rand_val, mask=mask)
 
 def rand(*size, generator=None, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False, pin_memory=False):

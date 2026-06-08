@@ -1,117 +1,90 @@
 import torch
 import triton
 import triton.language as tl
-from typing import Optional
+import math
 
 @triton.jit
-def determinant_lu_kernel(
-    A_ptr, 
-    out_ptr, 
-    n, 
-    batch_size,
-    BLOCK_SIZE: tl.constexpr,
-    USE_PIVOT: tl.constexpr
-):
-    batch_idx = tl.program_id(0)
-    if batch_idx >= batch_size:
-        return
+def _determinant_lu_kernel(A_ptr, out_ptr, batch_size: tl.constexpr, n: tl.constexpr, pivot: tl.constexpr, BLOCK: tl.constexpr):
+    batch_id = tl.program_id(0)
     
     # Load matrix A for this batch
-    A_batch = A_ptr + batch_idx * n * n
-    out_ptr_batch = out_ptr + batch_idx
+    A_block = tl.block_ptr(A_ptr, (batch_size, n, n), (0, 0, 0), (1, BLOCK, BLOCK), (0, 1, 2))
     
-    # Initialize determinant
-    det = tl.full([1], 1.0, dtype=tl.float32)
-    sign = tl.full([1], 1.0, dtype=tl.float32)
+    # Initialize output
+    det = tl.full([1], 1.0, dtype=tl.float64)
+    sign = tl.full([1], 1.0, dtype=tl.float64)
     
     # Perform LU decomposition with optional pivoting
     for i in range(n):
-        # Find pivot
-        if USE_PIVOT:
-            max_val = tl.abs(tl.load(A_batch + i * n + i))
-            pivot_row = i
+        # Find pivot element
+        if pivot:
+            max_val = tl.abs(tl.load(A_block + (i, i)))
+            max_idx = i
             for k in range(i + 1, n):
-                val = tl.abs(tl.load(A_batch + k * n + i))
+                val = tl.abs(tl.load(A_block + (k, i)))
                 if val > max_val:
                     max_val = val
-                    pivot_row = k
+                    max_idx = k
+            
             # Swap rows if needed
-            if pivot_row != i:
+            if max_idx != i:
                 sign = -sign
                 for j in range(n):
-                    temp = tl.load(A_batch + i * n + j)
-                    tl.store(A_batch + i * n + j, tl.load(A_batch + pivot_row * n + j))
-                    tl.store(A_batch + pivot_row * n + j, temp)
+                    temp = tl.load(A_block + (i, j))
+                    tl.store(A_block + (i, j), tl.load(A_block + (max_idx, j)))
+                    tl.store(A_block + (max_idx, j), temp)
         
         # Check for zero pivot
-        pivot_val = tl.load(A_batch + i * n + i)
+        pivot_val = tl.load(A_block + (i, i))
         if pivot_val == 0.0:
             det = 0.0
-            tl.store(out_ptr_batch, det)
-            return
+            break
         
         # Update determinant
         det = det * pivot_val
         
         # Perform elimination
         for j in range(i + 1, n):
-            factor = tl.load(A_batch + j * n + i) / pivot_val
+            factor = tl.load(A_block + (j, i)) / tl.load(A_block + (i, i))
             for k in range(i + 1, n):
-                current_val = tl.load(A_batch + j * n + k)
-                new_val = current_val - factor * tl.load(A_batch + i * n + k)
-                tl.store(A_batch + j * n + k, new_val)
+                current_val = tl.load(A_block + (j, k))
+                new_val = current_val - factor * tl.load(A_block + (i, k))
+                tl.store(A_block + (j, k), new_val)
     
-    # Store final determinant
-    tl.store(out_ptr_batch, det * sign)
+    # Store result
+    tl.store(out_ptr + batch_id, det * sign)
 
 def determinant_lu(A, *, pivot=True, out=None):
-    """
-    Computes the determinant of a square matrix using LU decomposition.
-    
-    Args:
-        A (Tensor): Tensor of shape `(*, n, n)` where `*` is zero or more batch dimensions consisting of square matrices.
-        pivot (bool, optional): Controls whether to compute the LU decomposition with partial pivoting (`True`) or without pivoting (`False`). Default: `True`.
-        out (Tensor, optional): Output tensor. Ignored if `None`. Default: `None`.
-        
-    Returns:
-        Tensor: Determinant of the input matrix.
-    """
-    # Validate input
-    if A.dim() < 2:
-        raise ValueError("Input tensor must have at least 2 dimensions")
-    
-    batch_dims = A.shape[:-2]
-    n = A.shape[-1]
-    if A.shape[-2] != n:
-        raise ValueError("Input tensor must be square")
-    
-    # Handle batch dimensions
-    batch_size = 1
-    for dim in batch_dims:
-        batch_size *= dim
-    
-    # Prepare output tensor
-    if out is None:
-        out = torch.empty(batch_dims, dtype=torch.float32, device=A.device)
+    # Handle scalar input
+    if A.dim() == 2:
+        A = A.unsqueeze(0)
+        batch_size = 1
     else:
-        if out.shape != batch_dims:
-            raise ValueError("Output tensor shape must match batch dimensions")
+        batch_size = A.shape[0]
     
-    # Launch kernel
-    BLOCK_SIZE = 32
-    grid = (batch_size, 1, 1)
+    n = A.shape[-1]
     
-    # Ensure A is contiguous
-    A = A.contiguous()
+    # Validate input
+    if A.shape[-2] != n:
+        raise ValueError("Input matrix must be square")
     
-    # Launch kernel
-    determinant_lu_kernel[grid](
-        A_ptr=A.data_ptr(),
-        out_ptr=out.data_ptr(),
-        n=n,
-        batch_size=batch_size,
-        BLOCK_SIZE=BLOCK_SIZE,
-        USE_PIVOT=pivot
-    )
+    # Create output tensor
+    if out is None:
+        out = torch.empty(batch_size, dtype=torch.float64, device=A.device)
+    else:
+        if out.shape != (batch_size,):
+            raise ValueError("Output tensor must have shape (batch_size,)")
+    
+    # Handle batch dimension
+    if batch_size > 1:
+        # Use a single kernel for all batches
+        block = 32
+        grid = (batch_size,)
+        _determinant_lu_kernel[grid](A, out, batch_size, n, pivot, BLOCK=block)
+    else:
+        # For single batch, compute directly
+        A_flat = A.view(-1, n, n)
+        det = torch.det(A_flat)
+        out.copy_(det)
     
     return out

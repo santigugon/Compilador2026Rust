@@ -3,62 +3,81 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _sub_gelu_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, alpha: tl.constexpr, approximate: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+def gelu_kernel(
+    input_ptr,
+    other_ptr,
+    alpha_ptr,
+    output_ptr,
+    approximate,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    other = tl.load(other_ptr + offsets, mask=mask)
+    alpha = tl.load(alpha_ptr)
     # Subtract other scaled by alpha from input
-    z = x - alpha * y
+    x = input - alpha * other
     # Apply GELU
-    if approximate == 0:  # 'none' mode
-        # GELU = x * Phi(x) where Phi is the standard normal CDF
-        # Approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-        sqrt_2_over_pi = 0.7978845608028654  # sqrt(2/pi)
-        term1 = 0.5 * z
-        term2 = 1.0 + tl.tanh(sqrt_2_over_pi * (z + 0.044715 * z * z * z))
-        result = term1 * term2
-    else:  # 'tanh' mode
-        # GELU approximation using tanh
-        # GELU = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-        sqrt_2_over_pi = 0.7978845608028654  # sqrt(2/pi)
-        term1 = 0.5 * z
-        term2 = 1.0 + tl.tanh(sqrt_2_over_pi * (z + 0.044715 * z * z * z))
-        result = term1 * term2
-    tl.store(out_ptr + offsets, result, mask=mask)
+    if approximate == "none":
+        # Exact GELU: x * 0.5 * (1 + erf(x / sqrt(2)))
+        sqrt2 = 1.4142135623730951
+        erf_arg = x / sqrt2
+        erf_val = tl.math.erf(erf_arg)
+        gelu_val = x * 0.5 * (1.0 + erf_val)
+    else:
+        # Approximate GELU using tanh
+        # GELU ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        pi = 3.141592653589793
+        sqrt2_over_pi = 1.4142135623730951 / pi
+        x_cubed = x * x * x
+        tanh_arg = sqrt2_over_pi * (x + 0.044715 * x_cubed)
+        tanh_val = tl.math.tanh(tanh_arg)
+        gelu_val = 0.5 * x * (1.0 + tanh_val)
+    tl.store(output_ptr + offsets, gelu_val, mask=mask)
 
-def sub_gelu(input, other, alpha=1, approximate='none', out=None):
-    # Handle scalar other
-    if not torch.is_tensor(other):
-        other = torch.tensor(other, dtype=input.dtype, device=input.device)
-    
-    # Ensure other has the same device and dtype as input
-    other = other.to(input.device, input.dtype)
-    
-    # Handle broadcasting
-    if input.shape != other.shape:
-        # Use torch's broadcasting rules
-        input, other = torch.broadcast_tensors(input, other)
-    
-    # Create output tensor
+def sub_gelu(input, other, alpha=1, approximate='none', out=None) -> torch.Tensor:
     if out is None:
         out = torch.empty_like(input)
     else:
         if out.shape != input.shape:
-            raise ValueError("Output tensor shape must match input tensor shape")
+            raise ValueError("Output tensor must have the same shape as input tensor.")
     
-    # Get total number of elements
-    n = input.numel()
+    # Ensure input and other are on the same device and have compatible dtypes
+    if not input.is_cuda:
+        raise ValueError("Input tensor must be on CUDA device.")
+    if not other.is_cuda:
+        raise ValueError("Other tensor must be on CUDA device.")
+    if input.dtype != other.dtype:
+        raise ValueError("Input and other tensors must have the same dtype.")
     
-    # Set up kernel launch parameters
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    # Prepare input tensors for kernel
+    input = input.contiguous()
+    other = other.contiguous()
+    out = out.contiguous()
     
-    # Determine approximate mode
-    approx_mode = 0 if approximate == 'none' else 1
+    # Get the number of elements
+    n_elements = input.numel()
     
     # Launch kernel
-    _sub_gelu_kernel[grid](input, other, out, n, alpha, approx_mode, BLOCK=block)
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    # Prepare alpha tensor
+    alpha_tensor = torch.tensor(alpha, dtype=torch.float32, device=input.device)
+    
+    # Launch kernel
+    gelu_kernel[grid](
+        input_ptr=input,
+        other_ptr=other,
+        alpha_ptr=alpha_tensor,
+        output_ptr=out,
+        approximate=approximate,
+        n_elements=n_elements,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
     
     return out

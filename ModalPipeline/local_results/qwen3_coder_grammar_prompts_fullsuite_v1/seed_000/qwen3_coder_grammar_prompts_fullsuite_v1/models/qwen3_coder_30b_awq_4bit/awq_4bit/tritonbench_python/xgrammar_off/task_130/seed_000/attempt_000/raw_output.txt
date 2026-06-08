@@ -2,66 +2,54 @@
 import torch
 import triton
 import triton.language as tl
-import math
+from typing import Optional, Union, Tuple, List
 
 @triton.jit
-def _rand_kernel(out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+def rand_kernel(output_ptr, size, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    
-    # Simple linear congruential generator (LCG) parameters
-    # These are standard values that provide good distribution properties
-    a = 1664525
-    c = 1013904223
-    m = 2**32
-    
-    # Initialize seed with thread index
-    seed = offsets % m
-    
-    # Generate pseudo-random numbers using LCG
-    # We use a simple approach to avoid complex operations
-    rand_vals = (a * seed + c) % m
-    # Normalize to [0, 1) range
-    normalized = rand_vals.to(tl.float32) / m.to(tl.float32)
-    
-    tl.store(out_ptr + offsets, normalized, mask=mask)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < size
+    # Simple linear congruential generator constants
+    # Using a simple approach for demonstration
+    # In practice, more sophisticated generators are used
+    seed = 12345
+    a = 1103515245
+    c = 12345
+    m = 2**31
+    # Generate pseudo-random numbers
+    # This is a simplified version - real implementation would be more complex
+    rand_val = tl.rand()  # Using Triton's built-in random function
+    tl.store(output_ptr + offsets, rand_val, mask=mask)
 
-def rand(*size, generator=None, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False, pin_memory=False):
+def rand(*size, *, generator=None, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False, pin_memory=False):
+    if device is None:
+        device = torch._C._get_default_device()
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    
     # Handle variable size arguments
     if len(size) == 1 and isinstance(size[0], (tuple, list)):
         shape = tuple(size[0])
     else:
         shape = size
     
-    # Create output tensor with specified shape
+    # Create output tensor
     if out is not None:
-        # If out is provided, use it
-        if out.shape != shape:
-            raise ValueError(f"Output tensor shape {out.shape} does not match requested shape {shape}")
-        if dtype is not None and out.dtype != dtype:
-            raise ValueError(f"Output tensor dtype {out.dtype} does not match requested dtype {dtype}")
-        if device is not None and out.device != device:
-            raise ValueError(f"Output tensor device {out.device} does not match requested device {device}")
-        result = out
+        output = out
     else:
-        # Create new tensor with specified properties
-        if dtype is None:
-            dtype = torch.get_default_dtype()
-        if device is None:
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        result = torch.empty(shape, dtype=dtype, device=device, layout=layout, requires_grad=requires_grad)
+        output = torch.empty(shape, dtype=dtype, device=device, layout=layout, requires_grad=requires_grad)
     
-    # Handle pin_memory
-    if pin_memory and device.type == 'cpu':
-        result = result.pin_memory()
+    # Calculate total elements
+    total_elements = 1
+    for dim in shape:
+        total_elements *= dim
     
-    # Fill with random numbers
-    n = result.numel()
-    if n > 0:
-        block = 256
-        grid = (triton.cdiv(n, block),)
-        _rand_kernel[grid](result, n, BLOCK=block)
+    if total_elements > 0:
+        # Launch kernel
+        BLOCK_SIZE = 256
+        num_blocks = (total_elements + BLOCK_SIZE - 1) // BLOCK_SIZE
+        rand_kernel[num_blocks](output.data_ptr(), total_elements, BLOCK_SIZE=BLOCK_SIZE)
     
-    return result
+    return output
 ```

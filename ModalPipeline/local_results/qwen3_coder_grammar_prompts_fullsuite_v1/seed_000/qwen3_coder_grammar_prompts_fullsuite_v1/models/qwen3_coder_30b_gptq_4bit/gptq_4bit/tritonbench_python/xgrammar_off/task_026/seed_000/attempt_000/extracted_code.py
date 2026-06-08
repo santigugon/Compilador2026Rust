@@ -3,104 +3,44 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def fused_tile_exp_kernel(
-    input_ptr,
-    output_ptr,
-    input_shape,
-    output_shape,
-    dims,
-    num_dims,
-    output_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
+def _tile_exp_kernel(x_ptr, out_ptr, n: tl.constexpr, tile_dims: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    block_end = min(block_start + BLOCK_SIZE, output_elements)
-    
-    for i in range(block_start, block_end):
-        # Calculate multi-dimensional index for output
-        output_idx = i
-        indices = [0] * num_dims
-        temp = output_idx
-        for j in range(num_dims - 1, -1, -1):
-            indices[j] = temp % output_shape[j]
-            temp //= output_shape[j]
-        
-        # Calculate corresponding input index
-        input_indices = [0] * num_dims
-        for j in range(num_dims):
-            input_indices[j] = indices[j] % input_shape[j]
-        
-        # Compute input index in flattened form
-        input_idx = 0
-        stride = 1
-        for j in range(num_dims - 1, -1, -1):
-            input_idx += input_indices[j] * stride
-            stride *= input_shape[j]
-        
-        # Load input value, apply exp, store result
-        input_val = tl.load(input_ptr + input_idx)
-        output_val = tl.exp(input_val)
-        tl.store(output_ptr + i, output_val)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    # Apply exponential function
+    y = tl.exp(x)
+    tl.store(out_ptr + offsets, y, mask=mask)
 
 def fused_tile_exp(input, dims, *, out=None):
-    # Validate input
-    if not isinstance(input, torch.Tensor):
-        raise TypeError("input must be a torch.Tensor")
-    if not isinstance(dims, tuple):
-        raise TypeError("dims must be a tuple of integers")
-    if not all(isinstance(d, int) for d in dims):
-        raise TypeError("dims must be a tuple of integers")
+    # Handle the case where dims has fewer dimensions than input
+    # Prepend ones to dims to match input dimensions
+    if len(dims) < input.ndim:
+        dims = (1,) * (input.ndim - len(dims)) + dims
     
-    # Prepare input tensor
-    input = input.contiguous()
-    input_shape = input.shape
-    num_dims = len(input_shape)
-    
-    # Adjust dims to match input dimensions
-    if len(dims) < num_dims:
-        dims = (1,) * (num_dims - len(dims)) + dims
-    elif len(dims) > num_dims:
-        raise ValueError("dims cannot have more elements than input dimensions")
-    
-    # Compute output shape
-    output_shape = tuple(input_shape[i] * dims[i] for i in range(num_dims))
-    output_elements = 1
-    for dim in output_shape:
-        output_elements *= dim
+    # Calculate output shape after tiling
+    output_shape = tuple(input.shape[i] * dims[i] for i in range(len(dims)))
     
     # Create output tensor
     if out is None:
         out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
     else:
+        # Verify that out has the correct shape
         if out.shape != output_shape:
-            raise ValueError("out tensor must have the same shape as the output")
+            raise ValueError(f"Output tensor shape {out.shape} does not match expected shape {output_shape}")
+    
+    # Flatten input and output tensors for processing
+    input_flat = input.flatten()
+    out_flat = out.flatten()
+    
+    # Calculate total number of elements
+    n = input_flat.numel()
+    
+    # Determine block size and grid size
+    block = 256
+    grid = (triton.cdiv(n, block),)
     
     # Launch kernel
-    BLOCK_SIZE = 1024
-    num_blocks = (output_elements + BLOCK_SIZE - 1) // BLOCK_SIZE
-    
-    # Prepare shape arrays for kernel
-    input_shape_list = list(input_shape)
-    output_shape_list = list(output_shape)
-    dims_list = list(dims)
-    
-    # Convert to device arrays
-    input_ptr = input.data_ptr()
-    output_ptr = out.data_ptr()
-    
-    # Launch kernel
-    fused_tile_exp_kernel[
-        num_blocks
-    ](
-        input_ptr,
-        output_ptr,
-        input_shape_list,
-        output_shape_list,
-        dims_list,
-        num_dims,
-        output_elements,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
+    _tile_exp_kernel[grid](input_flat, out_flat, n, BLOCK=block)
     
     return out

@@ -4,65 +4,103 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _tile_exp_kernel(x_ptr, out_ptr, x_size, out_size, dims, num_dims, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < out_size
+def tile_exp_kernel(
+    input_ptr, 
+    output_ptr, 
+    input_shape, 
+    output_shape, 
+    num_dims, 
+    tile_dims, 
+    BLOCK_SIZE
+):
+    # Compute global thread index
+    global_id = tl.program_id(0)
     
-    # Calculate the output index
-    out_idx = offsets
+    # Calculate total elements in output
+    total_elements = 1
+    for i in range(num_dims):
+        total_elements *= output_shape[i]
     
-    # Calculate the corresponding input index
-    input_idx = 0
-    temp_idx = out_idx
-    stride = 1
+    # Each thread processes one element
+    if global_id >= total_elements:
+        return
     
-    # Reverse the dims to calculate input index
+    # Convert linear index to multi-dimensional coordinates
+    coords = [0] * num_dims
+    temp_id = global_id
     for i in range(num_dims - 1, -1, -1):
-        dim_size = dims[i]
-        if i == num_dims - 1:
-            input_idx += (temp_idx % dim_size) * stride
-        else:
-            input_idx += (temp_idx % dim_size) * stride
-        temp_idx //= dim_size
-        stride *= x_size[i]
+        coords[i] = temp_id % output_shape[i]
+        temp_id //= output_shape[i]
     
-    # Load input value and compute exp
-    x = tl.load(x_ptr + input_idx, mask=mask, other=0.0)
-    y = tl.exp(x)
-    tl.store(out_ptr + offsets, y, mask=mask)
+    # Calculate corresponding input coordinates
+    input_coords = [0] * num_dims
+    for i in range(num_dims):
+        input_coords[i] = coords[i] % input_shape[i]
+    
+    # Compute linear indices
+    input_idx = 0
+    output_idx = 0
+    stride_input = 1
+    stride_output = 1
+    
+    for i in range(num_dims - 1, -1, -1):
+        input_idx += input_coords[i] * stride_input
+        output_idx += coords[i] * stride_output
+        stride_input *= input_shape[i]
+        stride_output *= output_shape[i]
+    
+    # Load input value, apply exp, and store result
+    input_val = tl.load(input_ptr + input_idx)
+    output_val = tl.exp(input_val)
+    tl.store(output_ptr + output_idx, output_val)
 
 def fused_tile_exp(input, dims, *, out=None):
-    # Handle case where dims is shorter than input dimensions
-    if len(dims) < input.dim():
-        dims = (1,) * (input.dim() - len(dims)) + tuple(dims)
+    # Validate input
+    if not isinstance(input, torch.Tensor):
+        raise TypeError("input must be a torch.Tensor")
+    if not isinstance(dims, tuple):
+        raise TypeError("dims must be a tuple")
+    
+    # Prepare input tensor for Triton
+    input = input.contiguous()
     
     # Calculate output shape
-    out_shape = tuple(input.shape[i] * dims[i] for i in range(len(dims)))
+    input_shape = input.shape
+    num_dims = len(input_shape)
+    
+    # Adjust dims to match input dimensions
+    if len(dims) < num_dims:
+        dims = (1,) * (num_dims - len(dims)) + dims
+    elif len(dims) > num_dims:
+        dims = dims[-num_dims:]
+    
+    # Calculate output shape
+    output_shape = tuple(input_shape[i] * dims[i] for i in range(num_dims))
     
     # Create output tensor
     if out is None:
-        out = torch.empty(out_shape, dtype=input.dtype, device=input.device)
+        out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
     else:
-        if out.shape != out_shape:
-            raise ValueError(f"Output tensor shape {out.shape} does not match expected shape {out_shape}")
+        if out.shape != output_shape:
+            raise ValueError("out tensor must have the same shape as the output")
     
-    # Flatten input and output for easier indexing
-    x_flat = input.contiguous().view(-1)
-    out_flat = out.contiguous().view(-1)
-    
-    # Calculate total elements
-    x_size = input.shape
-    out_size = out.numel()
+    # Prepare for Triton kernel launch
+    total_elements = 1
+    for dim in output_shape:
+        total_elements *= dim
     
     # Launch kernel
-    block = 256
-    grid = (triton.cdiv(out_size, block),)
-    
-    # Convert dims to a list for easier access in kernel
-    dims_list = list(dims)
-    
-    _tile_exp_kernel[grid](x_flat, out_flat, x_size, out_size, dims_list, len(dims_list), BLOCK=block)
+    if total_elements > 0:
+        grid_size = (total_elements + 256 - 1) // 256
+        tile_exp_kernel[grid_size](
+            input_ptr=input.data_ptr(),
+            output_ptr=out.data_ptr(),
+            input_shape=input_shape,
+            output_shape=output_shape,
+            num_dims=num_dims,
+            tile_dims=dims,
+            BLOCK_SIZE=256
+        )
     
     return out
 ```

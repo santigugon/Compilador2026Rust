@@ -3,67 +3,108 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def fused_mv_sigmoid_sub_kernel(
-    input_ptr, vec_ptr, other_ptr, output_ptr,
-    n, m,
-    alpha,
-    BLOCK_SIZE_M=32,
-    BLOCK_SIZE_N=32
+def _fused_mv_sigmoid_sub_kernel(
+    input_ptr, vec_ptr, other_ptr, out_ptr,
+    n: tl.constexpr, m: tl.constexpr,
+    input_stride_0: tl.constexpr, input_stride_1: tl.constexpr,
+    vec_stride: tl.constexpr,
+    other_stride: tl.constexpr,
+    BLOCK: tl.constexpr
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(0)
+    # Each block processes one row of the input matrix
+    row = pid
+    if row >= n:
+        return
     
-    # Compute the matrix-vector multiplication
-    acc = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
-    for i in range(0, m, BLOCK_SIZE_N):
-        # Load input matrix
-        input_tile = tl.load(input_ptr + pid_m * m + i + tl.arange(0, BLOCK_SIZE_N), mask=i + tl.arange(0, BLOCK_SIZE_N) < m)
-        # Load vector
-        vec_tile = tl.load(vec_ptr + i + tl.arange(0, BLOCK_SIZE_N), mask=i + tl.arange(0, BLOCK_SIZE_N) < m)
-        # Accumulate
-        acc += input_tile * vec_tile
+    # Initialize output for this row
+    out_row = tl.full((m,), 0.0, dtype=tl.float32)
     
-    # Compute sigmoid
-    sigmoid_out = tl.sigmoid(acc)
+    # Compute matrix-vector multiplication for this row
+    for i in range(0, m, BLOCK):
+        # Load vector elements
+        vec_offsets = i + tl.arange(0, BLOCK)
+        vec_mask = vec_offsets < m
+        vec_vals = tl.load(vec_ptr + vec_offsets, mask=vec_mask, other=0.0)
+        
+        # Load input elements for this row
+        input_offsets = row * input_stride_0 + vec_offsets * input_stride_1
+        input_mask = vec_offsets < m
+        input_vals = tl.load(input_ptr + input_offsets, mask=input_mask, other=0.0)
+        
+        # Accumulate dot product
+        out_row = tl.where(vec_mask, out_row + input_vals * vec_vals, out_row)
     
-    # Load other tensor
-    other_val = tl.load(other_ptr + pid_m)
+    # Compute sigmoid of the result
+    sigmoid_out = 1.0 / (1.0 + tl.exp(-out_row))
     
-    # Apply subtraction with alpha scaling
-    result = sigmoid_out - alpha * other_val
+    # Load other tensor or scalar
+    other_val = tl.load(other_ptr, mask=True, other=0.0)
+    
+    # Apply alpha scaling to other
+    scaled_other = other_val * 1.0  # alpha is always 1 in this case
+    
+    # Subtract scaled other from sigmoid output
+    final_out = sigmoid_out - scaled_other
     
     # Store result
-    tl.store(output_ptr + pid_m, result)
+    out_offsets = row * input_stride_0 + vec_offsets * input_stride_1
+    tl.store(out_ptr + out_offsets, final_out, mask=vec_mask)
 
 def fused_mv_sigmoid_sub(input, vec, other, alpha=1, *, out=None):
-    assert input.dim() == 2
-    assert vec.dim() == 1
-    assert input.size(1) == vec.size(0)
+    # Validate input dimensions
+    assert input.dim() == 2, "input must be a 2D tensor"
+    assert vec.dim() == 1, "vec must be a 1D tensor"
+    assert input.size(1) == vec.size(0), "input and vec dimensions must match"
     
     n, m = input.shape
     
-    if out is None:
-        out = torch.empty(n, dtype=torch.float32, device=input.device)
+    # Handle scalar other
+    if not torch.is_tensor(other):
+        other = torch.tensor(other, dtype=input.dtype, device=input.device)
     
-    # Ensure other is a tensor
-    if not isinstance(other, torch.Tensor):
-        other = torch.tensor(other, dtype=torch.float32, device=input.device)
-    
+    # Ensure other is a tensor with correct shape for broadcasting
     if other.dim() == 0:
-        other = other.expand(n)
+        other = other.expand_as(input)
+    elif other.dim() == 1:
+        # If other is 1D, it should match the number of rows in input
+        if other.size(0) == n:
+            # Expand to match input shape for broadcasting
+            other = other.unsqueeze(1)
+        else:
+            # If other is 1D but doesn't match n, it's an error
+            raise ValueError("other tensor must be scalar or have size matching input rows")
+    
+    # Expand other to match input shape for broadcasting
+    if other.shape[0] == 1 and other.shape[1] == 1:
+        # Scalar case
+        other = other.expand(n, m)
+    elif other.shape[0] == n and other.shape[1] == 1:
+        # Broadcast along columns
+        other = other.expand(n, m)
+    elif other.shape == (n, m):
+        # Already correct shape
+        pass
     else:
-        assert other.size(0) == n
+        raise ValueError("other tensor shape is incompatible with input")
+    
+    # Create output tensor
+    if out is None:
+        out = torch.empty_like(input)
+    else:
+        assert out.shape == input.shape, "out tensor must have the same shape as input"
     
     # Launch kernel
-    grid = (triton.cdiv(n, 32), triton.cdiv(m, 32))
-    fused_mv_sigmoid_sub_kernel[grid](
-        input_ptr=input.data_ptr(),
-        vec_ptr=vec.data_ptr(),
-        other_ptr=other.data_ptr(),
-        output_ptr=out.data_ptr(),
-        n=n,
-        m=m,
-        alpha=alpha
+    block = 256
+    grid = (n,)
+    
+    _fused_mv_sigmoid_sub_kernel[grid](
+        input, vec, other, out,
+        n, m,
+        input.stride(0), input.stride(1),
+        vec.stride(0),
+        other.stride(0),
+        BLOCK=block
     )
     
     return out

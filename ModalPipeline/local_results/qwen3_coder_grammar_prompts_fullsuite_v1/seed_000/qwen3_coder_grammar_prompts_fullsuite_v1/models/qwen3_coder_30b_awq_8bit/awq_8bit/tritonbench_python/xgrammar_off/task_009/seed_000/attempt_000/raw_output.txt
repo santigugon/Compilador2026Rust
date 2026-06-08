@@ -57,11 +57,10 @@ def _grid_sample_kernel(
         y = tl.where(y < 0, -y, y)
         x = tl.where(x >= input_shape3, 2 * input_shape3 - 2 - x, x)
         y = tl.where(y >= input_shape2, 2 * input_shape2 - 2 - y, y)
-        x = tl.clamp(x, 0.0, input_shape3 - 1.0)
-        y = tl.clamp(y, 0.0, input_shape2 - 1.0)
     
-    # Bilinear interpolation
+    # Perform interpolation
     if mode == "bilinear":
+        # Bilinear interpolation
         x0 = tl.floor(x).to(tl.int32)
         y0 = tl.floor(y).to(tl.int32)
         x1 = x0 + 1
@@ -76,21 +75,22 @@ def _grid_sample_kernel(
         wy = y - y0
         
         # Load four corner values
-        val00 = tl.load(input_ptr + out_c + y0 * input_shape3 + x0 * input_shape1 * input_shape2, mask=mask, other=0.0)
-        val01 = tl.load(input_ptr + out_c + y0 * input_shape3 + x1 * input_shape1 * input_shape2, mask=mask, other=0.0)
-        val10 = tl.load(input_ptr + out_c + y1 * input_shape3 + x0 * input_shape1 * input_shape2, mask=mask, other=0.0)
-        val11 = tl.load(input_ptr + out_c + y1 * input_shape3 + x1 * input_shape1 * input_shape2, mask=mask, other=0.0)
+        val00 = tl.load(input_ptr + out_c * input_shape1 * input_shape2 + y0 * input_shape3 + x0, mask=mask, other=0.0)
+        val01 = tl.load(input_ptr + out_c * input_shape1 * input_shape2 + y0 * input_shape3 + x1, mask=mask, other=0.0)
+        val10 = tl.load(input_ptr + out_c * input_shape1 * input_shape2 + y1 * input_shape3 + x0, mask=mask, other=0.0)
+        val11 = tl.load(input_ptr + out_c * input_shape1 * input_shape2 + y1 * input_shape3 + x1, mask=mask, other=0.0)
         
         # Interpolate
         val0 = val00 * (1 - wx) + val01 * wx
         val1 = val10 * (1 - wx) + val11 * wx
         result = val0 * (1 - wy) + val1 * wy
     else:  # mode == "nearest"
-        x = tl.round(x).to(tl.int32)
-        y = tl.round(y).to(tl.int32)
-        x = tl.clamp(x, 0, input_shape3 - 1)
-        y = tl.clamp(y, 0, input_shape2 - 1)
-        result = tl.load(input_ptr + out_c + y * input_shape3 + x * input_shape1 * input_shape2, mask=mask, other=0.0)
+        # Nearest neighbor interpolation
+        x_nearest = tl.round(x).to(tl.int32)
+        y_nearest = tl.round(y).to(tl.int32)
+        x_nearest = tl.clamp(x_nearest, 0, input_shape3 - 1)
+        y_nearest = tl.clamp(y_nearest, 0, input_shape2 - 1)
+        result = tl.load(input_ptr + out_c * input_shape1 * input_shape2 + y_nearest * input_shape3 + x_nearest, mask=mask, other=0.0)
     
     tl.store(output_ptr + offsets, result, mask=mask)
 
@@ -111,26 +111,26 @@ def grid_sample(input, grid, mode='bilinear', padding_mode='zeros', align_corner
     grid_height = grid.shape[1]
     grid_width = grid.shape[2]
     
+    # Validate batch size matches
     if batch_size != grid_batch_size:
         raise ValueError("input and grid must have the same batch size")
     
     # Create output tensor
     output = torch.empty(batch_size, channels, grid_height, grid_width, device=input.device, dtype=input.dtype)
     
-    # Flatten output for kernel processing
-    output_flat = output.view(-1)
-    
-    # Set up kernel launch parameters
-    block_size = 256
-    total_elements = output_flat.numel()
-    grid_size = triton.cdiv(total_elements, block_size)
-    
-    # Prepare input and grid pointers
-    input_ptr = input.data_ptr()
-    grid_ptr = grid.data_ptr()
-    output_ptr = output_flat.data_ptr()
+    # Flatten spatial dimensions for kernel
+    output_size = batch_size * channels * grid_height * grid_width
     
     # Launch kernel
+    block_size = 256
+    grid_size = triton.cdiv(output_size, block_size)
+    
+    # Prepare kernel arguments
+    input_ptr = input.data_ptr()
+    grid_ptr = grid.data_ptr()
+    output_ptr = output.data_ptr()
+    
+    # Call kernel
     _grid_sample_kernel[grid_size](
         input_ptr, grid_ptr, output_ptr,
         batch_size, channels, height, width,

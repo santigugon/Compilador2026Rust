@@ -3,38 +3,23 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def asin_kernel(
-    input_ptr,
-    output_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    block_end = min(block_start + BLOCK_SIZE, n_elements)
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    input = tl.load(input_ptr + offsets, mask=mask)
-    output = tl.asin(input)
-    tl.store(output_ptr + offsets, output, mask=mask)
+def _asin_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.asin(x)
+    tl.store(out_ptr + offsets, y, mask=mask)
 
 def asin(input, *, out=None):
-    assert input.dtype == torch.float32 or input.dtype == torch.float64, "Only float32 and float64 are supported"
     if out is None:
         out = torch.empty_like(input)
     else:
-        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input tensor"
         assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
+        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input tensor"
     
-    n_elements = input.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    asin_kernel[grid](
-        input_ptr=input.data_ptr(),
-        output_ptr=out.data_ptr(),
-        n_elements=n_elements,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _asin_kernel[grid](input, out, n, BLOCK=block)
     return out

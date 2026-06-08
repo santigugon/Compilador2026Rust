@@ -18,7 +18,7 @@ def relu_sqrt(input, inplace=False, out=None):
     if inplace:
         # For inplace operation, we need to ensure the input tensor can be modified
         if out is not None:
-            raise ValueError("Cannot specify both 'inplace=True' and 'out' parameter")
+            raise ValueError("Cannot specify both 'inplace' and 'out' parameters")
         out = input
     else:
         if out is None:

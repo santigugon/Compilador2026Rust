@@ -20,6 +20,7 @@ def tensordot_rsqrt(a: torch.Tensor, b: torch.Tensor, dims) -> torch.Tensor:
     n = tensordot_result.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
+    
     _rsqrt_kernel[grid](tensordot_result, out, n, BLOCK=block)
     return out
 

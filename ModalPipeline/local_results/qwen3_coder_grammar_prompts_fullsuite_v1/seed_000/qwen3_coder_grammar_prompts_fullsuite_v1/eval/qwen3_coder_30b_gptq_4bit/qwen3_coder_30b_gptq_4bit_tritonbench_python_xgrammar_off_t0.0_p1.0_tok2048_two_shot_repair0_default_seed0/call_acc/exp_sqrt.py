@@ -8,16 +8,14 @@ def _exp_sqrt_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    y = tl.exp(x)
-    z = tl.sqrt(y)
-    tl.store(out_ptr + offsets, z, mask=mask)
+    y = tl.sqrt(tl.exp(x))
+    tl.store(out_ptr + offsets, y, mask=mask)
 
 def exp_sqrt(input, out=None):
     if out is None:
         out = torch.empty_like(input)
     else:
         assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
-        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input tensor"
     
     n = input.numel()
     block = 256

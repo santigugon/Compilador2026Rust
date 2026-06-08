@@ -15,40 +15,64 @@ def tril_mm_and_scale_kernel(
     pid_n = tl.program_id(1)
     
     # Compute the block indices
-    m_offset = pid_m * BLOCK_SIZE_M
-    n_offset = pid_n * BLOCK_SIZE_N
+    m_start = pid_m * BLOCK_SIZE_M
+    n_start = pid_n * BLOCK_SIZE_N
     
-    # Create block of A (lower triangular)
-    block_A = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
+    # Create block-level output tensor
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    # Loop over the K dimension
     for k in range(0, n, BLOCK_SIZE_K):
-        a_ptrs = A_ptr + (m_offset * n + k) + tl.arange(0, BLOCK_SIZE_K) * n + tl.arange(0, BLOCK_SIZE_M)[:, None]
-        a_mask = (m_offset + tl.arange(0, BLOCK_SIZE_M)[:, None]) >= (k + tl.arange(0, BLOCK_SIZE_K)[None, :])
-        a_block = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        block_A += a_block
+        # Load A block (lower triangular part)
+        a_block = tl.load(
+            tl.make_block_ptr(
+                A_ptr, shape=(n, n), strides=(n, 1),
+                offsets=(m_start, k), block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+                order=(1, 0)
+            )
+        )
+        # Zero out upper triangular part of A block
+        mask = tl.arange(0, BLOCK_SIZE_M)[:, None] >= tl.arange(0, BLOCK_SIZE_K)[None, :]
+        a_block = tl.where(mask, a_block, 0.0)
+        
+        # Load B block
+        b_block = tl.load(
+            tl.make_block_ptr(
+                B_ptr, shape=(n, p), strides=(n, 1),
+                offsets=(k, n_start), block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+                order=(1, 0)
+            )
+        )
+        
+        # Perform matrix multiplication for this block
+        accumulator = tl.dot(a_block, b_block, accumulator)
     
-    # Create block of B
-    block_B = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, p, BLOCK_SIZE_K):
-        b_ptrs = B_ptr + (k * p + n_offset) + tl.arange(0, BLOCK_SIZE_N) * p + tl.arange(0, BLOCK_SIZE_K)[:, None]
-        b_mask = (k + tl.arange(0, BLOCK_SIZE_K)[:, None]) < p
-        b_block = tl.load(b_ptrs, mask=b_mask, other=0.0)
-        block_B += b_block
+    # Scale by alpha
+    accumulator = accumulator * alpha
     
-    # Compute the result
-    result = tl.dot(block_A, block_B)
-    result = result * alpha
+    # Scale by beta and store result
+    output_block = accumulator * beta
     
-    # Scale by beta
-    result = result * beta
-    
-    # Write the result
-    output_ptrs = output_ptr + (m_offset * p + n_offset) + tl.arange(0, BLOCK_SIZE_N) * p + tl.arange(0, BLOCK_SIZE_M)[:, None]
-    output_mask = (m_offset + tl.arange(0, BLOCK_SIZE_M)[:, None]) < n
-    tl.store(output_ptrs, result, mask=output_mask)
+    # Store the result
+    tl.store(
+        tl.make_block_ptr(
+            output_ptr, shape=(n, p), strides=(p, 1),
+            offsets=(m_start, n_start), block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+            order=(1, 0)
+        ),
+        output_block
+    )
 
 def tril_mm_and_scale(A: torch.Tensor, B: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
+    # Ensure inputs are on the same device and are contiguous
+    A = A.contiguous()
+    B = B.contiguous()
+    
+    # Get dimensions
     n, p = A.shape[0], B.shape[1]
-    output = torch.empty(n, p, dtype=torch.float32, device=A.device)
+    
+    # Create output tensor
+    output = torch.empty(n, p, device=A.device, dtype=A.dtype)
     
     # Define block size
     BLOCK_SIZE_M = 16
@@ -57,6 +81,7 @@ def tril_mm_and_scale(A: torch.Tensor, B: torch.Tensor, alpha: float, beta: floa
     
     # Launch kernel
     grid = (triton.cdiv(n, BLOCK_SIZE_M), triton.cdiv(p, BLOCK_SIZE_N))
+    
     tril_mm_and_scale_kernel[grid](
         A, B, output,
         n, p,

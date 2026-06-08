@@ -4,33 +4,39 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _signbit_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+def signbit_kernel(
+    input_ptr,
+    output_ptr,
+    num_elements,
+    BLOCK_SIZE: tl.constexpr
+):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    
-    # Convert to integer representation to check sign bit
-    x_int = tl.bitcast(x, tl.int32)
-    # Extract sign bit (MSB of 32-bit float)
-    sign_bit = (x_int >> 31) & 1
-    # Convert back to boolean
-    result = sign_bit.to(tl.uint8) == 1
-    tl.store(out_ptr + offsets, result, mask=mask)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_elements
+    input_vals = tl.load(input_ptr + offsets, mask=mask)
+    output_vals = tl.where(input_vals < 0.0, 1, 0)
+    tl.store(output_ptr + offsets, output_vals, mask=mask)
 
 def signbit(input, *, out=None):
     if out is None:
-        out = torch.empty(input.shape, dtype=torch.bool, device=input.device)
+        out = torch.empty_like(input, dtype=torch.bool, device=input.device)
     else:
-        if out.shape != input.shape:
-            raise ValueError("Output tensor shape must match input tensor shape")
         if out.dtype != torch.bool:
             raise ValueError("Output tensor must have bool dtype")
+        if out.shape != input.shape:
+            raise ValueError("Output tensor must have the same shape as input")
     
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    num_elements = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(num_elements, BLOCK_SIZE),)
     
-    _signbit_kernel[grid](input, out, n, BLOCK=block)
+    signbit_kernel[grid](
+        input_ptr=input,
+        output_ptr=out,
+        num_elements=num_elements,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
     return out
 ```

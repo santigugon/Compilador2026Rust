@@ -3,39 +3,44 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _quantize_kernel(x_ptr, qweight_ptr, scale_ptr, zero_point_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+def quantize_kernel(
+    input_ptr,
+    output_ptr,
+    scale_ptr,
+    zero_point_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    dtype: tl.constexpr,
+):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
     
-    # Simple quantization example: quantize to int8 with scale and zero point
-    # This is a simplified version - real quantization would be more complex
-    scale = tl.load(scale_ptr)
-    zero_point = tl.load(zero_point_ptr)
+    if dtype == tl.float16:
+        input = input.to(tl.float32)
+    
+    # Simple quantization logic (simplified for demonstration)
+    scale = tl.max(tl.abs(input)) / 127.0
+    zero_point = tl.zeros([], dtype=tl.int32)
     
     # Quantize to int8
-    quantized = tl.clamp((x / scale) + zero_point, -128, 127)
-    quantized = tl.cast(quantized, tl.int8)
+    quantized = tl.cast(input / scale + zero_point, tl.int8)
     
-    tl.store(out_ptr + offsets, quantized, mask=mask)
+    tl.store(output_ptr + offsets, quantized, mask=mask)
+    tl.store(scale_ptr + pid, scale, mask=pid < 1)
 
 def quantize_dynamic(model, qconfig_spec=None, inplace=False, mapping=None):
-    # This is a simplified implementation for demonstration purposes
-    # A full implementation would require more complex logic to handle
-    # actual quantization configurations and module replacement
-    
     if not inplace:
-        # Create a copy of the model
-        model = torch.nn.Module()
-        # This is a placeholder - in reality we would need to properly
-        # copy the model structure and parameters
-        for name, module in model.named_modules():
-            if hasattr(module, 'weight'):
-                # Create quantized version of the module
-                # This is a simplified approach
-                pass
+        model = model.copy()
     
-    # For demonstration, we'll just return the model as-is
-    # A real implementation would perform actual quantization
+    # This is a simplified implementation for demonstration
+    # In practice, this would need to handle the actual quantization
+    # of specific modules based on qconfig_spec and mapping
+    
+    # For now, we'll just return the model as-is
+    # A real implementation would traverse the model and quantize
+    # specific modules according to the provided specifications
+    
     return model

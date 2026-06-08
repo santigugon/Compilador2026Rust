@@ -9,11 +9,15 @@ def _l2_normalize_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    tl.store(out_ptr + offsets, x, mask=mask)
+    # Compute L2 norm
+    norm = tl.sqrt(tl.sum(x * x, axis=0) + 1e-8)
+    # Normalize
+    normalized = x / norm
+    tl.store(out_ptr + offsets, normalized, mask=mask)
 
 @triton.jit
 def _cosine_embedding_loss_kernel(
-    input1_ptr, input2_ptr, target_ptr, out_ptr,
+    input1_ptr, input2_ptr, target_ptr, out_ptr, 
     n: tl.constexpr, margin: tl.constexpr, BLOCK: tl.constexpr
 ):
     pid = tl.program_id(0)
@@ -24,44 +28,49 @@ def _cosine_embedding_loss_kernel(
     input2 = tl.load(input2_ptr + offsets, mask=mask, other=0.0)
     target = tl.load(target_ptr + offsets, mask=mask, other=0.0)
     
-    # Compute dot product
-    dot_product = input1 * input2
-    dot_product = tl.sum(dot_product)
-    
     # Compute cosine similarity
+    dot_product = tl.sum(input1 * input2, axis=0)
     cos_sim = dot_product
     
-    # Apply margin and compute loss
-    loss = tl.where(target > 0, 1 - cos_sim, tl.maximum(0, cos_sim - margin))
-    
+    # Compute loss
+    loss = tl.where(target > 0, 1 - cos_sim, tl.maximum(cos_sim - margin, 0))
     tl.store(out_ptr + offsets, loss, mask=mask)
 
 def fused_cosine_embedding_loss_with_normalization(input1: torch.Tensor, input2: torch.Tensor, target: torch.Tensor, margin: float = 0, reduction: str = 'mean') -> torch.Tensor:
-    # Normalize inputs using L2 normalization
-    input1_norm = torch.nn.functional.normalize(input1, p=2, dim=1)
-    input2_norm = torch.nn.functional.normalize(input2, p=2, dim=1)
+    # Validate inputs
+    if input1.shape != input2.shape:
+        raise ValueError("input1 and input2 must have the same shape")
+    if input1.shape != target.shape:
+        raise ValueError("input1 and target must have the same shape")
     
-    # Compute cosine embedding loss
-    out = torch.empty_like(input1_norm)
-    n = input1_norm.numel()
+    # Flatten tensors for processing
+    input1_flat = input1.view(-1)
+    input2_flat = input2.view(-1)
+    target_flat = target.view(-1)
+    
+    # Normalize inputs
+    normalized_input1 = torch.empty_like(input1_flat)
+    normalized_input2 = torch.empty_like(input2_flat)
+    
+    n = input1_flat.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
     
-    # For simplicity, we'll compute the loss directly using PyTorch operations
-    # since the full fused kernel would be complex for this operation
-    # We'll use the normalized tensors and compute the loss in PyTorch
+    # L2 normalize both inputs
+    _l2_normalize_kernel[grid](input1_flat, normalized_input1, n, BLOCK=block)
+    _l2_normalize_kernel[grid](input2_flat, normalized_input2, n, BLOCK=block)
     
-    # Compute cosine similarity
-    cos_sim = torch.sum(input1_norm * input2_norm, dim=1)
-    
-    # Compute loss
-    loss = torch.where(target > 0, 1 - cos_sim, torch.clamp(cos_sim - margin, min=0.0))
+    # Compute cosine embedding loss
+    loss = torch.empty_like(target_flat)
+    _cosine_embedding_loss_kernel[grid](normalized_input1, normalized_input2, target_flat, loss, n, margin, BLOCK=block)
     
     # Apply reduction
     if reduction == 'mean':
-        return torch.mean(loss)
+        return loss.mean()
     elif reduction == 'sum':
-        return torch.sum(loss)
-    else:  # reduction == 'none'
-        return loss
+        return loss.sum()
+    elif reduction == 'none':
+        return loss.view(input1.shape)
+    else:
+        raise ValueError("reduction must be 'none', 'mean', or 'sum'")
 ```

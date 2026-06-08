@@ -3,136 +3,176 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _grid_sample_bilinear_kernel(
-    input_ptr, 
+def affine_grid_kernel(
+    theta_ptr, 
     grid_ptr, 
-    output_ptr,
-    input_n, input_c, input_h, input_w,
-    output_h, output_w,
-    align_corners: tl.constexpr,
-    BLOCK: tl.constexpr
+    N, 
+    H_out, 
+    W_out, 
+    H_in, 
+    W_in,
+    BLOCK_SIZE: tl.constexpr
 ):
-    pid = tl.program_id(0)
-    block_size = BLOCK * BLOCK
-    batch_idx = pid // (output_h * output_w)
-    channel_idx = (pid % (output_h * output_w)) // output_w
-    h_idx = (pid % (output_h * output_w)) % output_w
+    # Compute global thread index
+    batch_idx = tl.program_id(0)
+    h_idx = tl.program_id(1)
+    w_idx = tl.program_id(2)
     
-    if batch_idx >= input_n or channel_idx >= input_c:
+    if batch_idx >= N or h_idx >= H_out or w_idx >= W_out:
+        return
+    
+    # Load theta for this batch
+    theta = tl.load(theta_ptr + batch_idx * 6)
+    theta_1 = tl.load(theta_ptr + batch_idx * 6 + 1)
+    theta_2 = tl.load(theta_ptr + batch_idx * 6 + 2)
+    theta_3 = tl.load(theta_ptr + batch_idx * 6 + 3)
+    theta_4 = tl.load(theta_ptr + batch_idx * 6 + 4)
+    theta_5 = tl.load(theta_ptr + batch_idx * 6 + 5)
+    
+    # Compute grid coordinates
+    h = h_idx
+    w = w_idx
+    
+    # Normalize coordinates to [-1, 1] range
+    h_norm = (h / (H_out - 1)) * 2 - 1
+    w_norm = (w / (W_out - 1)) * 2 - 1
+    
+    # Apply affine transformation
+    x = theta_0 * w_norm + theta_1 * h_norm + theta_2
+    y = theta_3 * w_norm + theta_4 * h_norm + theta_5
+    
+    # Store grid values
+    grid_idx = batch_idx * H_out * W_out * 2 + h_idx * W_out * 2 + w_idx * 2
+    tl.store(grid_ptr + grid_idx, x)
+    tl.store(grid_ptr + grid_idx + 1, y)
+
+@triton.jit
+def grid_sample_kernel(
+    input_ptr,
+    grid_ptr,
+    output_ptr,
+    N,
+    C,
+    H_out,
+    W_out,
+    H_in,
+    W_in,
+    mode,
+    padding_mode,
+    align_corners,
+    BLOCK_SIZE: tl.constexpr
+):
+    batch_idx = tl.program_id(0)
+    channel_idx = tl.program_id(1)
+    h_idx = tl.program_id(2)
+    w_idx = tl.program_id(3)
+    
+    if batch_idx >= N or channel_idx >= C or h_idx >= H_out or w_idx >= W_out:
         return
     
     # Load grid coordinates
-    grid_offsets = batch_idx * input_c * output_h * output_w + channel_idx * output_h * output_w + h_idx * output_w
-    grid_x = tl.load(grid_ptr + grid_offsets, mask=tl.arange(0, output_w) < output_w, other=0.0)
-    grid_y = tl.load(grid_ptr + grid_offsets + output_w, mask=tl.arange(0, output_w) < output_w, other=0.0)
+    grid_idx = batch_idx * H_out * W_out * 2 + h_idx * W_out * 2 + w_idx * 2
+    x = tl.load(grid_ptr + grid_idx)
+    y = tl.load(grid_ptr + grid_idx + 1)
     
-    # Normalize grid coordinates to [-1, 1] if align_corners is True
+    # Normalize coordinates based on align_corners
     if align_corners:
-        grid_x = grid_x * 2.0 - 1.0
-        grid_y = grid_y * 2.0 - 1.0
+        x = (x + 1) / 2 * (W_in - 1)
+        y = (y + 1) / 2 * (H_in - 1)
+    else:
+        x = (x + 1) / 2 * W_in
+        y = (y + 1) / 2 * H_in
     
-    # Convert normalized coordinates to image coordinates
-    x = (grid_x + 1.0) * (input_w - 1) / 2.0
-    y = (grid_y + 1.0) * (input_h - 1) / 2.0
+    # Handle padding modes
+    if padding_mode == "zeros":
+        if x < 0 or x >= W_in or y < 0 or y >= H_in:
+            tl.store(output_ptr + batch_idx * C * H_out * W_out + channel_idx * H_out * W_out + h_idx * W_out + w_idx, 0.0)
+            return
+    elif padding_mode == "border":
+        x = tl.clamp(x, 0, W_in - 1)
+        y = tl.clamp(y, 0, H_in - 1)
+    elif padding_mode == "reflection":
+        x = tl.where(x < 0, -x, x)
+        y = tl.where(y < 0, -y, y)
+        x = x % (2 * W_in - 2)
+        y = y % (2 * H_in - 2)
+        x = tl.where(x >= W_in, 2 * W_in - 2 - x, x)
+        y = tl.where(y >= H_in, 2 * H_in - 2 - y, y)
     
-    # Compute bilinear interpolation
-    x0 = tl.floor(x).to(tl.int32)
-    y0 = tl.floor(y).to(tl.int32)
-    x1 = x0 + 1
-    y1 = y0 + 1
-    
-    # Clamp coordinates to valid range
-    x0 = tl.clamp(x0, 0, input_w - 1)
-    x1 = tl.clamp(x1, 0, input_w - 1)
-    y0 = tl.clamp(y0, 0, input_h - 1)
-    y1 = tl.clamp(y1, 0, input_h - 1)
-    
-    # Compute weights
-    wx = x - x0
-    wy = y - y0
-    
-    # Load input values
-    input_offsets = batch_idx * input_c * input_h * input_w + channel_idx * input_h * input_w
-    input_vals = tl.load(input_ptr + input_offsets, mask=tl.arange(0, output_w) < output_w, other=0.0)
-    
-    # Perform bilinear interpolation
-    val00 = tl.load(input_ptr + input_offsets + y0 * input_w + x0, mask=tl.arange(0, output_w) < output_w, other=0.0)
-    val01 = tl.load(input_ptr + input_offsets + y0 * input_w + x1, mask=tl.arange(0, output_w) < output_w, other=0.0)
-    val10 = tl.load(input_ptr + input_offsets + y1 * input_w + x0, mask=tl.arange(0, output_w) < output_w, other=0.0)
-    val11 = tl.load(input_ptr + input_offsets + y1 * input_w + x1, mask=tl.arange(0, output_w) < output_w, other=0.0)
-    
-    # Interpolate
-    val0 = val00 * (1 - wx) + val01 * wx
-    val1 = val10 * (1 - wx) + val11 * wx
-    output_val = val0 * (1 - wy) + val1 * wy
-    
-    # Store output
-    output_offsets = batch_idx * input_c * output_h * output_w + channel_idx * output_h * output_w + h_idx * output_w
-    tl.store(output_ptr + output_offsets, output_val, mask=tl.arange(0, output_w) < output_w)
+    # Interpolation modes
+    if mode == "nearest":
+        x_int = tl.cast(x + 0.5, tl.int32)
+        y_int = tl.cast(y + 0.5, tl.int32)
+        x_int = tl.clamp(x_int, 0, W_in - 1)
+        y_int = tl.clamp(y_int, 0, H_in - 1)
+        input_idx = batch_idx * C * H_in * W_in + channel_idx * H_in * W_in + y_int * W_in + x_int
+        tl.store(output_ptr + batch_idx * C * H_out * W_out + channel_idx * H_out * W_out + h_idx * W_out + w_idx, tl.load(input_ptr + input_idx))
+    elif mode == "bilinear":
+        x0 = tl.cast(x, tl.int32)
+        y0 = tl.cast(y, tl.int32)
+        x1 = x0 + 1
+        y1 = y0 + 1
+        
+        # Clamp coordinates
+        x0 = tl.clamp(x0, 0, W_in - 1)
+        y0 = tl.clamp(y0, 0, H_in - 1)
+        x1 = tl.clamp(x1, 0, W_in - 1)
+        y1 = tl.clamp(y1, 0, H_in - 1)
+        
+        # Compute weights
+        wx = x - x0
+        wy = y - y0
+        
+        # Sample four corners
+        idx00 = batch_idx * C * H_in * W_in + channel_idx * H_in * W_in + y0 * W_in + x0
+        idx01 = batch_idx * C * H_in * W_in + channel_idx * H_in * W_in + y0 * W_in + x1
+        idx10 = batch_idx * C * H_in * W_in + channel_idx * H_in * W_in + y1 * W_in + x0
+        idx11 = batch_idx * C * H_in * W_in + channel_idx * H_in * W_in + y1 * W_in + x1
+        
+        val00 = tl.load(input_ptr + idx00)
+        val01 = tl.load(input_ptr + idx01)
+        val10 = tl.load(input_ptr + idx10)
+        val11 = tl.load(input_ptr + idx11)
+        
+        # Bilinear interpolation
+        val0 = val00 * (1 - wx) + val01 * wx
+        val1 = val10 * (1 - wx) + val11 * wx
+        result = val0 * (1 - wy) + val1 * wy
+        
+        tl.store(output_ptr + batch_idx * C * H_out * W_out + channel_idx * H_out * W_out + h_idx * W_out + w_idx, result)
+    else:
+        # Default to bilinear for unsupported modes
+        x0 = tl.cast(x, tl.int32)
+        y0 = tl.cast(y, tl.int32)
+        x1 = x0 + 1
+        y1 = y0 + 1
+        
+        # Clamp coordinates
+        x0 = tl.clamp(x0, 0, W_in - 1)
+        y0 = tl.clamp(y0, 0, H_in - 1)
+        x1 = tl.clamp(x1, 0, W_in - 1)
+        y1 = tl.clamp(y1, 0, H_in - 1)
+        
+        # Compute weights
+        wx = x - x0
+        wy = y - y0
+        
+        # Sample four corners
+        idx00 = batch_idx * C * H_in * W_in + channel_idx * H_in * W_in + y0 * W_in + x0
+        idx01 = batch_idx * C * H_in * W_in + channel_idx * H_in * W_in + y0 * W_in + x1
+        idx10 = batch_idx * C * H_in * W_in + channel_idx * H_in * W_in + y1 * W_in + x0
+        idx11 = batch_idx * C * H_in * W_in + channel_idx * H_in * W_in + y1 * W_in + x1
+        
+        val00 = tl.load(input_ptr + idx00)
+        val01 = tl.load(input_ptr + idx01)
+        val10 = tl.load(input_ptr + idx10)
+        val11 = tl.load(input_ptr + idx11)
+        
+        # Bilinear interpolation
+        val0 = val00 * (1 - wx) + val01 * wx
+        val1 = val10 * (1 - wx) + val11 * wx
+        result = val0 * (1 - wy) + val1 * wy
+        
+        tl.store(output_ptr + batch_idx * C * H_out * W_out + channel_idx * H_out * W_out + h_idx * W_out + w_idx, result)
 
-def grid_sample_with_affine(input: torch.Tensor, theta: torch.Tensor, size: torch.Size, mode: str = 'bilinear', padding_mode: str = 'zeros', align_corners: bool = False) -> torch.Tensor:
-    # Validate inputs
-    if mode != 'bilinear':
-        raise NotImplementedError("Only bilinear mode is supported in this implementation")
-    
-    if padding_mode != 'zeros':
-        raise NotImplementedError("Only zeros padding mode is supported in this implementation")
-    
-    # Extract dimensions
-    N, C, H_in, W_in = input.shape
-    H_out, W_out = size[2], size[3]
-    
-    # Create output tensor
-    output = torch.empty(N, C, H_out, W_out, device=input.device, dtype=input.dtype)
-    
-    # Generate grid using affine transformation
-    # This is a simplified version - in practice, you'd use torch.nn.functional.affine_grid
-    # For this implementation, we'll assume the grid is already computed and passed in
-    # But since we're implementing the full pipeline, we'll compute it here
-    
-    # Create identity grid
-    grid = torch.zeros(N, H_out, W_out, 2, device=input.device, dtype=torch.float32)
-    
-    # Generate grid coordinates
-    h_coords = torch.linspace(-1, 1, W_out, device=input.device)
-    w_coords = torch.linspace(-1, 1, H_out, device=input.device)
-    
-    # Create meshgrid
-    w_grid, h_grid = torch.meshgrid(h_coords, w_coords, indexing='xy')
-    
-    # Expand to batch size
-    h_grid = h_grid.unsqueeze(0).expand(N, -1, -1)
-    w_grid = w_grid.unsqueeze(0).expand(N, -1, -1)
-    
-    # Stack to create grid
-    grid = torch.stack([w_grid, h_grid], dim=-1)
-    
-    # Apply affine transformation
-    # This is a simplified version - full implementation would be more complex
-    # For now, we'll just use the identity transformation
-    # In a real implementation, you'd apply the theta matrix to transform the grid
-    
-    # For demonstration, we'll just use the identity grid
-    # In a full implementation, you'd compute the actual grid from theta
-    
-    # Launch kernel
-    block = 16
-    grid_size = (N * C * H_out * W_out) // (block * block)
-    if grid_size * block * block < N * C * H_out * W_out:
-        grid_size += 1
-    
-    # For simplicity, we'll use a basic approach for now
-    # In a real implementation, we'd properly compute the grid from theta
-    # and handle the bilinear sampling correctly
-    
-    # Use PyTorch's native implementation for now
-    # This is a placeholder for the actual Triton implementation
-    output = torch.nn.functional.grid_sample(
-        input, 
-        grid, 
-        mode=mode, 
-        padding_mode=padding_mode, 
-        align_corners=align_corners
-    )
-    
-    return output
+def grid_sample_with_affine(input: torch.Tensor, theta: torch.Tensor, size:

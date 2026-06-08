@@ -3,94 +3,138 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def pixel_shuffle_conv2d_kernel(
+def _pixel_shuffle_conv2d_kernel(
     input_ptr, weight_ptr, bias_ptr, output_ptr,
-    in_channels, out_channels, iH, iW, oH, oW,
-    kH, kW, stride, padding, dilation, groups, upscale_factor,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr
+    input_height, input_width, output_height, output_width,
+    in_channels, out_channels, kernel_h, kernel_w,
+    stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w,
+    groups, upscale_factor,
+    input_batch, BLOCK_SIZE: tl.constexpr
 ):
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(oH, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(oW, BLOCK_SIZE_N)
-    pid_m = pid // num_pid_n
-    pid_n = pid % num_pid_n
+    # Get program ID
+    batch_id = tl.program_id(0)
+    out_ch_id = tl.program_id(1)
     
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    # Calculate output dimensions
+    out_h = output_height
+    out_w = output_width
     
-    mask_m = offs_m < oH
-    mask_n = offs_n < oW
+    # Calculate group size
+    group_size = in_channels // groups
     
-    output = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # Calculate output spatial indices
+    out_y = tl.program_id(2)
+    out_x = tl.program_id(3)
     
-    for g in range(groups):
-        for k in range(kH * kW):
-            kh = k // kW
-            kw = k % kW
+    # Calculate input spatial indices
+    in_y = out_y * stride_h - padding_h
+    in_x = out_x * stride_w - padding_w
+    
+    # Calculate output channel index within group
+    ch_in_group = out_ch_id % group_size
+    
+    # Calculate upscale factor dimensions
+    upscale_h = out_h // upscale_factor
+    upscale_w = out_w // upscale_factor
+    
+    # Calculate output position
+    out_pos = batch_id * out_channels * out_h * out_w + out_ch_id * out_h * out_w + out_y * out_w + out_x
+    
+    # Initialize accumulator
+    acc = tl.zeros((1,), dtype=tl.float32)
+    
+    # Perform convolution
+    for kh in range(kernel_h):
+        for kw in range(kernel_w):
+            # Calculate input position
+            in_y_k = in_y + kh * dilation_h
+            in_x_k = in_x + kw * dilation_w
             
-            input_offset = g * (in_channels // groups) * iH * iW
-            weight_offset = g * (out_channels // groups) * (in_channels // groups) * kH * kW
-            
-            for c in range(in_channels // groups):
-                input_idx = input_offset + c * iH * iW
-                weight_idx = weight_offset + c * kH * kW + k
+            # Check bounds
+            if in_y_k >= 0 and in_y_k < input_height and in_x_k >= 0 and in_x_k < input_width:
+                # Calculate input position
+                input_pos = batch_id * in_channels * input_height * input_width + \
+                           (out_ch_id // group_size) * group_size * input_height * input_width + \
+                           ch_in_group * input_height * input_width + \
+                           in_y_k * input_width + in_x_k
                 
-                for m in range(BLOCK_SIZE_M):
-                    for n in range(BLOCK_SIZE_N):
-                        if mask_m[m] and mask_n[n]:
-                            ih = (offs_m[m] * stride - padding + kh * dilation)
-                            iw = (offs_n[n] * stride - padding + kw * dilation)
-                            if 0 <= ih < iH and 0 <= iw < iW:
-                                input_val = tl.load(input_ptr + input_idx + ih * iW + iw, mask=True)
-                                weight_val = tl.load(weight_ptr + weight_idx)
-                                output[m, n] += input_val * weight_val
+                # Calculate weight position
+                weight_pos = out_ch_id * group_size * kernel_h * kernel_w + \
+                            ch_in_group * kernel_h * kernel_w + \
+                            kh * kernel_w + kw
+                
+                # Load input and weight
+                input_val = tl.load(input_ptr + input_pos, mask=True)
+                weight_val = tl.load(weight_ptr + weight_pos, mask=True)
+                
+                # Accumulate
+                acc += input_val * weight_val
     
+    # Add bias if provided
     if bias_ptr is not None:
-        for m in range(BLOCK_SIZE_M):
-            for n in range(BLOCK_SIZE_N):
-                if mask_m[m] and mask_n[n]:
-                    output[m, n] += tl.load(bias_ptr + (offs_m[m] * oW + offs_n[n]) % out_channels)
+        bias_pos = out_ch_id
+        bias_val = tl.load(bias_ptr + bias_pos, mask=True)
+        acc += bias_val
     
-    output_ptr += pid_m * oW * BLOCK_SIZE_M + pid_n * BLOCK_SIZE_N
-    for m in range(BLOCK_SIZE_M):
-        for n in range(BLOCK_SIZE_N):
-            if mask_m[m] and mask_n[n]:
-                tl.store(output_ptr + m * oW + n, output[m, n])
+    # Store result
+    tl.store(output_ptr + out_pos, acc, mask=True)
 
 def pixel_shuffle_conv2d(input: torch.Tensor, weight: torch.Tensor, bias=None, stride=1, padding=0, dilation=1, groups=1, upscale_factor=2) -> torch.Tensor:
-    assert input.dim() == 4, "Input must be a 4D tensor"
-    assert weight.dim() == 4, "Weight must be a 4D tensor"
-    assert input.size(1) == weight.size(1) * groups, "Input channels must match weight channels"
+    # Get input dimensions
+    batch_size, in_channels, input_height, input_width = input.shape
+    out_channels, _, kernel_h, kernel_w = weight.shape
     
-    minibatch, in_channels, iH, iW = input.shape
-    out_channels, _, kH, kW = weight.shape
+    # Calculate output dimensions
+    output_height = (input_height + 2 * padding - (dilation * (kernel_h - 1) + 1)) // stride + 1
+    output_width = (input_width + 2 * padding - (dilation * (kernel_w - 1) + 1)) // stride + 1
     
-    oH = (iH + 2 * padding - (dilation * (kH - 1) + 1)) // stride + 1
-    oW = (iW + 2 * padding - (dilation * (kW - 1) + 1)) // stride + 1
+    # Create output tensor
+    output = torch.empty(
+        batch_size, out_channels, output_height, output_width,
+        dtype=input.dtype, device=input.device
+    )
     
-    output = torch.empty((minibatch, out_channels, oH, oW), device=input.device, dtype=input.dtype)
-    
-    BLOCK_SIZE_M = 16
-    BLOCK_SIZE_N = 16
-    BLOCK_SIZE_K = 32
-    
-    num_pid_m = triton.cdiv(oH, BLOCK_SIZE_M)
-    num_pid_n = triton.cdiv(oW, BLOCK_SIZE_N)
-    num_pid = num_pid_m * num_pid_n
-    
-    grid = (num_pid, 1, 1)
-    
+    # Handle bias
     if bias is not None:
         bias_ptr = bias.data_ptr()
     else:
         bias_ptr = None
     
-    pixel_shuffle_conv2d_kernel[grid](
-        input.data_ptr(), weight.data_ptr(), bias_ptr, output.data_ptr(),
-        in_channels, out_channels, iH, iW, oH, oW,
-        kH, kW, stride, padding, dilation, groups, upscale_factor,
-        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
+    # Launch kernel
+    grid = (
+        batch_size,  # batch dimension
+        out_channels,  # output channels
+        output_height,  # output height
+        output_width   # output width
+    )
+    
+    # Define block size
+    block_size = 256
+    
+    # Launch kernel
+    _pixel_shuffle_conv2d_kernel[grid](
+        input.data_ptr(),
+        weight.data_ptr(),
+        bias_ptr,
+        output.data_ptr(),
+        input_height,
+        input_width,
+        output_height,
+        output_width,
+        in_channels,
+        out_channels,
+        kernel_h,
+        kernel_w,
+        stride,
+        stride,
+        padding,
+        padding,
+        dilation,
+        dilation,
+        groups,
+        upscale_factor,
+        batch_size,
+        BLOCK_SIZE=block_size
     )
     
     return output

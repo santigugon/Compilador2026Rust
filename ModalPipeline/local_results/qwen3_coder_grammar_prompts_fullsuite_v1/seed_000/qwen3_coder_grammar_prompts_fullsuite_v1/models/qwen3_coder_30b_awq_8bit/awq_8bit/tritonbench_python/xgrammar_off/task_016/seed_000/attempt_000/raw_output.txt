@@ -48,9 +48,9 @@ def fused_silu_layer_norm_conv2d(x, weight, conv_weight, conv_bias=None,
                                 conv_stride=1, conv_padding=0, conv_dilation=1, 
                                 conv_groups=1, ln_eps=1e-5):
     # Perform convolution
-    conv_out = torch.nn.functional.conv2d(x, conv_weight, conv_bias, 
-                                        stride=conv_stride, padding=conv_padding, 
-                                        dilation=conv_dilation, groups=conv_groups)
+    conv_out = torch.nn.functional.conv2d(
+        x, conv_weight, conv_bias, conv_stride, conv_padding, conv_dilation, conv_groups
+    )
     
     # Layer normalization
     batch, channels, height, width = conv_out.shape

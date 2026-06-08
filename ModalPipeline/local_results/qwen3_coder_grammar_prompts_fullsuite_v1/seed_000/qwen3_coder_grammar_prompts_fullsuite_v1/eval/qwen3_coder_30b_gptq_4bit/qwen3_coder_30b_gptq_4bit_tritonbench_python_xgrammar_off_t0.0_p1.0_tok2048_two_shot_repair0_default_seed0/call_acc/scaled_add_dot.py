@@ -12,30 +12,27 @@ def _scaled_add_dot_kernel(y_ptr, x_ptr, out_ptr, n: tl.constexpr, alpha: tl.con
     y_new = y + alpha * x
     tl.store(y_ptr + offsets, y_new, mask=mask)
     # Compute dot product of modified y with itself
-    dot_product = tl.sum(y_new * y_new)
-    # Store the result to the output tensor
-    if pid == 0:
-        tl.store(out_ptr, dot_product)
+    y_new_squared = y_new * y_new
+    # Reduce to get sum of squares
+    sum_val = tl.sum(y_new_squared, axis=0)
+    # Store the result
+    tl.store(out_ptr, sum_val, mask=True)
 
 def scaled_add_dot(y: torch.Tensor, x: torch.Tensor, alpha: float) -> torch.Tensor:
-    # Ensure inputs are contiguous for efficient memory access
-    y = y.contiguous()
-    x = x.contiguous()
-    
-    # Create output tensor for the dot product result
-    out = torch.empty(1, dtype=torch.float32, device=y.device)
-    
-    # Get the total number of elements
+    # Ensure inputs are contiguous and have the same size
+    assert y.shape == x.shape, "y and x must have the same shape"
     n = y.numel()
     
-    # Define block size and grid size
+    # Create output tensor
+    out = torch.empty(1, dtype=torch.float32, device=y.device)
+    
+    # Determine block size and grid
     BLOCK = 256
     grid = (triton.cdiv(n, BLOCK),)
     
-    # Launch the kernel
+    # Launch kernel
     _scaled_add_dot_kernel[grid](y, x, out, n, alpha, BLOCK=BLOCK)
     
-    # Return the scalar result
     return out
 
 ##################################################################################################################################################

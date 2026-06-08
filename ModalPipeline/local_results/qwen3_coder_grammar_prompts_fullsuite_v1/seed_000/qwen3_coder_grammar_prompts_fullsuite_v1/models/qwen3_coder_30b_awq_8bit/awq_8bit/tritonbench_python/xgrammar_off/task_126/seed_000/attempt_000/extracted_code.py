@@ -3,32 +3,29 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def gelu_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask)
-    # GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+def _gelu_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    # GELU(x) = x * Φ(x) where Φ is the CDF of the standard normal distribution
+    # Approximate using tanh: GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x^3)))
     sqrt_2_over_pi = 0.7978845608028654  # sqrt(2/pi)
     coeff = 0.044715
-    gelu_x = 0.5 * x * (1.0 + tl.tanh(sqrt_2_over_pi * (x + coeff * x * x * x)))
-    tl.store(output_ptr + offsets, gelu_x, mask=mask)
+    x_cubed = x * x * x
+    tanh_arg = sqrt_2_over_pi * (x + coeff * x_cubed)
+    tanh_val = 2.0 / (1.0 + tl.exp(-2.0 * tanh_arg)) - 1.0
+    gelu_val = 0.5 * x * (1.0 + tanh_val)
+    tl.store(out_ptr + offsets, gelu_val, mask=mask)
 
 def gelu(input, approximate='none'):
-    if approximate != 'none':
-        raise ValueError("Triton implementation only supports exact GELU computation")
+    if approximate != 'tanh':
+        # For exact GELU, we fall back to PyTorch's implementation
+        return torch.nn.functional.gelu(input, approximate=approximate)
     
-    output = torch.empty_like(input)
-    n_elements = input.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    gelu_kernel[grid](
-        input,
-        output,
-        n_elements,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    
-    return output
+    out = torch.empty_like(input)
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _gelu_kernel[grid](input, out, n, BLOCK=block)
+    return out

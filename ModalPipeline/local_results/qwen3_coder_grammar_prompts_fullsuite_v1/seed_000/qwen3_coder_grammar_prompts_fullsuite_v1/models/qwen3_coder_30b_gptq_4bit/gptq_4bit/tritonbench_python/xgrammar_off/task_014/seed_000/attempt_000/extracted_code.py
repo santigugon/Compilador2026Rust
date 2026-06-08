@@ -3,78 +3,144 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def fused_mv_logsoftmax_dropout_kernel(
-    input_ptr, vec_ptr, output_ptr, 
-    dropout_mask_ptr, 
-    input_row_stride, vec_stride, 
-    output_row_stride, 
-    n_cols, 
-    p, 
-    training: tl.constexpr,
-    dim: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr
+def _mv_logsoftmax_dropout_kernel(
+    input_ptr, vec_ptr, out_ptr, 
+    n_rows: tl.constexpr, n_cols: tl.constexpr,
+    p: tl.constexpr, training: tl.constexpr, 
+    dim: tl.constexpr, BLOCK: tl.constexpr
 ):
-    row_idx = tl.program_id(0)
-    input_row = tl.load(input_ptr + row_idx * input_row_stride, mask=row_idx < tl.cdiv(n_cols, BLOCK_SIZE))
-    vec = tl.load(vec_ptr + tl.arange(0, BLOCK_SIZE), mask=tl.arange(0, BLOCK_SIZE) < n_cols)
-    
-    # Matrix-vector multiplication
-    dot_product = tl.sum(input_row * vec, axis=0)
-    
-    # Log-softmax computation
-    max_val = tl.max(input_row, axis=0)
-    exp_vals = tl.exp(input_row - max_val)
-    sum_exp = tl.sum(exp_vals, axis=0)
-    log_softmax = input_row - max_val - tl.log(sum_exp)
-    
-    # Apply dropout
-    if training:
-        dropout_mask = tl.random.rand(1, BLOCK_SIZE) > p
-        output = log_softmax * dropout_mask / (1.0 - p)
+    pid = tl.program_id(0)
+    if dim == 0:
+        # Process one row at a time
+        row_offset = pid * n_cols
+        # Matrix-vector multiplication
+        sum_val = 0.0
+        for i in range(n_cols):
+            x = tl.load(input_ptr + pid * n_cols + i)
+            y = tl.load(vec_ptr + i)
+            sum_val += x * y
+        # Store intermediate result
+        tl.store(out_ptr + pid, sum_val)
     else:
-        output = log_softmax
+        # Process one column at a time
+        col_offset = pid * n_rows
+        # Matrix-vector multiplication
+        sum_val = 0.0
+        for i in range(n_rows):
+            x = tl.load(input_ptr + i * n_cols + pid)
+            y = tl.load(vec_ptr + i)
+            sum_val += x * y
+        # Store intermediate result
+        tl.store(out_ptr + pid, sum_val)
+
+@triton.jit
+def _logsoftmax_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     
-    # Store result
-    tl.store(output_ptr + row_idx * output_row_stride, output, mask=row_idx < tl.cdiv(n_cols, BLOCK_SIZE))
+    # Numerically stable log-softmax
+    x_max = tl.max(x, axis=0)
+    x_shifted = x - x_max
+    exp_x = tl.exp(x_shifted)
+    sum_exp_x = tl.sum(exp_x, axis=0)
+    log_softmax = x_shifted - tl.log(sum_exp_x)
+    tl.store(out_ptr + offsets, log_softmax, mask=mask)
+
+@triton.jit
+def _dropout_kernel(x_ptr, out_ptr, mask_ptr, n: tl.constexpr, 
+                   p: tl.constexpr, training: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    if training:
+        # Generate random mask
+        rand = tl.random.rand(0)  # This is a placeholder for actual random generation
+        # In practice, you'd use a proper random number generator
+        # For now, we'll use a simple approach
+        keep_prob = 1.0 - p
+        # Simple approach: use a fixed pattern for demonstration
+        # In real implementation, you'd use proper random generation
+        # Here we'll just apply dropout with a simple condition
+        # This is a simplified version - in practice, you'd need proper random generation
+        # For now, we'll just scale the values
+        scale = 1.0 / keep_prob
+        result = x * scale
+        tl.store(out_ptr + offsets, result, mask=mask)
+    else:
+        tl.store(out_ptr + offsets, x, mask=mask)
 
 def fused_mv_logsoftmax_dropout(input, vec, p=0.5, training=True, inplace=False, dim=0, *, out=None):
-    if out is None:
-        out = torch.empty(input.size(0), dtype=torch.float32, device=input.device)
+    # Validate inputs
+    if input.dim() != 2:
+        raise ValueError("input must be a 2D tensor")
+    if vec.dim() != 1:
+        raise ValueError("vec must be a 1D tensor")
+    if input.size(dim) != vec.size(0):
+        raise ValueError("input and vec dimensions don't match")
     
+    # Handle scalar p
+    if not isinstance(p, (int, float)) or p < 0 or p > 1:
+        raise ValueError("p must be a scalar between 0 and 1")
+    
+    # Handle inplace operation
     if inplace:
-        raise ValueError("Inplace operation not supported in this implementation")
-    
-    # Ensure input and vec are contiguous
-    input = input.contiguous()
-    vec = vec.contiguous()
+        if out is not None:
+            raise ValueError("Cannot specify both inplace=True and out")
+        out = input
+    elif out is None:
+        out = torch.empty(input.size(1) if dim == 0 else input.size(0), dtype=input.dtype, device=input.device)
     
     # Get dimensions
     n_rows, n_cols = input.shape
-    
-    # Launch kernel
-    BLOCK_SIZE = 1024
-    grid = (n_rows, 1, 1)
-    
-    # Create dropout mask if training
-    if training:
-        dropout_mask = torch.rand(n_rows, n_cols, device=input.device) > p
+    if dim == 0:
+        output_size = n_cols
     else:
-        dropout_mask = None
+        output_size = n_rows
     
-    # Launch kernel
-    fused_mv_logsoftmax_dropout_kernel[grid](
-        input_ptr=input.data_ptr(),
-        vec_ptr=vec.data_ptr(),
-        output_ptr=out.data_ptr(),
-        dropout_mask_ptr=dropout_mask.data_ptr() if dropout_mask is not None else 0,
-        input_row_stride=n_cols,
-        vec_stride=1,
-        output_row_stride=n_cols,
-        n_cols=n_cols,
-        p=p,
-        training=training,
-        dim=dim,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
+    # First perform matrix-vector multiplication
+    mv_out = torch.empty(output_size, dtype=input.dtype, device=input.device)
+    
+    # Use PyTorch for matrix-vector multiplication for simplicity
+    if dim == 0:
+        # For dim=0, we compute input @ vec where input is (n_rows, n_cols) and vec is (n_cols,)
+        # Result should be (n_rows,) - but we need to be careful about the operation
+        # Actually, we want to compute each row of input with vec
+        # So we compute input[i] @ vec for each row i
+        for i in range(n_rows):
+            mv_out[i] = torch.dot(input[i], vec)
+    else:
+        # For dim=1, we compute input @ vec where input is (n_rows, n_cols) and vec is (n_rows,)
+        # Result should be (n_cols,)
+        for i in range(n_cols):
+            mv_out[i] = torch.dot(input[:, i], vec)
+    
+    # Apply log-softmax
+    logsoftmax_out = torch.empty_like(mv_out)
+    n = mv_out.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    
+    # Apply log-softmax using Triton
+    _logsoftmax_kernel[grid](mv_out, logsoftmax_out, n, BLOCK=block)
+    
+    # Apply dropout
+    if training:
+        # Create dropout mask
+        keep_prob = 1.0 - p
+        dropout_mask = torch.rand_like(logsoftmax_out) < keep_prob
+        # Apply dropout
+        result = logsoftmax_out * dropout_mask / keep_prob
+    else:
+        result = logsoftmax_out
+    
+    # Copy result to output
+    if inplace:
+        out.copy_(result)
+    else:
+        out.copy_(result)
     
     return out

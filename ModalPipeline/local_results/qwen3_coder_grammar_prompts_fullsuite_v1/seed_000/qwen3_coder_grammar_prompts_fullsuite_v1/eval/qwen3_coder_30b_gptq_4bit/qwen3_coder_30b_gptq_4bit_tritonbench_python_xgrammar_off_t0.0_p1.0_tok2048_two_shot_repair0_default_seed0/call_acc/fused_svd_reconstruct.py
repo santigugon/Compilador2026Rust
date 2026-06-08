@@ -8,71 +8,56 @@ def _svd_reconstruct_kernel(
     out_ptr,
     m: tl.constexpr, n: tl.constexpr, k: tl.constexpr,
     u_stride_0: tl.constexpr, u_stride_1: tl.constexpr,
-    s_stride: tl.constexpr,
+    s_stride_0: tl.constexpr,
     vh_stride_0: tl.constexpr, vh_stride_1: tl.constexpr,
     out_stride_0: tl.constexpr, out_stride_1: tl.constexpr,
     BLOCK: tl.constexpr
 ):
-    # Grid position
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(0)
+    block_size = BLOCK
+    start = pid * block_size
+    end = min(start + block_size, m)
     
-    # Tile dimensions
-    tile_m = BLOCK
-    tile_n = BLOCK
-    
-    # Compute tile boundaries
-    start_m = pid_m * tile_m
-    start_n = pid_n * tile_n
-    
-    # Load U tile
-    u_tile = tl.zeros((tile_m, k), dtype=tl.float32)
-    for i in range(0, tile_m, BLOCK):
-        for j in range(0, k, BLOCK):
-            if i + j < tile_m * k:
-                offsets = (start_m + i) * u_stride_0 + (j) * u_stride_1
-                u_tile[i:i+BLOCK, j:j+BLOCK] = tl.load(u_ptr + offsets, mask=(i + j) < tile_m * k, other=0.0)
-    
-    # Load S tile
-    s_tile = tl.zeros((k,), dtype=tl.float32)
-    for i in range(0, k, BLOCK):
-        if i < k:
-            offsets = (i) * s_stride
-            s_tile[i:i+BLOCK] = tl.load(s_ptr + offsets, mask=i + j < k, other=0.0)
-    
-    # Load Vh tile
-    vh_tile = tl.zeros((k, tile_n), dtype=tl.float32)
-    for i in range(0, k, BLOCK):
-        for j in range(0, tile_n, BLOCK):
-            if i + j < k * tile_n:
-                offsets = (i) * vh_stride_0 + (start_n + j) * vh_stride_1
-                vh_tile[i:i+BLOCK, j:j+BLOCK] = tl.load(vh_ptr + offsets, mask=(i + j) < k * tile_n, other=0.0)
-    
-    # Compute reconstruction: U @ diag(S) @ Vh
-    # This is a simplified version - in practice, you'd want to compute this more efficiently
-    # For now, we'll compute it element-wise
-    for i in range(tile_m):
-        for j in range(tile_n):
-            if start_m + i < m and start_n + j < n:
-                acc = 0.0
-                for l in range(k):
-                    u_val = u_tile[i, l]
-                    s_val = s_tile[l]
-                    vh_val = vh_tile[l, j]
-                    acc += u_val * s_val * vh_val
-                out_offsets = (start_m + i) * out_stride_0 + (start_n + j) * out_stride_1
-                tl.store(out_ptr + out_offsets, acc)
+    # Process each row
+    for i in range(start, end):
+        # For each row, compute the reconstruction
+        for j in range(n):
+            acc = 0.0
+            for l in range(k):
+                u_val = tl.load(u_ptr + i * u_stride_0 + l * u_stride_1)
+                s_val = tl.load(s_ptr + l * s_stride_0)
+                vh_val = tl.load(vh_ptr + l * vh_stride_0 + j * vh_stride_1)
+                acc += u_val * s_val * vh_val
+            tl.store(out_ptr + i * out_stride_0 + j * out_stride_1, acc)
 
 def fused_svd_reconstruct(A):
-    # Perform SVD
+    # Compute SVD
     U, S, Vh = torch.linalg.svd(A, full_matrices=False)
     
-    # Reconstruct the matrix
-    # A_reconstructed = U @ diag(S) @ Vh
-    reconstructed = U @ torch.diag(S) @ Vh
+    # Get dimensions
+    m, n = A.shape
+    k = S.shape[0]
     
-    # Return the reconstructed matrix
-    return reconstructed
+    # Create output tensor
+    out = torch.empty_like(A)
+    
+    # Set up kernel launch parameters
+    BLOCK = 32
+    grid = (triton.cdiv(m, BLOCK),)
+    
+    # Launch kernel
+    _svd_reconstruct_kernel[grid](
+        U, S, Vh,
+        out,
+        m, n, k,
+        U.stride(0), U.stride(1),
+        S.stride(0),
+        Vh.stride(0), Vh.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK=BLOCK
+    )
+    
+    return out
 
 ##################################################################################################################################################
 

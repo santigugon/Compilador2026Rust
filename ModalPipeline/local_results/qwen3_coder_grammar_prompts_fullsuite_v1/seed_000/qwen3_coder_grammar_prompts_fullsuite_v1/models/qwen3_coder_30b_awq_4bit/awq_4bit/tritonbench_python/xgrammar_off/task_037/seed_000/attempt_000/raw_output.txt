@@ -4,67 +4,98 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _l2_normalize_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    # Compute L2 norm
-    norm = tl.sqrt(tl.sum(x * x, axis=0) + 1e-8)
-    # Normalize
-    normalized = x / norm
-    tl.store(out_ptr + offsets, normalized, mask=mask)
-
-@triton.jit
-def _cosine_embedding_loss_kernel(
-    input1_ptr, input2_ptr, target_ptr, out_ptr, 
-    n: tl.constexpr, margin: tl.constexpr, BLOCK: tl.constexpr
+def cosine_embedding_loss_kernel(
+    input1_ptr, input2_ptr, target_ptr, output_ptr,
+    input1_size, input2_size, target_size,
+    margin, reduction,
+    BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
+    num_elements = tl.minimum(input1_size, input2_size)
     
-    input1 = tl.load(input1_ptr + offsets, mask=mask, other=0.0)
-    input2 = tl.load(input2_ptr + offsets, mask=mask, other=0.0)
-    target = tl.load(target_ptr + offsets, mask=mask, other=0.0)
+    # Initialize output
+    loss = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     
-    # Compute cosine similarity
-    dot_product = tl.sum(input1 * input2, axis=0)
-    norm1 = tl.sqrt(tl.sum(input1 * input1, axis=0) + 1e-8)
-    norm2 = tl.sqrt(tl.sum(input2 * input2, axis=0) + 1e-8)
-    cosine_sim = dot_product / (norm1 * norm2 + 1e-8)
+    # Process elements in blocks
+    for i in range(0, num_elements, BLOCK_SIZE):
+        # Load data
+        input1_offsets = i + tl.arange(0, BLOCK_SIZE)
+        input2_offsets = i + tl.arange(0, BLOCK_SIZE)
+        target_offsets = i + tl.arange(0, BLOCK_SIZE)
+        
+        input1_mask = input1_offsets < input1_size
+        input2_mask = input2_offsets < input2_size
+        target_mask = target_offsets < target_size
+        
+        input1_data = tl.load(input1_ptr + input1_offsets, mask=input1_mask, other=0.0)
+        input2_data = tl.load(input2_ptr + input2_offsets, mask=input2_mask, other=0.0)
+        target_data = tl.load(target_ptr + target_offsets, mask=target_mask, other=0.0)
+        
+        # Compute dot product
+        dot_product = tl.sum(input1_data * input2_data)
+        
+        # Compute L2 norms
+        norm1 = tl.sqrt(tl.sum(input1_data * input1_data) + 1e-8)
+        norm2 = tl.sqrt(tl.sum(input2_data * input2_data) + 1e-8)
+        
+        # Compute cosine similarity
+        cos_sim = dot_product / (norm1 * norm2)
+        
+        # Compute loss
+        loss_val = tl.where(
+            target_data == 1,
+            1 - cos_sim,
+            tl.maximum(cos_sim + margin, 0)
+        )
+        
+        # Accumulate loss
+        loss = loss + loss_val
     
-    # Compute loss
-    loss = tl.where(
-        target == 1,
-        1 - cosine_sim,
-        tl.maximum(cosine_sim - margin, 0)
-    )
-    
-    tl.store(out_ptr + offsets, loss, mask=mask)
+    # Store result
+    tl.store(output_ptr + pid, tl.sum(loss))
 
-def fused_cosine_embedding_loss_with_normalization(input1: torch.Tensor, input2: torch.Tensor, target: torch.Tensor, margin: float = 0, reduction: str = 'mean') -> torch.Tensor:
-    # Normalize inputs
-    input1_norm = torch.empty_like(input1)
-    input2_norm = torch.empty_like(input2)
+def fused_cosine_embedding_loss_with_normalization(
+    input1: torch.Tensor, 
+    input2: torch.Tensor, 
+    target: torch.Tensor, 
+    margin: float = 0, 
+    reduction: str = 'mean'
+) -> torch.Tensor:
+    # Ensure inputs are on the same device and have the same dtype
+    device = input1.device
+    if input2.device != device or target.device != device:
+        raise ValueError("All input tensors must be on the same device")
     
-    n = input1.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    if input1.dtype != input2.dtype or input1.dtype != target.dtype:
+        raise ValueError("All input tensors must have the same dtype")
     
-    # Normalize both inputs
-    _l2_normalize_kernel[grid](input1, input1_norm, n, BLOCK=block)
-    _l2_normalize_kernel[grid](input2, input2_norm, n, BLOCK=block)
+    # Flatten tensors for processing
+    input1_flat = input1.view(-1)
+    input2_flat = input2.view(-1)
+    target_flat = target.view(-1)
     
-    # Compute cosine embedding loss
-    loss = torch.empty_like(input1_norm)
-    _cosine_embedding_loss_kernel[grid](input1_norm, input2_norm, target, loss, n, margin, BLOCK=block)
+    # Create output tensor
+    output = torch.empty(1, dtype=torch.float32, device=device)
+    
+    # Determine block size and grid size
+    BLOCK_SIZE = 256
+    num_elements = max(input1_flat.size(0), input2_flat.size(0))
+    grid_size = (num_elements + BLOCK_SIZE - 1) // BLOCK_SIZE
+    
+    # Launch kernel
+    cosine_embedding_loss_kernel[grid_size](
+        input1_flat, input2_flat, target_flat, output,
+        input1_flat.size(0), input2_flat.size(0), target_flat.size(0),
+        margin, reduction, BLOCK_SIZE
+    )
     
     # Apply reduction
     if reduction == 'mean':
-        return torch.mean(loss)
+        return output / target_flat.size(0)
     elif reduction == 'sum':
-        return torch.sum(loss)
+        return output
     else:  # reduction == 'none'
-        return loss
+        return output
+    
+    return output
 ```

@@ -32,7 +32,7 @@ def solve_and_add_scaled_vector(A: torch.Tensor, b: torch.Tensor, y: torch.Tenso
     output = torch.zeros_like(b, device=device, dtype=torch.float32)
     
     # Launch kernel
-    grid = (2, 1, 1)  # Two blocks for triangular solve and add operations
+    grid = (2, 1, 1)
     triangular_solve_kernel[grid](A, b, y, output, n, k, alpha, BLOCK_SIZE=32)
     
     return output

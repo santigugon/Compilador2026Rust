@@ -1,90 +1,124 @@
 import torch
 import triton
 import triton.language as tl
-from torch.nn import functional as F
 
 @triton.jit
-def _conv2d_kernel(
+def relu_conv2d_kernel(
     input_ptr, weight_ptr, bias_ptr, output_ptr,
     batch_size, in_channels, out_channels, iH, iW, oH, oW,
-    kH, kW, stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w,
-    groups, group_size, BLOCK_SIZE: tl.constexpr
+    kH, kW, stride, padding, dilation, groups,
+    BLOCK_SIZE_M=16, BLOCK_SIZE_N=16, BLOCK_SIZE_K=16
 ):
-    batch_idx = tl.program_id(0)
-    out_ch_idx = tl.program_id(1)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
     
-    # Calculate output dimensions
-    output_h = oH
-    output_w = oW
+    # Compute output indices
+    out_h = pid_m * BLOCK_SIZE_M
+    out_w = pid_n * BLOCK_SIZE_N
+    out_c = pid_k * BLOCK_SIZE_K
     
-    # Load bias if available
-    bias_val = tl.load(bias_ptr + out_ch_idx) if bias_ptr is not None else 0.0
+    # Shared memory for input tile
+    input_tile = tl.shared.zeros((BLOCK_SIZE_M + 2 * padding, BLOCK_SIZE_N + 2 * padding), dtype=tl.float32)
+    
+    # Initialize output accumulator
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     
     # Loop over groups
     for g in range(groups):
-        # Calculate group-specific indices
-        group_start = g * group_size
-        group_end = (g + 1) * group_size
+        # Compute group-specific indices
+        group_in_channels = in_channels // groups
+        group_out_channels = out_channels // groups
         
-        # Loop over output spatial dimensions
-        for oh in range(output_h):
-            for ow in range(output_w):
-                # Initialize accumulator
-                acc = 0.0
+        # Compute group-specific output channel
+        group_out_c = out_c // groups
+        
+        # Loop over kernel
+        for kh in range(kH):
+            for kw in range(kW):
+                # Compute input indices
+                input_h = out_h * stride + kh * dilation - padding
+                input_w = out_w * stride + kw * dilation - padding
                 
-                # Loop over kernel spatial dimensions
-                for kh in range(kH):
-                    for kw in range(kW):
-                        # Calculate input indices
-                        ih = oh * stride_h - padding_h + kh * dilation_h
-                        iw = ow * stride_w - padding_w + kw * dilation_w
-                        
-                        # Check bounds
-                        if ih >= 0 and ih < iH and iw >= 0 and iw < iW:
-                            # Load input and weight
-                            input_val = tl.load(input_ptr + 
-                                               batch_idx * (in_channels * iH * iW) +
-                                               (group_start + kh * kW + kw) * (iH * iW) +
-                                               ih * iW + iw)
-                            weight_val = tl.load(weight_ptr + 
-                                                out_ch_idx * (in_channels * kH * kW) +
-                                                (group_start + kh * kW + kw) * (kH * kW) +
-                                                kh * kW + kw)
-                            acc += input_val * weight_val
-                
-                # Store result
-                output_idx = batch_idx * (out_channels * oH * oW) + out_ch_idx * (oH * oW) + oh * oW + ow
-                tl.store(output_ptr + output_idx, acc + bias_val)
+                # Check bounds
+                if input_h >= 0 and input_h < iH and input_w >= 0 and input_w < iW:
+                    # Load input tile
+                    input_tile[input_h, input_w] = tl.load(input_ptr + 
+                        (g * group_in_channels + 0) * iH * iW + 
+                        input_h * iW + input_w)
+    
+    # Compute convolution
+    for kh in range(kH):
+        for kw in range(kW):
+            # Compute weight indices
+            weight_idx = (out_c // groups) * kH * kW + kh * kW + kw
+            weight_val = tl.load(weight_ptr + weight_idx)
+            
+            # Compute convolution
+            for m in range(BLOCK_SIZE_M):
+                for n in range(BLOCK_SIZE_N):
+                    input_val = input_tile[m + kh * dilation, n + kw * dilation]
+                    acc[m, n] += input_val * weight_val
+    
+    # Add bias
+    if bias_ptr is not None:
+        for m in range(BLOCK_SIZE_M):
+            for n in range(BLOCK_SIZE_N):
+                acc[m, n] += tl.load(bias_ptr + out_c)
+    
+    # Apply ReLU
+    for m in range(BLOCK_SIZE_M):
+        for n in range(BLOCK_SIZE_N):
+            acc[m, n] = tl.maximum(acc[m, n], 0.0)
+    
+    # Store output
+    for m in range(BLOCK_SIZE_M):
+        for n in range(BLOCK_SIZE_N):
+            tl.store(output_ptr + (out_h + m) * oW + (out_w + n), acc[m, n])
 
 def relu_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, inplace=False):
-    # Handle scalar inputs
-    if not isinstance(stride, tuple):
-        stride = (stride, stride)
-    if not isinstance(padding, tuple):
-        padding = (padding, padding)
-    if not isinstance(dilation, tuple):
-        dilation = (dilation, dilation)
+    # Input validation
+    if len(input.shape) != 4:
+        raise ValueError("Input tensor must be 4D: (batch, channels, height, width)")
+    if len(weight.shape) != 4:
+        raise ValueError("Weight tensor must be 4D: (out_channels, in_channels, height, width)")
     
-    # Get dimensions
     batch_size, in_channels, iH, iW = input.shape
     out_channels, _, kH, kW = weight.shape
     
-    # Calculate output dimensions
-    oH = (iH + 2 * padding[0] - (dilation[0] * (kH - 1) + 1)) // stride[0] + 1
-    oW = (iW + 2 * padding[1] - (dilation[1] * (kW - 1) + 1)) // stride[1] + 1
+    # Compute output dimensions
+    oH = (iH + 2 * padding - (dilation * (kH - 1) + 1)) // stride + 1
+    oW = (iW + 2 * padding - (dilation * (kW - 1) + 1)) // stride + 1
     
-    # Create output tensor
+    # Initialize output tensor
     output = torch.empty(batch_size, out_channels, oH, oW, device=input.device, dtype=input.dtype)
     
-    # Handle groups
-    group_size = in_channels // groups
+    # Prepare kernel launch parameters
+    grid = (
+        triton.cdiv(oH, 16),
+        triton.cdiv(oW, 16),
+        triton.cdiv(out_channels, 16)
+    )
     
-    # For simplicity, we'll use PyTorch's conv2d and relu instead of implementing
-    # the full convolution kernel in Triton, since that would be quite complex
-    # and the performance gain might not be significant for this case.
-    conv_output = F.conv2d(input, weight, bias, stride, padding, dilation, groups)
+    # Launch kernel
+    relu_conv2d_kernel[grid](
+        input,
+        weight,
+        bias,
+        output,
+        batch_size,
+        in_channels,
+        out_channels,
+        iH,
+        iW,
+        oH,
+        oW,
+        kH,
+        kW,
+        stride,
+        padding,
+        dilation,
+        groups
+    )
     
-    if inplace:
-        return torch.relu_(conv_output)
-    else:
-        return torch.relu(conv_output)
+    return output

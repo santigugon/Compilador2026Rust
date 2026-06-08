@@ -17,10 +17,7 @@ def _sum_reduce_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     # Use a simple reduction approach for sum
-    # For simplicity, we'll use a single block reduction
-    # In practice, this would be more complex for multi-block reductions
-    sum_val = tl.sum(x, axis=0)
-    tl.store(out_ptr, sum_val, mask=mask)
+    tl.store(out_ptr + offsets, x, mask=mask)
 
 def sum_std(input, dim=None, keepdim=False, dtype=None, correction=1, out=None):
     # Handle dtype casting
@@ -30,37 +27,27 @@ def sum_std(input, dim=None, keepdim=False, dtype=None, correction=1, out=None):
     # Handle the case where we need to sum along specific dimensions
     if dim is None:
         # Sum all elements
-        sum_result = input.sum()
-        # Calculate std of the single sum value (which is just the sum itself)
-        # For a single value, std is 0
-        std_result = torch.tensor(0.0, dtype=input.dtype, device=input.device)
+        total_sum = input.sum()
+        # Calculate standard deviation of the single sum value
+        # This is a bit unusual but follows the specification
+        if correction == 0:
+            std = torch.tensor(0.0, dtype=input.dtype, device=input.device)
+        else:
+            std = torch.tensor(float('nan'), dtype=input.dtype, device=input.device)
+        return total_sum, std
     else:
         # Sum along specified dimensions
         sum_result = input.sum(dim=dim, keepdim=keepdim)
-        # Calculate standard deviation
-        if isinstance(dim, int):
-            dim = (dim,)
-        # Calculate the number of elements along the reduced dimensions
-        num_elements = 1
-        for d in dim:
-            if d < 0:
-                d = input.dim() + d
-            num_elements *= input.shape[d]
-        # Apply Bessel's correction
-        if num_elements <= correction:
-            std_result = torch.zeros_like(sum_result, dtype=input.dtype)
+        
+        # Calculate standard deviation of the summed values
+        # For this implementation, we'll compute std of the flattened sum_result
+        # and return it as a scalar tensor
+        if correction == 0:
+            std = sum_result.std(unbiased=False)
         else:
-            # For simplicity, we'll use PyTorch's std function
-            # This is a fallback since we need to compute std of the sum values
-            # which is a bit tricky to do efficiently in Triton for this case
-            std_result = sum_result.std(correction=correction)
-    
-    # If out is provided, we need to handle it
-    if out is not None:
-        out.copy_(std_result)
-        return out
-    
-    return std_result
+            std = sum_result.std(unbiased=True)
+            
+        return sum_result, std
 
 ##################################################################################################################################################
 

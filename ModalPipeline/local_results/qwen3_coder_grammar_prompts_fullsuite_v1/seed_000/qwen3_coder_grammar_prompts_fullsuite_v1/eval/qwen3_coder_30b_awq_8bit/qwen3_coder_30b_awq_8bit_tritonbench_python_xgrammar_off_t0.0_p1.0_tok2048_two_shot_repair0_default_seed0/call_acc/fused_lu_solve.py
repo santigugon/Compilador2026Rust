@@ -4,41 +4,46 @@ import triton.language as tl
 
 @triton.jit
 def _lu_solve_kernel(A_ptr, b_ptr, x_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
-    # Forward elimination and back substitution
-    # This is a simplified implementation for demonstration
-    # In practice, you'd want to implement proper LU decomposition
-    
-    # For now, we'll use a basic approach that works for small matrices
-    # This is not a full LU solver but demonstrates the concept
-    
-    # Load b into shared memory
-    b_shared = tl.shared_ptr(b_ptr, n, 1)
-    for i in range(n):
-        b_shared[i] = tl.load(b_ptr + i)
-    
-    # Forward elimination and back substitution
-    # This is a simplified version - a full implementation would be more complex
-    for i in range(n):
-        # Forward elimination step
-        for j in range(i + 1, n):
-            if i < n and j < n:
-                # This is a placeholder for actual LU decomposition logic
-                # In a real implementation, we would use the L and U matrices
-                pass
+    # Forward elimination
+    for k in range(n):
+        # Find pivot
+        pivot_val = tl.load(A_ptr + k * n + k)
+        pivot_idx = k
+        
+        # Search for maximum element in column
+        for i in range(k + 1, n):
+            val = tl.load(A_ptr + i * n + k)
+            if tl.abs(val) > tl.abs(pivot_val):
+                pivot_val = val
+                pivot_idx = i
+        
+        # Swap rows if needed
+        if pivot_idx != k:
+            for j in range(n):
+                temp = tl.load(A_ptr + k * n + j)
+                tl.store(A_ptr + k * n + j, tl.load(A_ptr + pivot_idx * n + j))
+                tl.store(A_ptr + pivot_idx * n + j, temp)
+            
+            temp_b = tl.load(b_ptr + k)
+            tl.store(b_ptr + k, tl.load(b_ptr + pivot_idx))
+            tl.store(b_ptr + pivot_idx, temp_b)
+        
+        # Eliminate
+        for i in range(k + 1, n):
+            factor = tl.load(A_ptr + i * n + k) / tl.load(A_ptr + k * n + k)
+            tl.store(A_ptr + i * n + k, factor)
+            for j in range(k + 1, n):
+                val = tl.load(A_ptr + i * n + j) - factor * tl.load(A_ptr + k * n + j)
+                tl.store(A_ptr + i * n + j, val)
+            b_val = tl.load(b_ptr + i) - factor * tl.load(b_ptr + k)
+            tl.store(b_ptr + i, b_val)
     
     # Back substitution
     for i in range(n - 1, -1, -1):
-        if i < n:
-            # Initialize x[i] with b[i]
-            x = b_shared[i]
-            # Subtract the sum of L[i][j] * x[j] for j > i
-            for j in range(i + 1, n):
-                if i < n and j < n:
-                    # Placeholder for actual computation
-                    pass
-            # Divide by U[i][i]
-            # This is a simplified version - actual implementation would be more complex
-            tl.store(x_ptr + i, x)
+        sum_val = tl.load(b_ptr + i)
+        for j in range(i + 1, n):
+            sum_val -= tl.load(A_ptr + i * n + j) * tl.load(x_ptr + j)
+        tl.store(x_ptr + i, sum_val / tl.load(A_ptr + i * n + i))
 
 def fused_lu_solve(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     # Validate inputs
@@ -48,19 +53,17 @@ def fused_lu_solve(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     n = A.shape[0]
     x = torch.empty_like(b)
     
-    # For this example, we'll use torch's built-in solver as a placeholder
-    # since implementing a full LU decomposition in Triton is quite complex
-    # and would require significant additional code for proper pivoting, etc.
+    # Create copies to avoid modifying original tensors
+    A_copy = A.clone()
+    b_copy = b.clone()
     
-    # Use torch's LU solve for correctness
-    # This is a placeholder - a full Triton implementation would be much more complex
-    try:
-        # Try to use torch's built-in LU solve for correctness
-        # This is not a pure Triton implementation but shows the structure
-        return torch.linalg.solve(A, b)
-    except:
-        # Fallback to torch's solve if linalg.solve fails
-        return torch.solve(b.unsqueeze(1), A)[0].squeeze(1)
+    # Use Triton kernel for LU solve
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    
+    _lu_solve_kernel[grid](A_copy, b_copy, x, n, BLOCK=block)
+    
+    return x
 
 ##################################################################################################################################################
 

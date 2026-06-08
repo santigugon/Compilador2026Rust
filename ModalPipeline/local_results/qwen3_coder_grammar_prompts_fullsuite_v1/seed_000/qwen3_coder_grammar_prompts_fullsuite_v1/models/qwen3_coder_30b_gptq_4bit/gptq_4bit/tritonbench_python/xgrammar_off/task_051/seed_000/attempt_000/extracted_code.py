@@ -3,125 +3,103 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def cos_avg_pool1d_kernel(
-    input_ptr,
-    output_ptr,
-    input_stride_0,
-    input_stride_1,
-    input_stride_2,
-    output_stride_0,
-    output_stride_1,
-    output_stride_2,
-    input_size_0,
-    input_size_1,
-    input_size_2,
-    output_size_0,
-    output_size_1,
-    output_size_2,
-    kernel_size,
-    stride,
-    padding,
-    ceil_mode,
-    count_include_pad,
-    BLOCK_SIZE: tl.constexpr,
+def _cos_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.cos(x)
+    tl.store(out_ptr + offsets, y, mask=mask)
+
+@triton.jit
+def _avg_pool1d_kernel(
+    x_ptr, out_ptr, 
+    in_w: tl.constexpr, 
+    out_w: tl.constexpr, 
+    kernel_size: tl.constexpr, 
+    stride: tl.constexpr, 
+    padding: tl.constexpr,
+    ceil_mode: tl.constexpr,
+    count_include_pad: tl.constexpr,
+    BLOCK: tl.constexpr
 ):
-    # Get the block index
-    block_idx = tl.program_id(0)
+    pid = tl.program_id(0)
+    out_w_offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = out_w_offsets < out_w
     
-    # Calculate the output index
-    output_idx = block_idx * BLOCK_SIZE
+    # Calculate output positions
+    out_w_idx = out_w_offsets
+    start_idx = out_w_idx * stride - padding
     
-    # Calculate the input index
-    input_idx = output_idx * stride - padding
+    # Compute pool size and sum
+    pool_size = 0
+    pool_sum = 0.0
     
-    # Initialize accumulator
-    accumulator = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-    
-    # Loop over the kernel size
+    # Loop through kernel size
     for i in range(kernel_size):
-        # Calculate the input index
-        input_i = input_idx + i
+        current_idx = start_idx + i
+        # Check if current index is within bounds
+        valid = (current_idx >= 0) & (current_idx < in_w)
         
-        # Check if the input index is within bounds
-        if input_i >= 0 and input_i < input_size_2:
-            # Load the input value
-            input_val = tl.load(input_ptr + input_i * input_stride_2)
-            # Apply cosine
-            input_val = tl.cos(input_val)
-            # Accumulate
-            accumulator += input_val
+        # Load value
+        val = tl.load(x_ptr + current_idx, mask=valid, other=0.0)
+        
+        # Add to sum and count
+        pool_sum += val
+        pool_size += tl.where(valid, 1, 0)
     
-    # Calculate the number of elements included in the average
-    num_elements = 0
-    for i in range(kernel_size):
-        input_i = input_idx + i
-        if input_i >= 0 and input_i < input_size_2:
-            num_elements += 1
-    
-    # If count_include_pad is False, we need to adjust the number of elements
-    if not count_include_pad:
-        # Count the padding elements
-        padding_elements = 0
-        for i in range(kernel_size):
-            input_i = input_idx + i
-            if input_i < 0 or input_i >= input_size_2:
-                padding_elements += 1
-        num_elements -= padding_elements
-    
-    # Calculate the average
-    if num_elements > 0:
-        average = accumulator / num_elements
+    # Handle padding inclusion
+    if count_include_pad:
+        # If padding is included, we already counted it in pool_size
+        pass
     else:
-        average = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        # If padding is not included, we need to adjust pool_size
+        # This is handled by the mask in the load operation
+        pass
     
-    # Store the result
-    tl.store(output_ptr + output_idx * output_stride_2, average)
+    # Compute average
+    avg = pool_sum / tl.where(pool_size > 0, pool_size, 1.0)
+    
+    # Store result
+    tl.store(out_ptr + out_w_offsets, avg, mask=mask)
 
 def cos_avg_pool1d(input: torch.Tensor, kernel_size: int, stride: int = None, padding: int = 0, ceil_mode: bool = False, count_include_pad: bool = True) -> torch.Tensor:
-    # Handle default stride
+    # Handle stride default
     if stride is None:
         stride = kernel_size
     
     # Get input dimensions
     minibatch, in_channels, iW = input.shape
     
-    # Calculate output size
+    # Apply cosine function
+    cos_input = torch.empty_like(input)
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _cos_kernel[grid](input, cos_input, n, BLOCK=block)
+    
+    # Calculate output width
     if ceil_mode:
-        output_size = (iW + 2 * padding - kernel_size) // stride + 1
+        out_w = (iW + 2 * padding - kernel_size) // stride + 1
+        if (iW + 2 * padding - kernel_size) % stride != 0:
+            out_w += 1
     else:
-        output_size = (iW + 2 * padding - kernel_size) // stride + 1
+        out_w = (iW + 2 * padding - kernel_size) // stride + 1
+    
+    # Ensure out_w is not negative
+    out_w = max(0, out_w)
     
     # Create output tensor
-    output = torch.zeros((minibatch, in_channels, output_size), device=input.device, dtype=input.dtype)
+    out = torch.empty(minibatch, in_channels, out_w, dtype=input.dtype, device=input.device)
     
-    # Define block size
-    BLOCK_SIZE = 1024
+    # Apply average pooling
+    if out_w > 0:
+        block = 256
+        grid = (triton.cdiv(out_w, block),)
+        _avg_pool1d_kernel[grid](
+            cos_input, out,
+            iW, out_w, kernel_size, stride, padding,
+            ceil_mode, count_include_pad, BLOCK=block
+        )
     
-    # Calculate grid size
-    grid = (output_size + BLOCK_SIZE - 1) // BLOCK_SIZE
-    
-    # Launch kernel
-    cos_avg_pool1d_kernel[grid](
-        input_ptr=input.data_ptr(),
-        output_ptr=output.data_ptr(),
-        input_stride_0=input.stride(0),
-        input_stride_1=input.stride(1),
-        input_stride_2=input.stride(2),
-        output_stride_0=output.stride(0),
-        output_stride_1=output.stride(1),
-        output_stride_2=output.stride(2),
-        input_size_0=minibatch,
-        input_size_1=in_channels,
-        input_size_2=iW,
-        output_size_0=minibatch,
-        output_size_1=in_channels,
-        output_size_2=output_size,
-        kernel_size=kernel_size,
-        stride=stride,
-        padding=padding,
-        ceil_mode=ceil_mode,
-        count_include_pad=count_include_pad,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    
-    return output
+    return out

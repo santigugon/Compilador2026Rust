@@ -3,129 +3,107 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _sgd_kernel(
-    param_ptr, 
-    grad_ptr, 
-    momentum_ptr, 
-    buf_ptr,
-    lr, 
-    momentum_factor, 
-    weight_decay, 
-    dampening, 
-    nesterov, 
+def sgd_kernel(
+    params_ptr,
+    grads_ptr,
+    momentum_ptr,
+    state_ptr,
+    lr,
+    momentum_val,
+    weight_decay,
+    dampening,
+    nesterov,
     maximize,
-    numel: tl.constexpr,
-    BLOCK: tl.constexpr
+    num_params,
+    BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < numel
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_params
     
-    param = tl.load(param_ptr + offsets, mask=mask, other=0.0)
-    grad = tl.load(grad_ptr + offsets, mask=mask, other=0.0)
+    params = tl.load(params_ptr + offsets, mask=mask)
+    grads = tl.load(grads_ptr + offsets, mask=mask)
     
-    # Apply weight decay
     if weight_decay != 0:
-        grad = grad + weight_decay * param
+        grads = grads + weight_decay * params
     
-    # Update momentum
-    if momentum_factor != 0:
-        momentum = tl.load(momentum_ptr + offsets, mask=mask, other=0.0)
-        momentum = momentum * momentum_factor + grad * (1 - dampening)
-        tl.store(momentum_ptr + offsets, momentum, mask=mask)
+    if momentum_val != 0:
+        momentum_vals = tl.load(momentum_ptr + offsets, mask=mask)
+        momentum_vals = momentum_val * momentum_vals + (1 - dampening) * grads
+        tl.store(momentum_ptr + offsets, momentum_vals, mask=mask)
         
-        # Apply Nesterov momentum
         if nesterov:
-            grad = grad + momentum_factor * momentum
+            grads = grads + momentum_val * momentum_vals
         else:
-            grad = momentum
-    else:
-        # Apply dampening for non-momentum case
-        if dampening != 0:
-            grad = grad * (1 - dampening)
+            grads = momentum_vals
     
-    # Apply learning rate and maximize
     if maximize:
-        param = param + lr * grad
+        params = params + lr * grads
     else:
-        param = param - lr * grad
+        params = params - lr * grads
     
-    tl.store(param_ptr + offsets, param, mask=mask)
+    tl.store(params_ptr + offsets, params, mask=mask)
 
 def SGD(params, lr=1e-3, momentum=0, weight_decay=0, dampening=0, nesterov=False, maximize=False, foreach=None, differentiable=False, fused=None):
-    # Handle scalar learning rate
-    if not torch.is_tensor(lr):
-        lr = torch.tensor(lr, dtype=torch.float32)
+    if not isinstance(params, list):
+        params = [params]
     
-    # Handle scalar momentum
-    if not torch.is_tensor(momentum):
-        momentum = torch.tensor(momentum, dtype=torch.float32)
+    if len(params) == 0:
+        return
     
-    # Handle scalar weight decay
-    if not torch.is_tensor(weight_decay):
-        weight_decay = torch.tensor(weight_decay, dtype=torch.float32)
+    # Flatten all parameters
+    param_list = []
+    for p in params:
+        if isinstance(p, torch.Tensor):
+            param_list.append(p)
     
-    # Handle scalar dampening
-    if not torch.is_tensor(dampening):
-        dampening = torch.tensor(dampening, dtype=torch.float32)
+    if len(param_list) == 0:
+        return
     
-    # Handle scalar nesterov
-    if not torch.is_tensor(nesterov):
-        nesterov = torch.tensor(nesterov, dtype=torch.bool)
+    # Flatten all parameters into a single tensor
+    flat_params = torch.cat([p.flatten() for p in param_list])
+    num_params = flat_params.numel()
     
-    # Handle scalar maximize
-    if not torch.is_tensor(maximize):
-        maximize = torch.tensor(maximize, dtype=torch.bool)
+    # Initialize momentum if needed
+    momentum_tensor = torch.zeros_like(flat_params) if momentum != 0 else None
     
-    # For simplicity, we'll process each parameter separately
-    # In a real implementation, we'd want to batch this
-    for param in params:
-        if param.grad is None:
-            continue
-            
-        grad = param.grad
-        if grad is None:
-            continue
-            
-        # Initialize momentum buffer if needed
-        if momentum != 0:
-            if not hasattr(param, 'momentum_buffer'):
-                param.momentum_buffer = torch.zeros_like(param)
-            momentum_buffer = param.momentum_buffer
-        else:
-            momentum_buffer = None
-            
-        # Create output tensor
-        out = torch.empty_like(param)
-        
-        # Launch kernel
-        n = param.numel()
-        block = 256
-        grid = (triton.cdiv(n, block),)
-        
-        # Prepare buffers for kernel
-        if momentum_buffer is not None:
-            buf = momentum_buffer
-        else:
-            buf = torch.empty_like(param)
-        
-        _sgd_kernel[grid](
-            param.data_ptr(),
-            grad.data_ptr(),
-            buf.data_ptr() if momentum_buffer is not None else 0,
-            buf.data_ptr() if momentum_buffer is not None else 0,
-            lr.item() if torch.is_tensor(lr) else lr,
-            momentum.item() if torch.is_tensor(momentum) else momentum,
-            weight_decay.item() if torch.is_tensor(weight_decay) else weight_decay,
-            dampening.item() if torch.is_tensor(dampening) else dampening,
-            nesterov.item() if torch.is_tensor(nesterov) else nesterov,
-            maximize.item() if torch.is_tensor(maximize) else maximize,
-            n,
-            BLOCK=block
-        )
-        
-        # Update momentum buffer if needed
-        if momentum_buffer is not None:
-            param.momentum_buffer = buf
+    # Create a single tensor for gradients
+    flat_grads = torch.cat([p.grad.flatten() for p in param_list if p.grad is not None])
+    
+    # Ensure same size
+    if flat_grads.numel() != num_params:
+        raise ValueError("Parameter and gradient sizes do not match")
+    
+    # Launch kernel
+    BLOCK_SIZE = 256
+    num_blocks = (num_params + BLOCK_SIZE - 1) // BLOCK_SIZE
+    
+    # Create a single tensor for state
+    state = torch.zeros_like(flat_params) if momentum != 0 else None
+    
+    # Launch kernel
+    sgd_kernel[(num_blocks,)](
+        flat_params,
+        flat_grads,
+        momentum_tensor,
+        state,
+        lr,
+        momentum,
+        weight_decay,
+        dampening,
+        nesterov,
+        maximize,
+        num_params,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    # Copy back to original parameters
+    offset = 0
+    for p in param_list:
+        if p.grad is not None:
+            size = p.numel()
+            p.data = flat_params[offset:offset+size].view(p.shape)
+            offset += size
     
     return params

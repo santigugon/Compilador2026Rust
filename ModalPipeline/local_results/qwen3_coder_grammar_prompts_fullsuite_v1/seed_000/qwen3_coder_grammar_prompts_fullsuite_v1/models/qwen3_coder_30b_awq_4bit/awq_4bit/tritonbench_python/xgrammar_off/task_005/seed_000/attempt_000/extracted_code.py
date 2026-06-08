@@ -3,34 +3,41 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _relu_sqrt_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    # Apply ReLU: set negative values to zero
-    x = tl.maximum(x, 0.0)
-    # Apply square root
-    y = tl.sqrt(x)
-    tl.store(out_ptr + offsets, y, mask=mask)
+def relu_sqrt_kernel(
+    input_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    relu_input = tl.maximum(input, 0.0)
+    output = tl.sqrt(relu_input)
+    tl.store(output_ptr + offsets, output, mask=mask)
 
-def relu_sqrt(input, inplace=False, out=None):
+def relu_sqrt(input, inplace=False, out=None) -> torch.Tensor:
     if inplace:
-        # Check if input is contiguous and can be modified in-place
-        if not input.is_contiguous():
-            # If not contiguous, we can't do in-place modification safely
-            inplace = False
-        else:
-            # For in-place operation, we modify the input tensor directly
-            out = input
+        output = input
+    elif out is not None:
+        output = out
+    else:
+        output = torch.empty_like(input)
     
-    if out is None:
-        out = torch.empty_like(input)
+    if not input.is_contiguous() or not output.is_contiguous():
+        raise ValueError("Input and output tensors must be contiguous")
     
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    n_elements = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
     
-    _relu_sqrt_kernel[grid](input, out, n, BLOCK=block)
+    relu_sqrt_kernel[grid](
+        input,
+        output,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
     
-    return out
+    return output

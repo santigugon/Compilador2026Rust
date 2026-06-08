@@ -11,7 +11,8 @@ def leaky_relu_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
     input = tl.load(input_ptr + offsets, mask=mask)
     output = tl.where(input > 0, input, negative_slope * input)

@@ -3,46 +3,35 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def ones_like_kernel(
-    input_ptr,
-    output_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    tl.store(output_ptr + offsets, tl.full((BLOCK_SIZE,), 1.0, dtype=tl.float32), mask=mask)
+def _ones_like_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    # Load input to ensure we have the right shape and stride info
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    # Store ones with the same shape and stride
+    tl.store(out_ptr + offsets, 1.0, mask=mask)
 
 def ones_like(input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format):
-    if layout is not None and layout != torch.strided:
-        raise ValueError("Triton implementation only supports strided layout")
-    if device is not None and device.type != 'cuda':
-        raise ValueError("Triton implementation only supports CUDA tensors")
-    if memory_format != torch.preserve_format:
-        raise ValueError("Triton implementation only supports preserve_format memory format")
-    
-    # Determine output dtype
+    # Handle dtype, layout, device parameters
     if dtype is None:
         dtype = input.dtype
-    else:
-        # Ensure dtype is a torch dtype
-        dtype = torch.tensor([], dtype=dtype).dtype
+    if device is None:
+        device = input.device
+    if layout is None:
+        layout = input.layout
     
-    # Create output tensor with same shape as input
-    output = torch.empty_like(input, dtype=dtype, device=input.device, requires_grad=requires_grad)
+    # Create output tensor with same shape as input but with specified dtype and device
+    out = torch.empty_like(input, dtype=dtype, device=device, layout=layout, requires_grad=requires_grad)
+    
+    # If input is empty, return empty output
+    if input.numel() == 0:
+        return out
     
     # Launch kernel
-    n_elements = output.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _ones_like_kernel[grid](input, out, n, BLOCK=block)
     
-    ones_like_kernel[grid](
-        input_ptr=input.data_ptr(),
-        output_ptr=output.data_ptr(),
-        n_elements=n_elements,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    
-    return output
+    return out

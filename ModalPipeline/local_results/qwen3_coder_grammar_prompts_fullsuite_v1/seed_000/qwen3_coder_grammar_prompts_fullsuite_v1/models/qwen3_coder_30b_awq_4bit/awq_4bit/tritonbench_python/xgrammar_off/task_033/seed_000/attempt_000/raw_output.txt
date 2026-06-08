@@ -4,78 +4,88 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _logsumexp_kernel(x_ptr, out_ptr, dim_size: tl.constexpr, total_elements: tl.constexpr, BLOCK: tl.constexpr):
+def logsumexp_kernel(
+    input_ptr, 
+    output_ptr, 
+    num_elements, 
+    dim_size, 
+    stride_input, 
+    stride_output,
+    BLOCK_SIZE: tl.constexpr
+):
     pid = tl.program_id(0)
-    # Calculate the number of elements per block
-    num_blocks = tl.cdiv(total_elements, BLOCK)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_elements
     
-    # Initialize accumulator for max value
-    max_val = tl.full([], -float('inf'), dtype=tl.float32)
+    input_ptrs = input_ptr + offsets * stride_input
+    input_vals = tl.load(input_ptrs, mask=mask)
     
-    # First pass: find the maximum value along the specified dimension
-    for i in range(0, num_blocks):
-        offsets = i * BLOCK + tl.arange(0, BLOCK)
-        mask = offsets < total_elements
-        x = tl.load(x_ptr + offsets, mask=mask, other=-float('inf'))
-        max_val = tl.maximum(max_val, tl.max(x, axis=0))
+    # Find max value for numerical stability
+    max_val = tl.max(input_vals)
     
-    # Second pass: compute log(sum(exp(x - max_val)) + max_val)
-    # This is numerically stable
-    sum_exp = tl.full([], 0.0, dtype=tl.float32)
-    for i in range(0, num_blocks):
-        offsets = i * BLOCK + tl.arange(0, BLOCK)
-        mask = offsets < total_elements
-        x = tl.load(x_ptr + offsets, mask=mask, other=-float('inf'))
-        exp_x = tl.exp(x - max_val)
-        sum_exp += tl.sum(exp_x, axis=0)
+    # Compute sum of exponentials
+    exp_vals = tl.exp(input_vals - max_val)
+    sum_exp = tl.sum(exp_vals)
     
-    result = tl.log(sum_exp) + max_val
-    tl.store(out_ptr, result)
+    # Compute log of sum of exponentials
+    log_sum_exp = tl.log(sum_exp) + max_val
+    
+    # Store result
+    output_ptrs = output_ptr + pid * stride_output
+    tl.store(output_ptrs, log_sum_exp)
 
-def logsumexp(input, dim, keepdim=False, *, out=None):
-    # Handle scalar input case
-    if input.dim() == 0:
-        if out is not None:
-            out.copy_(input)
-        else:
-            out = input.clone()
-        return out
+def logsumexp(input, dim, keepdim=False, *, out=None) -> torch.Tensor:
+    if out is not None:
+        raise NotImplementedError("out parameter is not supported")
     
-    # Handle negative dimension
+    input = input.contiguous()
+    input_shape = input.shape
+    input_rank = len(input_shape)
+    
+    # Normalize dim to be in [0, input_rank)
     if dim < 0:
-        dim = input.dim() + dim
+        dim = dim + input_rank
     
-    # Validate dimension
-    if dim < 0 or dim >= input.dim():
-        raise ValueError(f"Dimension {dim} is out of range for input with {input.dim()} dimensions")
-    
-    # For simplicity, we'll use a more direct approach for the reduction
-    # This implementation handles the core computation using Triton
-    # but for complex cases, we'll fall back to PyTorch for correctness
-    
-    # Create output tensor
-    if out is not None:
-        # Validate output tensor
-        if out.shape != input.shape:
-            raise ValueError("Output tensor shape must match input tensor shape")
+    # Create output tensor shape
+    if keepdim:
+        output_shape = list(input_shape)
+        output_shape[dim] = 1
     else:
-        # Create output tensor with correct shape
-        out_shape = list(input.shape)
-        if keepdim:
-            out_shape[dim] = 1
-        else:
-            out_shape.pop(dim)
-        out = torch.empty(out_shape, dtype=input.dtype, device=input.device)
+        output_shape = [input_shape[i] for i in range(input_rank) if i != dim]
     
-    # For this implementation, we'll use a simpler approach that works
-    # with the standard PyTorch reduction for better numerical stability
-    # and correctness
+    # Calculate output tensor
+    output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
     
-    # Use PyTorch's implementation for correctness
-    if out is not None:
-        torch.logsumexp(input, dim=dim, keepdim=keepdim, out=out)
+    # Get the size of the dimension we're reducing
+    dim_size = input_shape[dim]
+    
+    # Calculate total elements
+    num_elements = input.numel()
+    
+    # Set up kernel launch parameters
+    BLOCK_SIZE = 1024
+    num_blocks = (num_elements + BLOCK_SIZE - 1) // BLOCK_SIZE
+    
+    # Create a view of the input tensor for the kernel
+    # We need to handle the reduction dimension specially
+    if dim == input_rank - 1:
+        stride_input = 1
+        stride_output = 1
     else:
-        out = torch.logsumexp(input, dim=dim, keepdim=keepdim)
+        stride_input = input.stride()[dim]
+        stride_output = 1
     
-    return out
+    # Launch kernel
+    logsumexp_kernel[(num_blocks,)](
+        input.data_ptr(),
+        output.data_ptr(),
+        num_elements,
+        dim_size,
+        stride_input,
+        stride_output,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return output
 ```

@@ -3,44 +3,55 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _cos_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    y = tl.cos(x)
-    tl.store(out_ptr + offsets, y, mask=mask)
-
-@triton.jit
-def _avg_pool1d_kernel(x_ptr, out_ptr, input_size: tl.constexpr, output_size: tl.constexpr, 
-                       kernel_size: tl.constexpr, stride: tl.constexpr, padding: tl.constexpr,
-                       ceil_mode: tl.constexpr, count_include_pad: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+def cos_avg_pool1d_kernel(
+    input_ptr, 
+    output_ptr, 
+    input_size, 
+    output_size, 
+    kernel_size, 
+    stride, 
+    padding, 
+    count_include_pad,
+    BLOCK_SIZE: tl.constexpr
+):
+    # Get the block index
+    block_idx = tl.program_id(0)
     
-    # Calculate output indices
-    output_idx = offsets // kernel_size
-    kernel_idx = offsets % kernel_size
+    # Calculate the starting position for this block
+    start_pos = block_idx * BLOCK_SIZE
     
-    # Initialize accumulator
-    accumulator = tl.zeros([BLOCK], dtype=tl.float32)
-    count = tl.zeros([BLOCK], dtype=tl.int32)
-    
-    # Loop over input elements
-    for i in range(0, input_size, BLOCK):
-        input_offsets = i + kernel_idx
-        mask = (input_offsets < input_size) & (output_idx < output_size)
+    # Loop over the output elements
+    for i in range(0, BLOCK_SIZE):
+        if start_pos + i >= output_size:
+            break
+            
+        # Calculate the pooling window start and end positions
+        pool_start = start_pos + i * stride - padding
+        pool_end = pool_start + kernel_size
         
-        # Load input values
-        x = tl.load(x_ptr + input_offsets, mask=mask, other=0.0)
+        # Adjust for padding
+        pool_start = tl.max(pool_start, 0)
+        pool_end = tl.min(pool_end, input_size)
         
-        # Accumulate values
-        accumulator = tl.where(mask, accumulator + x, accumulator)
-        count = tl.where(mask, count + 1, count)
-    
-    # Compute average
-    avg = tl.where(count > 0, accumulator / count, 0.0)
-    tl.store(out_ptr + offsets, avg, mask=output_idx < output_size)
+        # Calculate the number of elements in the pooling window
+        num_elements = pool_end - pool_start
+        
+        # If no elements, set output to 0
+        if num_elements <= 0:
+            tl.store(output_ptr + start_pos + i, 0.0)
+            continue
+            
+        # Compute the sum of cosine values in the pooling window
+        sum_cos = 0.0
+        for j in range(pool_start, pool_end):
+            input_val = tl.load(input_ptr + j)
+            sum_cos += tl.cos(input_val)
+            
+        # Compute the average
+        avg = sum_cos / num_elements if not count_include_pad or num_elements > 0 else 0.0
+        
+        # Store the result
+        tl.store(output_ptr + start_pos + i, avg)
 
 def cos_avg_pool1d(input: torch.Tensor, kernel_size: int, stride: int = None, padding: int = 0, ceil_mode: bool = False, count_include_pad: bool = True) -> torch.Tensor:
     # Handle default stride
@@ -50,44 +61,37 @@ def cos_avg_pool1d(input: torch.Tensor, kernel_size: int, stride: int = None, pa
     # Get input dimensions
     batch_size, channels, input_length = input.shape
     
-    # Apply cosine operation
-    cos_input = torch.empty_like(input)
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    _cos_kernel[grid](input, cos_input, n, BLOCK=block)
-    
     # Calculate output length
     if ceil_mode:
         output_length = (input_length + 2 * padding - kernel_size) // stride + 1
     else:
         output_length = (input_length + 2 * padding - kernel_size) // stride + 1
     
-    # Handle edge case where output_length is 0
-    if output_length <= 0:
-        output_length = 1
+    # Create output tensor
+    output = torch.empty(batch_size, channels, output_length, device=input.device, dtype=input.dtype)
     
-    # Apply average pooling
-    output = torch.empty(batch_size, channels, output_length, dtype=torch.float32, device=input.device)
+    # Flatten input for easier processing
+    input_flat = input.view(-1, input_length)
+    output_flat = output.view(-1, output_length)
     
-    # Flatten for processing
-    flat_cos = cos_input.view(-1, input_length)
-    flat_output = output.view(-1, output_length)
-    
-    # Process each channel
-    for i in range(flat_cos.shape[0]):
-        # For simplicity, we'll use PyTorch's built-in average pooling for the actual pooling operation
-        # since implementing a full 1D average pooling kernel with proper stride and padding
-        # is complex and would require more sophisticated indexing
-        input_channel = flat_cos[i:i+1, :]
-        output_channel = torch.nn.functional.avg_pool1d(
-            input_channel.unsqueeze(0), 
-            kernel_size=kernel_size, 
-            stride=stride, 
-            padding=padding, 
-            ceil_mode=ceil_mode, 
-            count_include_pad=count_include_pad
-        ).squeeze(0)
-        flat_output[i:i+1, :] = output_channel
+    # Launch kernel
+    for i in range(input_flat.shape[0]):
+        # Get input and output pointers
+        input_ptr = input_flat[i].data_ptr()
+        output_ptr = output_flat[i].data_ptr()
+        
+        # Launch kernel with appropriate grid size
+        grid_size = (output_length + 256 - 1) // 256
+        cos_avg_pool1d_kernel[grid_size](
+            input_ptr,
+            output_ptr,
+            input_length,
+            output_length,
+            kernel_size,
+            stride,
+            padding,
+            count_include_pad,
+            BLOCK_SIZE=256
+        )
     
     return output

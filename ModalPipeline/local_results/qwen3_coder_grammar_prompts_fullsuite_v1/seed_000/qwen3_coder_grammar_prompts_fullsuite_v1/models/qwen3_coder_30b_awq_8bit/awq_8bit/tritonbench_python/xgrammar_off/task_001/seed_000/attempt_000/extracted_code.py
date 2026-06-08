@@ -27,29 +27,31 @@ def div(input, other, *, rounding_mode=None, out=None):
         other = torch.tensor(other, dtype=input.dtype, device=input.device)
     
     # Handle broadcasting
-    expanded_input, expanded_other = torch.broadcast_tensors(input, other)
+    input, other = torch.broadcast_tensors(input, other)
     
     # Determine output tensor
     if out is not None:
-        result = out
+        if out.shape != input.shape:
+            raise ValueError("Output tensor shape must match input tensor shape")
+        out = out
     else:
-        result = torch.empty_like(expanded_input)
+        out = torch.empty_like(input)
     
     # Get total number of elements
-    n = expanded_input.numel()
+    n = input.numel()
     
     # Set up kernel launch parameters
     block = 256
     grid = (triton.cdiv(n, block),)
     
-    # Launch kernel
-    _div_kernel[grid](
-        expanded_input,
-        expanded_other,
-        result,
-        n,
-        rounding_mode,
-        BLOCK=block
-    )
+    # Determine rounding mode
+    rounding_mode_enum = None
+    if rounding_mode is not None:
+        if rounding_mode not in ["trunc", "floor"]:
+            raise ValueError("rounding_mode must be None, 'trunc', or 'floor'")
+        rounding_mode_enum = rounding_mode
     
-    return result
+    # Launch kernel
+    _div_kernel[grid](input, other, out, n, rounding_mode_enum, BLOCK=block)
+    
+    return out

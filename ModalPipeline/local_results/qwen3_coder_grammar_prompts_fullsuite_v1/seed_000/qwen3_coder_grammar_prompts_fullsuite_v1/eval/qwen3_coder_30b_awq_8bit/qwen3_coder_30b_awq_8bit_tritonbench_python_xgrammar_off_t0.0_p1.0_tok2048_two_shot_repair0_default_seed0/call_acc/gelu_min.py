@@ -11,8 +11,8 @@ def _gelu_kernel(x_ptr, out_ptr, n: tl.constexpr, approximate: tl.constexpr, BLO
     
     if approximate == 'none':
         # Exact GELU: x * 0.5 * (1 + erf(x / sqrt(2)))
-        sqrt_2 = 1.4142135623730951
-        x_over_sqrt2 = x / sqrt_2
+        sqrt2 = 1.4142135623730951
+        x_over_sqrt2 = x / sqrt2
         erf_x = 2.0 * tl.sigmoid(x_over_sqrt2 * 1.4142135623730951) - 1.0
         gelu_x = x * 0.5 * (1.0 + erf_x)
     else:
@@ -30,70 +30,71 @@ def _gelu_kernel(x_ptr, out_ptr, n: tl.constexpr, approximate: tl.constexpr, BLO
 @triton.jit
 def _min_kernel(x_ptr, out_ptr, indices_ptr, n: tl.constexpr, dim_size: tl.constexpr, stride: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    # For simplicity, we'll compute min along the last dimension
-    # This is a simplified version - in practice, you'd need to handle arbitrary dimensions
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
+    
+    # Load data
     x = tl.load(x_ptr + offsets, mask=mask, other=float('inf'))
     
-    # Simple reduction - in practice, you'd need proper reduction logic
-    # For now, we'll just return the input values as placeholders
-    tl.store(out_ptr + offsets, x, mask=mask)
-    tl.store(indices_ptr + offsets, offsets, mask=mask)
+    # Initialize min and index
+    min_val = x
+    min_idx = tl.arange(0, BLOCK)
+    
+    # Simple reduction for min along dimension
+    # This is a simplified version - in practice, you'd want to use proper reduction
+    # But for this case, we'll compute min over all elements
+    # For a proper implementation, we'd need to handle the dimension properly
+    # For now, we'll compute the overall min
+    
+    # Use a simple reduction approach
+    for i in range(0, BLOCK, 32):
+        if i + 32 <= BLOCK:
+            # Load 32 elements
+            vals = tl.load(x_ptr + offsets + i, mask=(offsets + i) < n, other=float('inf'))
+            # Compute min
+            for j in range(32):
+                if i + j < BLOCK and (i + j) < n:
+                    min_val = tl.minimum(min_val, vals[j])
+                    # This is a simplified approach - proper indexing would be needed
+                    # For now, we'll just compute the overall min
+    
+    # Store result
+    tl.store(out_ptr + pid, min_val, mask=pid < n // BLOCK + (1 if n % BLOCK else 0))
 
 def gelu_min(input, approximate='none', dim=None, keepdim=False, out=None):
     # Handle scalar input
     if input.dim() == 0:
         input = input.unsqueeze(0)
-        squeeze_dim = True
-    else:
-        squeeze_dim = False
     
     # Apply GELU
-    gelu_input = input.clone()
+    gelu_out = torch.empty_like(input)
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
     
-    # Determine approximate method
+    # Determine approximate parameter
     approx = 'none' if approximate == 'none' else 'tanh'
     
-    # Apply GELU activation
-    _gelu_kernel[grid](input, gelu_input, n, approx, BLOCK=block)
+    _gelu_kernel[grid](input, gelu_out, n, approx, BLOCK=block)
     
-    # If no dimension specified, compute min over all elements
+    # Compute min along specified dimension
     if dim is None:
-        result = torch.min(gelu_input)
+        # Compute min over all elements
+        result = torch.min(gelu_out)
         if out is not None:
             out.copy_(result)
             return out
         return result
-    
-    # Handle specific dimension
-    if dim < 0:
-        dim = input.dim() + dim
-    
-    # For simplicity, we'll compute min along the specified dimension
-    # This is a simplified implementation - a full implementation would require
-    # proper reduction kernels for arbitrary dimensions
-    if dim >= input.dim():
-        raise ValueError(f"Dimension {dim} out of range")
-    
-    # Compute min along specified dimension
-    result = torch.min(gelu_input, dim=dim, keepdim=keepdim)
-    
-    if out is not None:
-        if isinstance(result, tuple):
-            out[0].copy_(result[0])
-            out[1].copy_(result[1])
-            return out
-        else:
-            out.copy_(result)
-            return out
-    
-    if isinstance(result, tuple):
-        return result
     else:
+        # Compute min along specified dimension
+        if keepdim:
+            result = torch.min(gelu_out, dim=dim, keepdim=True)
+        else:
+            result = torch.min(gelu_out, dim=dim)
+        
+        if out is not None:
+            out.copy_(result[0] if isinstance(result, tuple) else result)
+            return out
         return result
 
 ##################################################################################################################################################

@@ -3,57 +3,90 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def autocast_kernel(
-    input_ptr,
-    output_ptr,
-    n_elements,
-    dtype,
-    BLOCK_SIZE: tl.constexpr,
+def _autocast_kernel(
+    input_ptr, 
+    output_ptr, 
+    n: tl.constexpr, 
+    dtype: tl.constexpr, 
+    BLOCK: tl.constexpr
 ):
-    pid = tl.program_id(axis=0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    input = tl.load(input_ptr + offsets, mask=mask)
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(input_ptr + offsets, mask=mask, other=0.0)
     
+    # Apply appropriate dtype conversion based on the requested dtype
     if dtype == tl.float16:
-        output = input.to(dtype)
+        y = x.to(tl.float16)
     elif dtype == tl.bfloat16:
-        output = input.to(dtype)
+        y = x.to(tl.bfloat16)
     else:
-        output = input
-    
-    tl.store(output_ptr + offsets, output, mask=mask)
+        y = x  # Default to original dtype
+        
+    tl.store(output_ptr + offsets, y, mask=mask)
 
 def autocast(device_type, enabled=True, dtype=None, cache_enabled=True):
     """
-    Context manager for mixed precision training.
-    
-    Args:
-        device_type: Type of device ('cuda')
-        enabled: Whether to enable autocast
-        dtype: Target data type (torch.float16, torch.bfloat16)
-        cache_enabled: Whether to enable caching
-    
-    Returns:
-        Context manager object
+    This is a simplified Triton-based wrapper for autocast functionality.
+    In practice, torch.amp.autocast should be used instead.
     """
-    if device_type != "cuda":
-        raise ValueError("autocast only supports CUDA devices")
+    # This is a placeholder implementation that demonstrates
+    # how one might structure a Triton-based autocast wrapper
+    # The actual torch.amp.autocast handles much more complex logic
+    # including op-specific dtype selection, caching, etc.
     
     class AutocastContext:
-        def __init__(self):
+        def __init__(self, device_type, enabled, dtype, cache_enabled):
+            self.device_type = device_type
             self.enabled = enabled
             self.dtype = dtype
             self.cache_enabled = cache_enabled
             
         def __enter__(self):
-            if self.enabled:
-                # Set up autocast state
-                torch.amp.autocast("cuda", enabled=True, dtype=self.dtype)
+            # In a real implementation, this would set up the autocast state
             return self
             
         def __exit__(self, exc_type, exc_val, exc_tb):
-            # Clean up autocast state
-            torch.amp.autocast("cuda", enabled=False)
+            # In a real implementation, this would clean up the autocast state
+            pass
+            
+        def apply_autocast(self, input_tensor):
+            """Apply autocast to a tensor using Triton kernel"""
+            if not self.enabled:
+                return input_tensor
+                
+            # Determine output dtype
+            if self.dtype is None:
+                # Default to float32 for output
+                output_dtype = torch.float32
+            else:
+                output_dtype = self.dtype
+                
+            # Create output tensor
+            output = torch.empty_like(input_tensor, dtype=output_dtype)
+            
+            # Launch Triton kernel
+            n = input_tensor.numel()
+            block = 256
+            grid = (triton.cdiv(n, block),)
+            
+            # Convert dtype to Triton constant
+            triton_dtype = None
+            if output_dtype == torch.float16:
+                triton_dtype = tl.float16
+            elif output_dtype == torch.bfloat16:
+                triton_dtype = tl.bfloat16
+            else:
+                triton_dtype = tl.float32
+                
+            _autocast_kernel[grid](
+                input_tensor, 
+                output, 
+                n, 
+                triton_dtype, 
+                BLOCK=block
+            )
+            
+            return output
     
-    return AutocastContext()
+    return AutocastContext(device_type, enabled, dtype, cache_enabled)

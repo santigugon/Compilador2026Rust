@@ -21,26 +21,23 @@ def _autocast_kernel(
     elif dtype == tl.bfloat16:
         output = input.to(tl.bfloat16)
     else:
-        output = input
-    
+        output = input.to(tl.float32)
+        
     tl.store(output_ptr + offsets, output, mask=mask)
 
 def autocast(device_type, enabled=True, dtype=None, cache_enabled=True):
     """
-    Context manager for mixed precision autocasting.
+    Context manager for mixed precision training.
     
     Args:
-        device_type: Type of device ('cuda' expected)
+        device_type: Type of device ('cuda')
         enabled: Whether to enable autocast
-        dtype: Target data type for autocast
+        dtype: Data type for autocast
         cache_enabled: Whether to enable caching
     
     Returns:
-        Context manager for autocast operations
+        Context manager for autocast
     """
-    if device_type != "cuda":
-        raise ValueError("autocast is only supported for CUDA devices")
-    
     class AutocastContext:
         def __init__(self):
             self.enabled = enabled
@@ -48,9 +45,10 @@ def autocast(device_type, enabled=True, dtype=None, cache_enabled=True):
             self.cache_enabled = cache_enabled
             
         def __enter__(self):
-            # Store original settings
+            # Store original autocast state
             self.original_enabled = torch.is_autocast_enabled()
             self.original_dtype = torch.get_autocast_gpu_dtype()
+            
             # Enable autocast if needed
             if self.enabled:
                 torch.set_autocast_enabled(True)
@@ -59,32 +57,16 @@ def autocast(device_type, enabled=True, dtype=None, cache_enabled=True):
             return self
             
         def __exit__(self, exc_type, exc_val, exc_tb):
-            # Restore original settings
+            # Restore original autocast state
             torch.set_autocast_enabled(self.original_enabled)
             torch.set_autocast_gpu_dtype(self.original_dtype)
             
-        def apply_mixed_precision(self, tensor):
-            """Apply mixed precision transformation to tensor"""
-            if not self.enabled:
-                return tensor
+        def __call__(self, func):
+            def wrapper(*args, **kwargs):
+                with self:
+                    return func(*args, **kwargs)
+            return wrapper
             
-            if self.dtype is not None:
-                # Use Triton kernel for type conversion
-                output = torch.empty_like(tensor, dtype=self.dtype)
-                n_elements = tensor.numel()
-                BLOCK_SIZE = 1024
-                grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-                
-                _autocast_kernel[grid](
-                    tensor.data_ptr(),
-                    output.data_ptr(),
-                    n_elements,
-                    self.dtype,
-                    BLOCK_SIZE=BLOCK_SIZE
-                )
-                return output
-            return tensor
-    
     return AutocastContext()
 
 ##################################################################################################################################################

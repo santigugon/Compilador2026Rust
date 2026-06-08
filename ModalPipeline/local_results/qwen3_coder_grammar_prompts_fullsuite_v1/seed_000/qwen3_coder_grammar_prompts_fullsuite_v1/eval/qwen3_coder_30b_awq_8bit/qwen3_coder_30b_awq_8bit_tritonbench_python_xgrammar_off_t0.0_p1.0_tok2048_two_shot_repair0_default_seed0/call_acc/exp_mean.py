@@ -6,68 +6,98 @@ import triton.language as tl
 def _exp_mean_kernel(x_ptr, out_ptr, n: tl.constexpr, dim_size: tl.constexpr, stride_x: tl.constexpr, stride_out: tl.constexpr, keepdim: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     if keepdim:
-        # For keepdim=True, we compute mean along the specified dimension
-        # Each thread block handles one element along the non-dim dimensions
+        # For keepdim=True, we compute mean along a specific dimension
+        # Each thread block handles one element along the reduced dimension
         offsets = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offsets < n
-        x = tl.load(x_ptr + offsets * stride_x, mask=mask, other=0.0)
-        exp_x = tl.exp(x)
-        # Reduce along the specified dimension
-        # This is a simplified approach - in practice, you'd need to handle
-        # the reduction properly with shared memory for better performance
-        # For now, we'll compute the mean in a straightforward way
-        mean_val = tl.sum(exp_x) / dim_size
-        tl.store(out_ptr + pid * stride_out, mean_val, mask=pid < n)
+        mask = offsets < dim_size
+        if stride_x == 1:
+            # Contiguous case
+            x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+        else:
+            # Strided case
+            x = tl.load(x_ptr + offsets * stride_x, mask=mask, other=0.0)
+        # Apply exp
+        x = tl.exp(x)
+        # Compute sum
+        sum_val = tl.sum(x, axis=0)
+        # Compute mean
+        mean_val = sum_val / dim_size
+        tl.store(out_ptr + pid, mean_val)
     else:
         # For keepdim=False, we compute mean over all elements
+        # Each thread block handles a chunk of elements
         offsets = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offsets < n
-        x = tl.load(x_ptr + offsets * stride_x, mask=mask, other=0.0)
-        exp_x = tl.exp(x)
-        mean_val = tl.sum(exp_x) / n
-        tl.store(out_ptr + pid * stride_out, mean_val, mask=pid < n)
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+        # Apply exp
+        x = tl.exp(x)
+        # Compute sum
+        sum_val = tl.sum(x, axis=0)
+        # Compute mean
+        mean_val = sum_val / n
+        tl.store(out_ptr + pid, mean_val)
 
 def exp_mean(input, dim=None, keepdim=False, dtype=None, out=None):
-    if dim is not None and not isinstance(dim, int):
-        raise ValueError("dim must be an integer or None")
-    
-    if dim is not None and (dim < 0 or dim >= input.dim()):
-        raise ValueError("dim must be within the range of input dimensions")
-    
-    # Handle scalar input
-    if input.numel() == 1:
-        result = torch.exp(input).mean()
-        if dtype is not None:
-            result = result.to(dtype)
-        if out is not None:
-            out.copy_(result)
-            return out
-        return result
-    
-    # Handle the case where we compute mean over all elements
     if dim is None:
-        # Compute exp and then mean over all elements
+        # Compute mean over all elements
+        input_flat = input.flatten()
+        n = input_flat.numel()
+        if out is not None:
+            out = out.view(-1)
+        else:
+            out = torch.empty(1, dtype=dtype or input.dtype, device=input.device)
+        
+        block = 256
+        grid = (triton.cdiv(n, block),)
+        
+        @triton.jit
+        def _exp_mean_all_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+            pid = tl.program_id(0)
+            offsets = pid * BLOCK + tl.arange(0, BLOCK)
+            mask = offsets < n
+            x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+            x = tl.exp(x)
+            sum_val = tl.sum(x, axis=0)
+            mean_val = sum_val / n
+            tl.store(out_ptr + pid, mean_val)
+        
+        _exp_mean_all_kernel[grid](input_flat, out, n, BLOCK=block)
+        return out[0] if out.numel() == 1 else out
+    else:
+        # Compute mean along specified dimension
+        input = input.contiguous()
+        if dim < 0:
+            dim = input.dim() + dim
+        dim_size = input.size(dim)
+        output_shape = list(input.shape)
+        if keepdim:
+            output_shape[dim] = 1
+        else:
+            output_shape.pop(dim)
+        
+        if out is not None:
+            out = out.contiguous()
+        else:
+            out = torch.empty(output_shape, dtype=dtype or input.dtype, device=input.device)
+        
+        # For simplicity, we'll use a two-step approach:
+        # 1. Apply exp
+        # 2. Compute mean along specified dimension
+        
+        # Create a temporary tensor for exp result
         exp_input = torch.exp(input)
-        result = exp_input.mean()
-        if dtype is not None:
-            result = result.to(dtype)
+        
+        # Use PyTorch's mean function for the reduction part
+        if keepdim:
+            result = torch.mean(exp_input, dim=dim, keepdim=True)
+        else:
+            result = torch.mean(exp_input, dim=dim, keepdim=False)
+            
         if out is not None:
             out.copy_(result)
             return out
-        return result
-    
-    # Handle specific dimension case
-    # For simplicity, we'll use PyTorch's implementation for the reduction part
-    # and only implement the exp part in Triton
-    exp_input = torch.exp(input)
-    result = torch.mean(exp_input, dim=dim, keepdim=keepdim)
-    
-    if dtype is not None:
-        result = result.to(dtype)
-    if out is not None:
-        out.copy_(result)
-        return out
-    return result
+        else:
+            return result
 
 ##################################################################################################################################################
 

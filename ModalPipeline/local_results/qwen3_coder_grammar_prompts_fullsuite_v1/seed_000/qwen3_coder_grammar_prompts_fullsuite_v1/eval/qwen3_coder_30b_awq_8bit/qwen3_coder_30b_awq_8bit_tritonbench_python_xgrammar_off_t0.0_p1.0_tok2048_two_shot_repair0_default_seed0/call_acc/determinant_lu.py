@@ -1,37 +1,36 @@
 import torch
 import triton
 import triton.language as tl
+import math
 
 @triton.jit
 def _determinant_lu_kernel(A_ptr, out_ptr, batch_size: tl.constexpr, n: tl.constexpr, pivot: tl.constexpr, BLOCK: tl.constexpr):
     batch_idx = tl.program_id(0)
+    if batch_idx >= batch_size:
+        return
     
-    # Load matrix A for this batch
-    A_block_ptr = tl.make_block_ptr(
-        base=A_ptr + batch_idx * n * n,
-        shape=(n, n),
-        strides=(n, 1),
-        offsets=(0, 0),
-        block_shape=(BLOCK, BLOCK),
-        order=(1, 0)
-    )
+    # Each batch processes one matrix
+    matrix_offset = batch_idx * n * n
+    A_base = A_ptr + matrix_offset
     
-    # Allocate workspace for LU decomposition
-    L = tl.zeros((BLOCK, BLOCK), dtype=tl.float32)
-    U = tl.zeros((BLOCK, BLOCK), dtype=tl.float32)
+    # Create a copy of the matrix for LU decomposition
+    L = tl.full((n, n), 0.0, dtype=tl.float32)
+    U = tl.full((n, n), 0.0, dtype=tl.float32)
     
-    # Copy input matrix to U
+    # Initialize U with A values
     for i in range(n):
         for j in range(n):
-            if i <= j:
-                U[i, j] = tl.load(A_block_ptr, (i, j), mask=(i < n) & (j < n), other=0.0)
-            else:
-                L[i, j] = tl.load(A_block_ptr, (i, j), mask=(i < n) & (j < n), other=0.0)
+            offset = i * n + j
+            U[i, j] = tl.load(A_base + offset)
     
-    # Initialize determinant
-    det = 1.0
+    # Initialize L as identity matrix
+    for i in range(n):
+        L[i, i] = 1.0
     
-    # Perform LU decomposition with partial pivoting
+    # Permutation sign tracking
+    sign = 1.0
+    
+    # LU decomposition with partial pivoting
     for k in range(n):
         # Find pivot
         if pivot:
@@ -42,84 +41,97 @@ def _determinant_lu_kernel(A_ptr, out_ptr, batch_size: tl.constexpr, n: tl.const
                     max_val = tl.abs(U[i, k])
                     pivot_row = i
             
-            # Swap rows if needed
+            # Swap rows in U and L if needed
             if pivot_row != k:
+                sign = -sign
                 for j in range(n):
                     temp = U[k, j]
                     U[k, j] = U[pivot_row, j]
                     U[pivot_row, j] = temp
-                det = -det  # Flip sign for row swap
+                    
+                    temp = L[k, j]
+                    L[k, j] = L[pivot_row, j]
+                    L[pivot_row, j] = temp
         
         # Check for zero pivot
-        if tl.abs(U[k, k]) < 1e-12:
-            det = 0.0
-            break
+        if abs(U[k, k]) < 1e-12:
+            # Return zero determinant if singular
+            tl.store(out_ptr + batch_idx, 0.0)
+            return
         
-        # Update determinant with diagonal element
-        det *= U[k, k]
-        
-        # Perform elimination
+        # Compute L and U
         for i in range(k + 1, n):
-            if tl.abs(U[k, k]) > 1e-12:
-                factor = U[i, k] / U[k, k]
-                L[i, k] = factor
+            if abs(U[k, k]) > 1e-12:
+                L[i, k] = U[i, k] / U[k, k]
                 for j in range(k + 1, n):
-                    U[i, j] = U[i, j] - factor * U[k, j]
-            else:
-                L[i, k] = 0.0
+                    U[i, j] = U[i, j] - L[i, k] * U[k, j]
     
-    # Store result
+    # Compute determinant as product of diagonal elements of U
+    det = sign
+    for i in range(n):
+        det = det * U[i, i]
+    
     tl.store(out_ptr + batch_idx, det)
 
 def determinant_lu(A, *, pivot=True, out=None):
-    # Handle scalar case
+    # Handle scalar input
+    if A.dim() == 0:
+        return A.clone()
+    
+    # Handle 1D input (vector)
+    if A.dim() == 1:
+        if A.shape[0] == 1:
+            return A[0].clone()
+        else:
+            raise ValueError("Input must be a square matrix")
+    
+    # Handle 2D input (single matrix)
     if A.dim() == 2:
-        A = A.unsqueeze(0)
+        batch_shape = ()
+        n = A.shape[-1]
+        if A.shape[-2] != n:
+            raise ValueError("Input must be a square matrix")
         batch_size = 1
     else:
-        batch_size = A.shape[:-2]
-        if len(batch_size) == 0:
-            batch_size = 1
-        else:
-            batch_size = int(torch.prod(torch.tensor(batch_size)))
-    
-    n = A.shape[-1]
+        # Handle batched input
+        batch_shape = A.shape[:-2]
+        n = A.shape[-1]
+        if A.shape[-2] != n:
+            raise ValueError("Input must be a square matrix")
+        batch_size = 1
+        for dim in batch_shape:
+            batch_size *= dim
     
     # Create output tensor
     if out is None:
-        out = torch.empty(batch_size, dtype=torch.float32, device=A.device)
+        out = torch.empty(batch_shape, dtype=A.dtype, device=A.device)
     else:
-        out = out.view(-1)
+        if out.shape != batch_shape:
+            raise ValueError("Output tensor shape does not match input batch shape")
+        if out.dtype != A.dtype:
+            raise ValueError("Output tensor dtype does not match input dtype")
+        if out.device != A.device:
+            raise ValueError("Output tensor device does not match input device")
     
-    # Launch kernel
-    block = 16
-    grid = (batch_size,)
-    
-    # For small matrices, we can use a simpler approach
-    if n <= 32:
-        # Use a more direct approach for small matrices
-        if pivot:
-            # For small matrices, we can use torch's implementation for better numerical stability
-            if batch_size == 1:
-                return torch.det(A.squeeze(0))
-            else:
-                return torch.stack([torch.det(A[i]) for i in range(batch_size)])
+    # For small matrices, use PyTorch's implementation for better numerical stability
+    if n <= 4:
+        if out is None:
+            out = torch.empty(batch_shape, dtype=A.dtype, device=A.device)
+        if batch_size == 1:
+            out.fill_(torch.det(A))
         else:
-            # Without pivoting, we can use a simpler approach
-            if batch_size == 1:
-                return torch.det(A.squeeze(0))
-            else:
-                return torch.stack([torch.det(A[i]) for i in range(batch_size)])
-    else:
-        # For larger matrices, use the Triton kernel
-        _determinant_lu_kernel[grid](A, out, batch_size, n, pivot, BLOCK=block)
-        return out.view(A.shape[:-2] + (1,)).squeeze(-1)
+            for i in range(batch_size):
+                batch_A = A[i] if batch_size > 1 else A
+                out[i] = torch.det(batch_A)
+        return out
     
-    # Fallback to PyTorch for complex cases
-    if batch_size == 1:
-        return torch.det(A.squeeze(0))
-    else:
-        return torch.stack([torch.det(A[i]) for i in range(batch_size)])
+    # For larger matrices, use Triton implementation
+    if batch_size > 0:
+        block = 256
+        grid = (triton.cdiv(batch_size, block),)
+        _determinant_lu_kernel[grid](A, out, batch_size, n, pivot, BLOCK=block)
+    
+    return out
 
 ##################################################################################################################################################
 

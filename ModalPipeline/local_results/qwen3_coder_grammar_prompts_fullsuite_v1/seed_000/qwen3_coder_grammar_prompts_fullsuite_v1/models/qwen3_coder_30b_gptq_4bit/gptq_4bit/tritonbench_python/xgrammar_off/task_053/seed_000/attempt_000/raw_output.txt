@@ -4,64 +4,44 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def mul_relu_kernel(
-    input_ptr,
-    other_ptr,
-    output_ptr,
-    n_elements,
-    inplace: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr
-):
+def _mul_relu_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, inplace: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    input = tl.load(input_ptr + offsets, mask=mask)
-    other = tl.load(other_ptr + offsets, mask=mask)
-    result = input * other
-    result = tl.where(result > 0, result, 0)
-    if inplace:
-        tl.store(input_ptr + offsets, result, mask=mask)
-    else:
-        tl.store(output_ptr + offsets, result, mask=mask)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+    result = x * y
+    # Apply ReLU
+    result = tl.maximum(result, 0.0)
+    tl.store(out_ptr + offsets, result, mask=mask)
 
 def mul_relu(input, other, inplace=False, out=None):
-    if inplace and not input.is_contiguous():
-        raise ValueError("Inplace operation requires input to be contiguous")
-    
-    if isinstance(other, (int, float)):
+    # Handle scalar other
+    if not torch.is_tensor(other):
         other = torch.tensor(other, dtype=input.dtype, device=input.device)
     
+    # Ensure other is broadcastable with input
     if other.shape != input.shape:
-        if other.dim() == 0:
-            other = other.expand_as(input)
-        else:
-            raise ValueError("Shape mismatch between input and other")
+        # Use torch's broadcasting rules
+        other = other.expand_as(input)
     
-    if out is None:
-        out = torch.empty_like(input)
-    
-    n_elements = input.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    if inplace:
-        mul_relu_kernel[grid](
-            input_ptr=input.data_ptr(),
-            other_ptr=other.data_ptr(),
-            output_ptr=None,
-            n_elements=n_elements,
-            inplace=True,
-            BLOCK_SIZE=BLOCK_SIZE
-        )
-        return input
+    # Determine output tensor
+    if out is not None:
+        output = out
+    elif inplace:
+        output = input
     else:
-        mul_relu_kernel[grid](
-            input_ptr=input.data_ptr(),
-            other_ptr=other.data_ptr(),
-            output_ptr=out.data_ptr(),
-            n_elements=n_elements,
-            inplace=False,
-            BLOCK_SIZE=BLOCK_SIZE
-        )
-        return out
+        output = torch.empty_like(input)
+    
+    # Get the total number of elements
+    n = input.numel()
+    
+    # Set up grid and block size
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    
+    # Launch kernel
+    _mul_relu_kernel[grid](input, other, output, n, inplace, BLOCK=block)
+    
+    return output
 ```

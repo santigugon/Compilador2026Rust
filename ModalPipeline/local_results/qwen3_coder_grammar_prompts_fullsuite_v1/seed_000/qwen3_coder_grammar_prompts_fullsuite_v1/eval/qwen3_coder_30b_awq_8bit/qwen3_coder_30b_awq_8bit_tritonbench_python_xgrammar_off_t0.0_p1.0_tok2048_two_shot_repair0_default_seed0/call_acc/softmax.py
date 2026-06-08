@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _softmax_kernel(x_ptr, out_ptr, dim_size: tl.constexpr, stride_x, stride_out, BLOCK: tl.constexpr):
+def _softmax_kernel(x_ptr, out_ptr, stride_x, stride_out, dim_size: tl.constexpr, BLOCK: tl.constexpr):
     # Get the program ID for the dimension we're processing
     pid = tl.program_id(0)
     
@@ -37,49 +37,54 @@ def softmax(input, dim, dtype=None):
     if dtype is not None:
         input = input.to(dtype)
     
-    # Get input shape and create output tensor
-    input_shape = input.shape
+    # Create output tensor with same shape and dtype
     out = torch.empty_like(input)
     
     # Get the size of the specified dimension
-    dim_size = input_shape[dim]
+    dim_size = input.shape[dim]
     
-    # Handle negative dimensions
-    if dim < 0:
-        dim = len(input_shape) + dim
+    # Get the stride for the specified dimension
+    stride = input.stride(dim)
     
-    # Calculate total elements and block size
-    total_elements = input.numel()
-    block = 256
-    
-    # For softmax along a specific dimension, we need to process along that dimension
-    # We'll iterate through the other dimensions
-    if dim == len(input_shape) - 1:
-        # If we're softmaxing along the last dimension
+    # For small dimensions, use a simple approach
+    if dim_size <= 1024:
+        block = 256
         grid = (triton.cdiv(dim_size, block),)
+        
+        # Create a temporary tensor for the computation
+        temp_input = input.contiguous()
+        temp_out = out.contiguous()
+        
         _softmax_kernel[grid](
-            input, 
-            out, 
-            dim_size, 
-            input.stride(dim), 
-            out.stride(dim), 
+            temp_input,
+            temp_out,
+            stride,
+            temp_out.stride(dim),
+            dim_size,
             BLOCK=block
         )
     else:
-        # For other dimensions, we need to handle the multi-dimensional case
-        # This is a simplified approach - for full generality, we'd need to 
-        # iterate through all combinations of other dimensions
-        # For now, we'll handle the common case where we process along the last dimension
-        # and assume the input is contiguous along that dimension
-        grid = (triton.cdiv(dim_size, block),)
-        _softmax_kernel[grid](
-            input, 
-            out, 
-            dim_size, 
-            input.stride(dim), 
-            out.stride(dim), 
-            BLOCK=block
-        )
+        # For larger dimensions, we need to handle it differently
+        # This is a simplified approach that works for most cases
+        # For a more robust implementation, we'd need to handle
+        # multi-dimensional cases more carefully
+        
+        # Reshape to handle the softmax along the specified dimension
+        # We'll compute softmax along the last dimension for simplicity
+        # and then reshape back
+        input_flat = input.view(-1, dim_size)
+        out_flat = out.view(-1, dim_size)
+        
+        for i in range(input_flat.shape[0]):
+            # Compute softmax for each slice
+            slice_input = input_flat[i]
+            slice_out = out_flat[i]
+            
+            # Get max for numerical stability
+            max_val = slice_input.max()
+            exp_vals = (slice_input - max_val).exp()
+            sum_vals = exp_vals.sum()
+            slice_out.copy_(exp_vals / sum_vals)
     
     return out
 

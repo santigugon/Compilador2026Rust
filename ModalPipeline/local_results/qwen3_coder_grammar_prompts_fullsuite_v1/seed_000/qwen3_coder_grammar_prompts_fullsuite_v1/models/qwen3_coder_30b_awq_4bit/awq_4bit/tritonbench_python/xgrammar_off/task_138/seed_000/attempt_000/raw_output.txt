@@ -2,171 +2,122 @@
 import torch
 import triton
 import triton.language as tl
-import math
 
 @triton.jit
-def _lu_decompose_kernel(A_ptr, L_ptr, U_ptr, P_ptr, n, batch_size, BLOCK: tl.constexpr):
-    # This kernel performs LU decomposition with partial pivoting
-    batch_idx = tl.program_id(0)
-    tid = tl.program_id(1)
+def _lu_decomposition_kernel(A, L, U, pivot, n, stride_a, stride_l, stride_u, stride_p, BLOCK_SIZE):
+    pid = tl.program_id(0)
+    block_size = BLOCK_SIZE
+    num_blocks = (n + block_size - 1) // block_size
     
-    # Load matrix for this batch
-    A = tl.load(A_ptr + batch_idx * n * n + tl.arange(0, n)[:, None] * n + tl.arange(0, n)[None, :], 
-                mask=(tl.arange(0, n)[:, None] < n) & (tl.arange(0, n)[None, :] < n))
-    
-    # Initialize L, U, and P matrices
-    L = tl.zeros((n, n), dtype=tl.float32)
-    U = tl.zeros((n, n), dtype=tl.float32)
-    P = tl.zeros((n, n), dtype=tl.int32)
-    
-    # Initialize P as identity matrix
-    for i in range(n):
-        P[i, i] = i
-    
-    # LU decomposition with partial pivoting
-    for k in range(n):
-        # Find pivot
-        max_val = tl.abs(A[k, k])
-        pivot_row = k
-        for i in range(k + 1, n):
-            if tl.abs(A[i, k]) > max_val:
-                max_val = tl.abs(A[i, k])
-                pivot_row = i
-        
-        # Swap rows in A
-        if pivot_row != k:
-            for j in range(n):
-                temp = A[k, j]
-                A[k, j] = A[pivot_row, j]
-                A[pivot_row, j] = temp
-            
-            # Update permutation matrix P
-            temp = P[k, :]
-            P[k, :] = P[pivot_row, :]
-            P[pivot_row, :] = temp
+    for k in range(num_blocks):
+        # Load diagonal element
+        if k * block_size + pid < n:
+            diag = tl.load(A + (k * block_size + pid) * stride_a)
+            tl.store(U + (k * block_size + pid) * stride_u, diag)
         
         # Compute L and U
-        for i in range(k + 1, n):
-            if A[k, k] != 0:
-                L[i, k] = A[i, k] / A[k, k]
-                for j in range(k + 1, n):
-                    A[i, j] = A[i, j] - L[i, k] * A[k, j]
-        
-        # Copy U values
-        for i in range(n):
-            for j in range(n):
-                if i <= j:
-                    U[i, j] = A[i, j]
-                else:
-                    U[i, j] = 0.0
-    
-    # Store results
-    tl.store(L_ptr + batch_idx * n * n + tl.arange(0, n)[:, None] * n + tl.arange(0, n)[None, :],
-             L, mask=(tl.arange(0, n)[:, None] < n) & (tl.arange(0, n)[None, :] < n))
-    tl.store(U_ptr + batch_idx * n * n + tl.arange(0, n)[:, None] * n + tl.arange(0, n)[None, :],
-             U, mask=(tl.arange(0, n)[:, None] < n) & (tl.arange(0, n)[None, :] < n))
-    tl.store(P_ptr + batch_idx * n * n + tl.arange(0, n)[:, None] * n + tl.arange(0, n)[None, :],
-             P, mask=(tl.arange(0, n)[:, None] < n) & (tl.arange(0, n)[None, :] < n))
+        for i in range(k * block_size, min((k + 1) * block_size, n)):
+            if i >= k * block_size + pid:
+                # Compute L elements
+                if i < n and k * block_size + pid < n:
+                    sum_val = tl.load(A + (i * stride_a + k * block_size + pid))
+                    for j in range(k):
+                        sum_val -= tl.load(L + (i * stride_l + j)) * tl.load(U + (j * stride_u + k * block_size + pid))
+                    tl.store(L + (i * stride_l + k * block_size + pid), sum_val)
+                
+                # Compute U elements
+                if k * block_size + pid < n and k * block_size + pid < n:
+                    sum_val = tl.load(A + (k * block_size + pid) * stride_a)
+                    for j in range(k):
+                        sum_val -= tl.load(L + (k * block_size + pid) * stride_l + j) * tl.load(U + (j * stride_u + k * block_size + pid))
+                    tl.store(U + (k * block_size + pid) * stride_u, sum_val)
 
 @triton.jit
-def _solve_triangular_kernel(L_ptr, U_ptr, P_ptr, b_ptr, x_ptr, n, batch_size, BLOCK: tl.constexpr):
-    # This kernel solves the triangular systems for the inverse
-    batch_idx = tl.program_id(0)
+def _solve_triangular_kernel(L, U, pivot, b, x, n, stride_l, stride_u, stride_p, stride_b, stride_x, BLOCK_SIZE):
+    pid = tl.program_id(0)
+    block_size = BLOCK_SIZE
     
-    # Load L, U, P, and b
-    L = tl.load(L_ptr + batch_idx * n * n + tl.arange(0, n)[:, None] * n + tl.arange(0, n)[None, :],
-                mask=(tl.arange(0, n)[:, None] < n) & (tl.arange(0, n)[None, :] < n))
-    U = tl.load(U_ptr + batch_idx * n * n + tl.arange(0, n)[:, None] * n + tl.arange(0, n)[None, :],
-                mask=(tl.arange(0, n)[:, None] < n) & (tl.arange(0, n)[None, :] < n))
-    P = tl.load(P_ptr + batch_idx * n * n + tl.arange(0, n)[:, None] * n + tl.arange(0, n)[None, :],
-                mask=(tl.arange(0, n)[:, None] < n) & (tl.arange(0, n)[None, :] < n))
-    
-    # Solve for x using forward and backward substitution
-    # Forward substitution: L * y = P * b
-    y = tl.zeros((n, 1), dtype=tl.float32)
+    # Forward substitution
     for i in range(n):
-        y[i, 0] = 0.0
+        sum_val = tl.load(b + (i * stride_b))
         for j in range(i):
-            y[i, 0] = y[i, 0] - L[i, j] * y[j, 0]
-        y[i, 0] = y[i, 0] + 1.0  # Placeholder for b value
+            sum_val -= tl.load(L + (i * stride_l + j)) * tl.load(x + (j * stride_x))
+        tl.store(x + (i * stride_x), sum_val)
     
-    # Backward substitution: U * x = y
-    x = tl.zeros((n, 1), dtype=tl.float32)
+    # Backward substitution
     for i in range(n - 1, -1, -1):
-        x[i, 0] = y[i, 0]
+        sum_val = tl.load(x + (i * stride_x))
         for j in range(i + 1, n):
-            x[i, 0] = x[i, 0] - U[i, j] * x[j, 0]
-        if U[i, i] != 0:
-            x[i, 0] = x[i, 0] / U[i, i]
-    
-    # Store result
-    tl.store(x_ptr + batch_idx * n * n + tl.arange(0, n)[:, None] * n + tl.arange(0, n)[None, :],
-             x, mask=(tl.arange(0, n)[:, None] < n) & (tl.arange(0, n)[None, :] < n))
+            sum_val -= tl.load(U + (i * stride_u + j)) * tl.load(x + (j * stride_x))
+        tl.store(x + (i * stride_x), sum_val)
 
 def invert_matrix_lu(A, *, pivot=True, out=None):
-    if not torch.is_tensor(A):
-        raise TypeError("Input must be a tensor")
+    if A.dtype not in [torch.float32, torch.float64, torch.complex64, torch.complex128]:
+        raise ValueError("Unsupported dtype")
     
     if A.dim() < 2:
-        raise ValueError("Input must have at least 2 dimensions")
+        raise ValueError("Input must be at least 2D")
     
     if A.size(-1) != A.size(-2):
-        raise ValueError("Input must be a square matrix")
+        raise ValueError("Input must be square")
     
     batch_dims = A.shape[:-2]
     n = A.size(-1)
     
     # Create output tensor
-    if out is not None:
-        if out.shape != A.shape:
-            raise ValueError("Output tensor must have the same shape as input")
-        out = out
-    else:
+    if out is None:
         out = torch.empty_like(A)
+    else:
+        if out.shape != A.shape or out.dtype != A.dtype:
+            raise ValueError("Output tensor must have the same shape and dtype as input")
     
-    # Handle scalar case
-    if A.dim() == 2:
-        batch_dims = ()
+    # Handle batched operations
+    if len(batch_dims) == 0:
         batch_size = 1
+        A = A.unsqueeze(0)
+        out = out.unsqueeze(0)
     else:
-        batch_size = math.prod(batch_dims)
+        batch_size = 1
+        for dim in batch_dims:
+            batch_size *= dim
+        A = A.view(-1, n, n)
+        out = out.view(-1, n, n)
     
-    # For simplicity, we'll use torch's implementation for now
-    # since implementing full LU decomposition in Triton is complex
-    # and would require significant additional kernels for pivoting
-    # and solving triangular systems
+    # Allocate memory for L, U, and pivot arrays
+    L = torch.zeros_like(A)
+    U = torch.zeros_like(A)
+    pivot = torch.zeros((batch_size, n), dtype=torch.int32, device=A.device)
     
-    # Use torch's implementation for correctness
-    if batch_size == 1:
-        # Single matrix case
-        if A.dtype == torch.float32:
-            A = A.float()
-        elif A.dtype == torch.float64:
-            A = A.double()
-        elif A.dtype == torch.complex64:
-            A = A.complex64()
-        elif A.dtype == torch.complex128:
-            A = A.complex128()
-        else:
-            raise ValueError(f"Unsupported dtype: {A.dtype}")
+    # Launch kernels
+    BLOCK_SIZE = 32
+    num_blocks = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
+    
+    for i in range(batch_size):
+        # LU decomposition
+        grid = (num_blocks, 1, 1)
+        _lu_decomposition_kernel[grid](
+            A[i], L[i], U[i], pivot[i], n, 
+            A.stride(-2), L.stride(-2), U.stride(-2), pivot.stride(-1),
+            BLOCK_SIZE
+        )
         
-        # Use torch's inverse function
-        out = torch.linalg.inv(A)
-    else:
-        # Batch case
-        if A.dtype == torch.float32:
-            A = A.float()
-        elif A.dtype == torch.float64:
-            A = A.double()
-        elif A.dtype == torch.complex64:
-            A = A.complex64()
-        elif A.dtype == torch.complex128:
-            A = A.complex128()
-        else:
-            raise ValueError(f"Unsupported dtype: {A.dtype}")
+        # Solve for inverse
+        b = torch.eye(n, dtype=A.dtype, device=A.device)
+        x = torch.zeros_like(b)
+        grid = (1, 1, 1)
+        _solve_triangular_kernel[grid](
+            L[i], U[i], pivot[i], b, x, n,
+            L[i].stride(-2), U[i].stride(-2), pivot[i].stride(-1),
+            b.stride(-1), x.stride(-1),
+            BLOCK_SIZE
+        )
         
-        # Use torch's batch inverse function
-        out = torch.linalg.inv(A)
+        # Copy result to output
+        out[i] = x
+    
+    # Reshape output if needed
+    if len(batch_dims) == 0:
+        out = out.squeeze(0)
     
     return out
 ```

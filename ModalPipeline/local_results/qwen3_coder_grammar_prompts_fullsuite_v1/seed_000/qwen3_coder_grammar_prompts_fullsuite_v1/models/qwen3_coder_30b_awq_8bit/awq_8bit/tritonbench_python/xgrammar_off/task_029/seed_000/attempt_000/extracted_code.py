@@ -44,40 +44,37 @@ def index_fill_(self, dim, index, value):
     for i in range(dim + 1, len(shape)):
         stride *= shape[i]
     
-    # Create a kernel that fills the specified indices with value
-    # We'll use a different approach: directly modify the tensor in-place
+    # Create a temporary tensor to store the fill pattern
+    fill_pattern = torch.zeros_like(self, dtype=torch.float32)
     
-    # For each element in the specified dimension, check if it's in index
-    # and fill with value if so
-    
-    # Create a mask for the indices to fill
+    # Fill the pattern tensor with 1.0 at the specified indices
     if dim == 0:
-        # Fill along first dimension
         for i in range(index_size):
             idx = index[i].item()
             if 0 <= idx < dim_size:
-                out[idx, ...] = value
+                fill_pattern[idx, ...] = 1.0
     elif dim == 1:
-        # Fill along second dimension
         for i in range(index_size):
             idx = index[i].item()
             if 0 <= idx < dim_size:
-                out[:, idx, ...] = value
+                fill_pattern[:, idx, ...] = 1.0
     elif dim == 2:
-        # Fill along third dimension
         for i in range(index_size):
             idx = index[i].item()
             if 0 <= idx < dim_size:
-                out[:, :, idx, ...] = value
+                fill_pattern[:, :, idx, ...] = 1.0
     else:
-        # For higher dimensions, we need to be more careful
-        # Create a more general approach
+        # For higher dimensions, we need to handle it more carefully
+        # This is a simplified approach for the general case
         for i in range(index_size):
             idx = index[i].item()
             if 0 <= idx < dim_size:
-                # Create slice for the specific dimension
-                slices = [slice(None)] * len(shape)
-                slices[dim] = idx
-                out[tuple(slices)] = value
+                # Create advanced indexing for the specific dimension
+                indices = [slice(None)] * len(shape)
+                indices[dim] = idx
+                fill_pattern[tuple(indices)] = 1.0
+    
+    # Apply the fill pattern
+    out = torch.where(fill_pattern.bool(), value, out)
     
     return out

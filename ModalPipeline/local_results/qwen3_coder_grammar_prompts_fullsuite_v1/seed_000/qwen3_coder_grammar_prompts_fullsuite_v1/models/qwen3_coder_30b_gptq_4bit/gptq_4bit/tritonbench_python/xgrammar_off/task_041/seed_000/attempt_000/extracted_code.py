@@ -3,45 +3,62 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def batch_norm_hardsigmoid_kernel(
+def _batch_norm_hardsigmoid_kernel(
     x_ptr, 
     running_mean_ptr, 
     running_var_ptr, 
     weight_ptr, 
     bias_ptr,
     output_ptr,
-    N,
-    C,
-    training,
-    momentum,
-    eps,
-    BLOCK_SIZE: tl.constexpr,
+    n_features: tl.constexpr,
+    n_samples: tl.constexpr,
+    momentum: tl.constexpr,
+    eps: tl.constexpr,
+    training: tl.constexpr,
+    BLOCK: tl.constexpr
 ):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < N
-    
-    x = tl.load(x_ptr + offsets, mask=mask)
-    
-    # Get channel index for batch norm
-    channel_idx = (offsets // (N // C)) % C
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_features
     
     # Load running stats
-    mean = tl.load(running_mean_ptr + channel_idx, mask=channel_idx < C)
-    var = tl.load(running_var_ptr + channel_idx, mask=channel_idx < C)
+    running_mean = tl.load(running_mean_ptr + offsets, mask=mask, other=0.0)
+    running_var = tl.load(running_var_ptr + offsets, mask=mask, other=0.0)
     
-    # Batch normalization
-    x_norm = (x - mean) / tl.sqrt(var + eps)
+    # Compute batch statistics if in training mode
+    if training:
+        # Compute mean and variance for this batch
+        batch_mean = tl.sum(tl.load(x_ptr + offsets, mask=mask, other=0.0)) / n_samples
+        batch_var = tl.sum((tl.load(x_ptr + offsets, mask=mask, other=0.0) - batch_mean) ** 2) / n_samples
+        
+        # Update running stats
+        updated_mean = (1 - momentum) * running_mean + momentum * batch_mean
+        updated_var = (1 - momentum) * running_var + momentum * batch_var
+        
+        # Store updated running stats
+        tl.store(running_mean_ptr + offsets, updated_mean, mask=mask)
+        tl.store(running_var_ptr + offsets, updated_var, mask=mask)
+        
+        # Use batch stats for normalization
+        mean = batch_mean
+        var = batch_var
+    else:
+        # Use running stats
+        mean = running_mean
+        var = running_var
     
-    # Apply learnable weight and bias
+    # Normalize
+    x_normalized = (tl.load(x_ptr + offsets, mask=mask, other=0.0) - mean) / (tl.sqrt(var + eps))
+    
+    # Apply weight and bias if provided
     if weight_ptr is not None and bias_ptr is not None:
-        weight = tl.load(weight_ptr + channel_idx, mask=channel_idx < C)
-        bias = tl.load(bias_ptr + channel_idx, mask=channel_idx < C)
-        x_norm = x_norm * weight + bias
+        weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0)
+        bias = tl.load(bias_ptr + offsets, mask=mask, other=0.0)
+        x_normalized = x_normalized * weight + bias
     
-    # Hardsigmoid activation
-    hardsigmoid = tl.where(x_norm >= 0, tl.where(x_norm <= 6, x_norm / 6 + 0.5, 1.0), 0.0)
+    # Apply Hardsigmoid
+    # Hardsigmoid: min(max((x + 3) / 6, 0), 1)
+    hardsigmoid = tl.minimum(tl.maximum((x_normalized + 3.0) / 6.0, 0.0), 1.0)
     
     # Store result
     tl.store(output_ptr + offsets, hardsigmoid, mask=mask)
@@ -57,44 +74,58 @@ def fused_hardsigmoid_batch_norm(
     eps: float = 1e-5,
     inplace: bool = False
 ) -> torch.Tensor:
+    # Handle scalar inputs
+    if x.dim() == 1:
+        x = x.unsqueeze(0)
+    
     # Ensure input is contiguous
     x = x.contiguous()
     
     # Get dimensions
-    N = x.numel()
-    C = running_mean.shape[0]  # Channel dimension
+    n_samples = x.shape[0]
+    n_features = x.shape[1]
     
-    # Prepare output tensor
+    # Create output tensor
     if inplace:
-        output = x
+        out = x
     else:
-        output = torch.empty_like(x)
+        out = torch.empty_like(x)
     
-    # Set up kernel launch parameters
-    BLOCK_SIZE = 1024
-    num_warps = 4
+    # Handle case where weight and bias are None
+    if weight is None:
+        weight = torch.ones(n_features, device=x.device, dtype=x.dtype)
+    if bias is None:
+        bias = torch.zeros(n_features, device=x.device, dtype=x.dtype)
+    
+    # Ensure weight and bias are contiguous
+    weight = weight.contiguous()
+    bias = bias.contiguous()
     
     # Launch kernel
-    grid = (triton.cdiv(N, BLOCK_SIZE),)
+    block = 256
+    grid = (triton.cdiv(n_features, block),)
     
-    # Handle optional weight and bias
+    # Create pointers for Triton kernel
+    x_ptr = x.data_ptr()
+    running_mean_ptr = running_mean.data_ptr()
+    running_var_ptr = running_var.data_ptr()
     weight_ptr = weight.data_ptr() if weight is not None else None
     bias_ptr = bias.data_ptr() if bias is not None else None
+    output_ptr = out.data_ptr()
     
-    batch_norm_hardsigmoid_kernel[grid](
-        x_ptr=x.data_ptr(),
-        running_mean_ptr=running_mean.data_ptr(),
-        running_var_ptr=running_var.data_ptr(),
-        weight_ptr=weight_ptr,
-        bias_ptr=bias_ptr,
-        output_ptr=output.data_ptr(),
-        N=N,
-        C=C,
-        training=training,
-        momentum=momentum,
-        eps=eps,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps
+    _batch_norm_hardsigmoid_kernel[grid](
+        x_ptr,
+        running_mean_ptr,
+        running_var_ptr,
+        weight_ptr,
+        bias_ptr,
+        output_ptr,
+        n_features,
+        n_samples,
+        momentum,
+        eps,
+        training,
+        BLOCK=block
     )
     
-    return output
+    return out

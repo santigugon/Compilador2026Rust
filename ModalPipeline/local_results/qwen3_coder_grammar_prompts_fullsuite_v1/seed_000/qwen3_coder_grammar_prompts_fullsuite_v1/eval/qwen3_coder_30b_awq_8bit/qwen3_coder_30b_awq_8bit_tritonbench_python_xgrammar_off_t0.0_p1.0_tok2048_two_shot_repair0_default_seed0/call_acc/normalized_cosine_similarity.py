@@ -3,58 +3,43 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _norm_kernel(x_ptr, out_ptr, n: tl.constexpr, dim_size: tl.constexpr, stride_x, stride_out, p_norm: tl.constexpr, eps_norm: tl.constexpr, BLOCK: tl.constexpr):
+def _norm_kernel(x_ptr, out_ptr, n: tl.constexpr, dim_size: tl.constexpr, p: tl.constexpr, eps: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    batch_idx = pid // dim_size
-    dim_idx = pid % dim_size
-    
-    # Compute norm for this element
-    offsets = batch_idx * stride_x + dim_idx
-    x = tl.load(x_ptr + offsets, mask=dim_idx < dim_size, other=0.0)
-    
-    # Compute L_p norm
-    if p_norm == 2:
-        norm = tl.sqrt(tl.sum(x * x, axis=0) + eps_norm)
-    elif p_norm == 1:
-        norm = tl.sum(tl.abs(x), axis=0) + eps_norm
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    if p == 2:
+        x = x * x
+        x = tl.sum(x, axis=0)
+        x = tl.sqrt(x + eps)
     else:
-        norm = tl.pow(tl.sum(tl.pow(tl.abs(x), p_norm), axis=0) + eps_norm, 1.0 / p_norm)
-    
-    tl.store(out_ptr + pid, norm, mask=dim_idx < dim_size)
+        x = tl.abs(x) ** p
+        x = tl.sum(x, axis=0)
+        x = x ** (1.0 / p)
+    tl.store(out_ptr + offsets, x, mask=mask)
 
 @triton.jit
-def _cosine_similarity_kernel(x1_ptr, x2_ptr, out_ptr, n: tl.constexpr, dim_size: tl.constexpr, stride_x1, stride_x2, stride_out, eps_similarity: tl.constexpr, BLOCK: tl.constexpr):
+def _cosine_similarity_kernel(x1_ptr, x2_ptr, out_ptr, n: tl.constexpr, dim_size: tl.constexpr, eps_sim: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    batch_idx = pid // dim_size
-    dim_idx = pid % dim_size
-    
-    # Load elements
-    offsets = batch_idx * stride_x1 + dim_idx
-    x1_val = tl.load(x1_ptr + offsets, mask=dim_idx < dim_size, other=0.0)
-    x2_val = tl.load(x2_ptr + offsets, mask=dim_idx < dim_size, other=0.0)
-    
-    # Compute dot product and norms
-    dot_product = x1_val * x2_val
-    norm_x1 = tl.load(x1_ptr + offsets, mask=dim_idx < dim_size, other=0.0)
-    norm_x2 = tl.load(x2_ptr + offsets, mask=dim_idx < dim_size, other=0.0)
-    
-    # Compute cosine similarity
-    numerator = dot_product
-    denominator = norm_x1 * norm_x2 + eps_similarity
-    
-    cosine_sim = numerator / denominator
-    tl.store(out_ptr + pid, cosine_sim, mask=dim_idx < dim_size)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x1 = tl.load(x1_ptr + offsets, mask=mask, other=0.0)
+    x2 = tl.load(x2_ptr + offsets, mask=mask, other=0.0)
+    dot = x1 * x2
+    dot = tl.sum(dot, axis=0)
+    x1_norm = tl.load(x1_ptr + offsets, mask=mask, other=0.0)
+    x2_norm = tl.load(x2_ptr + offsets, mask=mask, other=0.0)
+    x1_norm = tl.sum(x1_norm * x1_norm, axis=0)
+    x2_norm = tl.sum(x2_norm * x2_norm, axis=0)
+    x1_norm = tl.sqrt(x1_norm + eps_sim)
+    x2_norm = tl.sqrt(x2_norm + eps_sim)
+    norm_product = x1_norm * x2_norm
+    cosine_sim = dot / norm_product
+    tl.store(out_ptr + offsets, cosine_sim, mask=mask)
 
 def normalized_cosine_similarity(x1: torch.Tensor, x2: torch.Tensor, dim: int = 1, eps_similarity: float = 1e-8, p_norm: float = 2, eps_norm: float = 1e-12) -> torch.Tensor:
     # Normalize along the specified dimension
-    # First compute norms
-    if dim < 0:
-        dim = x1.dim() + dim
-    
-    # Create output tensor for normalized vectors
-    out = torch.empty_like(x1)
-    
-    # Compute norms for x1 and x2
+    # First compute the norms
     x1_norm = torch.norm(x1, p=p_norm, dim=dim, keepdim=True)
     x2_norm = torch.norm(x2, p=p_norm, dim=dim, keepdim=True)
     
@@ -67,14 +52,12 @@ def normalized_cosine_similarity(x1: torch.Tensor, x2: torch.Tensor, dim: int = 
     x2_normalized = x2 / x2_norm
     
     # Compute cosine similarity
-    # Use PyTorch's built-in function for the final computation
-    # This is more numerically stable and handles edge cases better
-    result = torch.sum(x1_normalized * x2_normalized, dim=dim)
+    dot_product = torch.sum(x1_normalized * x2_normalized, dim=dim, keepdim=True)
+    norm_product = x1_norm * x2_norm
+    cosine_sim = dot_product / (norm_product + eps_similarity)
     
-    # Add epsilon to similarity to avoid division by zero
-    result = result / (torch.norm(x1_normalized, p=2, dim=dim) * torch.norm(x2_normalized, p=2, dim=dim) + eps_similarity)
-    
-    return result
+    # Return the result
+    return cosine_sim.squeeze(dim)
 
 ##################################################################################################################################################
 

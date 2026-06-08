@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _hstack_div_kernel(
+def _fused_hstack_div_kernel(
     stacked_ptr, 
     divisor_ptr, 
     out_ptr, 
@@ -32,17 +32,17 @@ def _hstack_div_kernel(
 def fused_hstack_div(tensors, divisor, *, rounding_mode=None, out=None):
     # Handle scalar divisor
     if not torch.is_tensor(divisor):
-        divisor = torch.tensor(divisor, dtype=torch.float32, device=tensors[0].device)
+        divisor = torch.tensor(divisor, dtype=torch.float32, device=torch.device('cuda'))
     
     # Stack tensors horizontally
     stacked = torch.hstack(tensors)
     
-    # Handle rounding mode
-    if rounding_mode is None:
-        # For integer types, promote to default scalar type
-        if all(t.dtype in (torch.int32, torch.int64) for t in tensors) and divisor.dtype in (torch.int32, torch.int64):
-            stacked = stacked.to(torch.float32)
-            divisor = divisor.to(torch.float32)
+    # Ensure divisor is broadcastable
+    if divisor.dim() == 0:
+        divisor = divisor.expand_as(stacked)
+    else:
+        # Handle broadcasting
+        divisor = divisor.expand_as(stacked)
     
     # Prepare output tensor
     if out is not None:
@@ -53,19 +53,17 @@ def fused_hstack_div(tensors, divisor, *, rounding_mode=None, out=None):
     # Get total number of elements
     n = stacked.numel()
     
-    # Launch kernel
+    # Set block size and grid
     block = 256
     grid = (triton.cdiv(n, block),)
     
-    # Convert rounding_mode to a constant for the kernel
-    rounding_mode_const = 0 if rounding_mode is None else (1 if rounding_mode == 'trunc' else 2)
-    
-    _hstack_div_kernel[grid](
+    # Launch kernel
+    _fused_hstack_div_kernel[grid](
         stacked, 
         divisor, 
         out, 
         n, 
-        rounding_mode_const, 
+        rounding_mode, 
         BLOCK=block
     )
     

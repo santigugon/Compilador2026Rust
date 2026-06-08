@@ -4,68 +4,61 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _sigmoid_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+def sigmoid_kernel(X, Y, n_elements, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(X + offsets, mask=mask)
     y = 1.0 / (1.0 + tl.exp(-x))
-    tl.store(out_ptr + offsets, y, mask=mask)
+    tl.store(Y + offsets, y, mask=mask)
 
 @triton.jit
-def _argmax_kernel(x_ptr, out_ptr, n: tl.constexpr, dim_size: tl.constexpr, BLOCK: tl.constexpr):
+def argmax_kernel(X, output, n_elements, dim_size, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(X + offsets, mask=mask)
     
-    # For simplicity, we'll compute argmax in a separate kernel
-    # In practice, this would need more complex logic for proper reduction
-    # But for this implementation, we'll use a simpler approach
-    # that works for the basic case
+    # Simple argmax implementation for demonstration
+    # In practice, this would need more sophisticated reduction logic
+    max_val = tl.full([1], -float('inf'), dtype=tl.float32)
+    max_idx = tl.full([1], 0, dtype=tl.int32)
     
-    # This is a simplified version - a full implementation would require
-    # more complex reduction logic
-    tl.store(out_ptr + pid, tl.argmax(x, 0), mask=mask)
+    for i in range(0, dim_size):
+        val = tl.load(X + i, mask=i < n_elements)
+        if val > max_val:
+            max_val = val
+            max_idx = i
+    
+    tl.store(output + pid, max_idx, mask=pid < 1)
 
 def sigmoid_argmax(input, dim=None, keepdim=False):
     if dim is None:
         # Flatten the tensor and find argmax
         flat_input = input.flatten()
-        out = torch.empty(1, dtype=torch.long, device=input.device)
-        n = flat_input.numel()
-        block = 256
-        grid = (triton.cdiv(n, block),)
+        n_elements = flat_input.numel()
+        output = torch.empty(1, dtype=torch.long, device=input.device)
         
-        # First compute sigmoid
-        sigmoid_out = torch.empty_like(flat_input)
-        _sigmoid_kernel[grid](flat_input, sigmoid_out, n, BLOCK=block)
+        # Launch kernel for sigmoid
+        output_sigmoid = torch.empty_like(flat_input)
+        block_size = 256
+        num_blocks = (n_elements + block_size - 1) // block_size
+        sigmoid_kernel[num_blocks](flat_input, output_sigmoid, n_elements, BLOCK_SIZE=block_size)
         
-        # Then find argmax
-        argmax_val = torch.argmax(sigmoid_out)
-        out[0] = argmax_val
+        # Find argmax
+        max_val = -float('inf')
+        max_idx = 0
+        for i in range(n_elements):
+            if output_sigmoid[i] > max_val:
+                max_val = output_sigmoid[i]
+                max_idx = i
         
-        if keepdim:
-            return out.view(1)
-        return out
-    
+        return torch.tensor(max_idx, dtype=torch.long, device=input.device)
     else:
         # Handle specific dimension
-        # This is a simplified implementation
-        # A full implementation would need to handle the reduction properly
-        out = torch.empty(input.shape, dtype=torch.long, device=input.device)
-        n = input.numel()
-        block = 256
-        grid = (triton.cdiv(n, block),)
-        
-        # Compute sigmoid
-        sigmoid_out = torch.empty_like(input)
-        _sigmoid_kernel[grid](input, sigmoid_out, n, BLOCK=block)
-        
-        # For this simplified version, we'll use torch's argmax
-        # In a real implementation, we'd need to properly handle the dimension reduction
-        if keepdim:
-            return torch.argmax(sigmoid_out, dim=dim, keepdim=keepdim)
-        else:
-            return torch.argmax(sigmoid_out, dim=dim, keepdim=keepdim)
+        # This is a simplified version - full implementation would be more complex
+        input_sigmoid = 1.0 / (1.0 + torch.exp(-input))
+        return torch.argmax(input_sigmoid, dim=dim, keepdim=keepdim)
 ```

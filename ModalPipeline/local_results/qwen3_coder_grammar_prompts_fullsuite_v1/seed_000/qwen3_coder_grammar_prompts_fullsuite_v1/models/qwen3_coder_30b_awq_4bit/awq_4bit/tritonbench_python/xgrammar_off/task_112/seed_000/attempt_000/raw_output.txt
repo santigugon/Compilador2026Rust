@@ -4,86 +4,94 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _min_kernel(x_ptr, out_ptr, indices_ptr, n_rows, n_cols, stride_x_row, stride_x_col, stride_out_row, stride_out_col, stride_indices_row, stride_indices_col, keepdim: tl.constexpr, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    if pid >= n_rows:
+def min_kernel(
+    input_ptr, 
+    output_ptr, 
+    indices_ptr,
+    n_rows, 
+    n_cols,
+    BLOCK_SIZE: tl.constexpr
+):
+    row_idx = tl.program_id(0)
+    if row_idx >= n_rows:
         return
     
-    # Load the row data
-    row_offsets = pid * stride_x_row
-    row_ptr = x_ptr + row_offsets
-    
     # Initialize min and index
-    min_val = tl.load(row_ptr + tl.arange(0, BLOCK_SIZE) * stride_x_col)
-    min_val = tl.min(min_val)
+    min_val = tl.full([1], float('inf'), dtype=tl.float32)
+    min_idx = tl.full([1], 0, dtype=tl.int64)
     
-    # Find the index of the first minimum value
-    indices = tl.arange(0, BLOCK_SIZE) * stride_x_col
-    min_indices = tl.argmin(min_val, indices)
+    # Load data in chunks
+    for col_start in range(0, n_cols, BLOCK_SIZE):
+        col_offset = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = col_offset < n_cols
+        
+        # Load input values
+        input_vals = tl.load(input_ptr + row_idx * n_cols + col_offset, mask=mask, other=float('inf'))
+        
+        # Find min and update indices
+        current_min = tl.min(input_vals)
+        current_min_idx = tl.argmin(input_vals)
+        
+        # Update global min and index
+        if current_min < min_val:
+            min_val = current_min
+            min_idx = current_min_idx + col_start
     
     # Store results
-    out_row_offset = pid * stride_out_row
-    indices_row_offset = pid * stride_indices_row
-    
-    tl.store(out_ptr + out_row_offset, min_val)
-    tl.store(indices_ptr + indices_row_offset, min_indices)
+    tl.store(output_ptr + row_idx, min_val)
+    tl.store(indices_ptr + row_idx, min_idx)
 
 def min(input, dim, keepdim=False, *, out=None):
-    if out is not None:
-        raise NotImplementedError("out parameter is not supported")
-    
     if dim < 0:
         dim = input.dim() + dim
     
-    if dim < 0 or dim >= input.dim():
-        raise ValueError("dim out of range")
+    if dim >= input.dim():
+        raise ValueError("Dimension out of range")
     
-    # Get dimensions
-    input_shape = input.shape
+    # Get input shape
+    shape = input.shape
     n_rows = 1
-    n_cols = input_shape[dim]
+    n_cols = 1
     
-    # Calculate strides
-    input_strides = input.stride()
-    stride_x_row = input_strides[dim] if dim < len(input_strides) else 1
-    stride_x_col = input_strides[0] if len(input_strides) > 0 else 1
-    
-    # Calculate output shape
-    output_shape = list(input_shape)
-    if keepdim:
-        output_shape[dim] = 1
-    else:
-        output_shape.pop(dim)
+    # Calculate dimensions
+    for i in range(len(shape)):
+        if i == dim:
+            n_cols = shape[i]
+        else:
+            n_rows *= shape[i]
     
     # Create output tensors
-    out_min = torch.empty(output_shape, dtype=input.dtype, device=input.device)
-    out_indices = torch.empty(output_shape, dtype=torch.long, device=input.device)
-    
-    # Calculate grid
-    n_rows = input_shape[0] if dim == 0 else 1
-    for i in range(dim):
-        n_rows *= input_shape[i]
-    
-    block_size = 256
-    grid = (triton.cdiv(n_rows, block_size),)
+    if out is not None:
+        output = out[0]
+        indices = out[1]
+    else:
+        output = torch.empty(n_rows, dtype=torch.float32, device=input.device)
+        indices = torch.empty(n_rows, dtype=torch.int64, device=input.device)
     
     # Launch kernel
     if n_rows > 0:
-        _min_kernel[grid](
-            input, 
-            out_min, 
-            out_indices, 
-            n_rows, 
-            n_cols, 
-            stride_x_row, 
-            stride_x_col, 
-            out_min.stride()[0] if len(out_min.stride()) > 0 else 1, 
-            out_min.stride()[1] if len(out_min.stride()) > 1 else 1, 
-            out_indices.stride()[0] if len(out_indices.stride()) > 0 else 1, 
-            out_indices.stride()[1] if len(out_indices.stride()) > 1 else 1, 
-            keepdim, 
-            block_size
+        BLOCK_SIZE = 256
+        grid = (n_rows, 1, 1)
+        min_kernel[grid](
+            input_ptr=input.data_ptr(),
+            output_ptr=output.data_ptr(),
+            indices_ptr=indices.data_ptr(),
+            n_rows=n_rows,
+            n_cols=n_cols,
+            BLOCK_SIZE=BLOCK_SIZE
         )
     
-    return (out_min, out_indices)
+    # Reshape outputs if needed
+    if keepdim:
+        new_shape = list(shape)
+        new_shape[dim] = 1
+        output = output.view(new_shape)
+        indices = indices.view(new_shape)
+    else:
+        new_shape = list(shape)
+        new_shape.pop(dim)
+        output = output.view(new_shape)
+        indices = indices.view(new_shape)
+    
+    return (output, indices)
 ```

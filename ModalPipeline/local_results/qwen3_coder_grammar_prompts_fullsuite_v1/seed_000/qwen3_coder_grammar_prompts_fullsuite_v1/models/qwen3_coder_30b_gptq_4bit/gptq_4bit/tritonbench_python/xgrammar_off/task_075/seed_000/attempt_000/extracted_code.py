@@ -1,63 +1,97 @@
 import torch
 import triton
 import triton.language as tl
+import math
 
 @triton.jit
-def cholesky_kernel(A, L, n, BLOCK_SIZE: tl.constexpr):
-    # Compute Cholesky decomposition
-    for k in range(n):
-        # Compute diagonal element
-        sum_val = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-        for p in range(k):
-            sum_val += L[k, p] * L[k, p]
-        L[k, k] = tl.sqrt(A[k, k] - sum_val)
-        
-        # Compute off-diagonal elements
-        for i in range(k + 1, n):
-            sum_val = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-            for p in range(k):
-                sum_val += L[i, p] * L[k, p]
-            L[i, k] = (A[i, k] - sum_val) / L[k, k]
+def _cholesky_kernel(A_ptr, L_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    # Compute Cholesky decomposition: A = L * L.T
+    # L is lower triangular
+    
+    # Each thread block handles one row of L
+    row = tl.program_id(0)
+    
+    if row >= n:
+        return
+    
+    # For each element in the row
+    for col in range(row + 1):
+        if col == row:
+            # Compute diagonal element
+            sum_val = tl.zeros([1], dtype=tl.float32)
+            for k in range(col):
+                sum_val += L_ptr[row * n + k] * L_ptr[row * n + k]
+            L_ptr[row * n + col] = tl.sqrt(A_ptr[row * n + col] - sum_val)
+        else:
+            # Compute off-diagonal element
+            sum_val = tl.zeros([1], dtype=tl.float32)
+            for k in range(col):
+                sum_val += L_ptr[row * n + k] * L_ptr[col * n + k]
+            L_ptr[row * n + col] = (A_ptr[row * n + col] - sum_val) / L_ptr[col * n + col]
 
 @triton.jit
-def solve_lower_triangular_kernel(L, b, x, n, k, BLOCK_SIZE: tl.constexpr):
-    # Solve L * x = b
-    for i in range(n):
-        sum_val = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-        for j in range(i):
-            sum_val += L[i, j] * x[j]
-        x[i] = (b[i] - sum_val) / L[i, i]
+def _forward_substitution_kernel(L_ptr, b_ptr, x_ptr, n: tl.constexpr, k: tl.constexpr, BLOCK: tl.constexpr):
+    # Solve L * x = b using forward substitution
+    # Each thread handles one column of x
+    
+    col = tl.program_id(0)
+    
+    if col >= k:
+        return
+    
+    # For each row
+    for row in range(n):
+        sum_val = tl.zeros([1], dtype=tl.float32)
+        for j in range(row):
+            sum_val += L_ptr[row * n + j] * x_ptr[j * k + col]
+        x_ptr[row * k + col] = (b_ptr[row * k + col] - sum_val) / L_ptr[row * n + row]
 
 @triton.jit
-def solve_upper_triangular_kernel(L, b, x, n, k, BLOCK_SIZE: tl.constexpr):
-    # Solve L.T * x = b (upper triangular solve)
-    for i in range(n - 1, -1, -1):
-        sum_val = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-        for j in range(i + 1, n):
-            sum_val += L[j, i] * x[j]
-        x[i] = (b[i] - sum_val) / L[i, i]
+def _backward_substitution_kernel(L_ptr, x_ptr, n: tl.constexpr, k: tl.constexpr, BLOCK: tl.constexpr):
+    # Solve L.T * x = x using backward substitution
+    # Each thread handles one column of x
+    
+    col = tl.program_id(0)
+    
+    if col >= k:
+        return
+    
+    # For each row from bottom to top
+    for row in range(n - 1, -1, -1):
+        sum_val = tl.zeros([1], dtype=tl.float32)
+        for j in range(row + 1, n):
+            sum_val += L_ptr[j * n + row] * x_ptr[j * k + col]
+        x_ptr[row * k + col] = (x_ptr[row * k + col] - sum_val) / L_ptr[row * n + row]
 
 def fused_cholesky_solve(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    n, k = b.shape
-    assert A.shape == (n, n), "Matrix A must be n x n"
+    # Validate inputs
+    assert A.shape[0] == A.shape[1], "A must be square"
+    assert A.shape[0] == b.shape[0], "A and b must have compatible dimensions"
     
-    # Allocate output tensor
-    x = torch.zeros_like(b)
+    n, k = A.shape[0], b.shape[1]
     
-    # Create output tensor for L
-    L = torch.zeros_like(A)
+    # Create output tensor
+    x = torch.empty_like(b)
+    
+    # Allocate memory for L
+    L = torch.empty(n, n, dtype=A.dtype, device=A.device)
     
     # Compute Cholesky decomposition
-    BLOCK_SIZE = 32
-    grid = (triton.cdiv(n, BLOCK_SIZE), 1)
-    cholesky_kernel[grid](A, L, n, BLOCK_SIZE=BLOCK_SIZE)
+    block = 16
+    grid = (n, 1, 1)
+    _cholesky_kernel[grid](A, L, n, BLOCK=block)
     
-    # Solve L * x = b
-    grid = (triton.cdiv(n, BLOCK_SIZE), 1)
-    solve_lower_triangular_kernel[grid](L, b, x, n, k, BLOCK_SIZE=BLOCK_SIZE)
+    # Copy b to x
+    x.copy_(b)
     
-    # Solve L.T * x = result (upper triangular solve)
-    grid = (triton.cdiv(n, BLOCK_SIZE), 1)
-    solve_upper_triangular_kernel[grid](L, x, x, n, k, BLOCK_SIZE=BLOCK_SIZE)
+    # Forward substitution: L * x = b
+    block = 16
+    grid = (k, 1, 1)
+    _forward_substitution_kernel[grid](L, b, x, n, k, BLOCK=block)
+    
+    # Backward substitution: L.T * x = x
+    block = 16
+    grid = (k, 1, 1)
+    _backward_substitution_kernel[grid](L, x, n, k, BLOCK=block)
     
     return x

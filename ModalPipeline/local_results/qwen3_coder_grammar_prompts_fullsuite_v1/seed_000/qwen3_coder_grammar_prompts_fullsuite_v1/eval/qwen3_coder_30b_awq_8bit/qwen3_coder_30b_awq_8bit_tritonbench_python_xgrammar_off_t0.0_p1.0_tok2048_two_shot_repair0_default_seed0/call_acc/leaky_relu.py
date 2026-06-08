@@ -8,12 +8,11 @@ def _leaky_relu_kernel(x_ptr, out_ptr, n: tl.constexpr, negative_slope: tl.const
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    y = tl.maximum(x, 0.0) + negative_slope * tl.minimum(x, 0.0)
+    y = tl.where(x > 0, x, negative_slope * x)
     tl.store(out_ptr + offsets, y, mask=mask)
 
 def leaky_relu(input, negative_slope=0.01, inplace=False):
     if inplace:
-        # For inplace operation, we modify the input tensor directly
         out = input
     else:
         out = torch.empty_like(input)
@@ -23,7 +22,6 @@ def leaky_relu(input, negative_slope=0.01, inplace=False):
     grid = (triton.cdiv(n, block),)
     
     _leaky_relu_kernel[grid](input, out, n, negative_slope, BLOCK=block)
-    
     return out
 
 ##################################################################################################################################################

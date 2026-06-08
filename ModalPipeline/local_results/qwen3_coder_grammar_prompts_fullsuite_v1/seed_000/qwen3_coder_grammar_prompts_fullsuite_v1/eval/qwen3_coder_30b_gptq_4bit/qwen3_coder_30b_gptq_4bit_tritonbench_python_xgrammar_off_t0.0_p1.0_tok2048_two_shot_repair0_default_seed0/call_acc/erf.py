@@ -14,10 +14,12 @@ def _erf_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     a = 0.147
     sign_x = tl.where(x >= 0, 1.0, -1.0)
     x_squared = x * x
-    approx = 1.0 - tl.exp(-x_squared * (4.0 / 3.141592653589793 + a * x_squared) / (1.0 + a * x_squared))
-    erf_x = sign_x * tl.sqrt(approx)
+    numerator = -x_squared * (4.0 / 3.141592653589793 + a * x_squared)
+    denominator = 1.0 + a * x_squared
+    exp_val = tl.exp(numerator / denominator)
+    erf_val = sign_x * tl.sqrt(1.0 - exp_val)
     
-    tl.store(out_ptr + offsets, erf_x, mask=mask)
+    tl.store(out_ptr + offsets, erf_val, mask=mask)
 
 def erf(input, *, out=None):
     if out is None:

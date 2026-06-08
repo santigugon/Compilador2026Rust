@@ -8,44 +8,46 @@ def _fused_layer_norm_relu_linear_kernel(
     input_row_stride, weight_row_stride, weight_col_stride,
     output_row_stride, output_col_stride,
     n_features: tl.constexpr, n_out: tl.constexpr,
-    eps: tl.constexpr, BLOCK_SIZE: tl.constexpr
+    eps: tl.constexpr, BLOCK: tl.constexpr
 ):
     pid = tl.program_id(0)
     row = pid
     
     # Load input row
-    input_offsets = row * input_row_stride + tl.arange(0, BLOCK_SIZE)
+    input_offsets = row * input_row_stride + tl.arange(0, BLOCK)
     input_row = tl.load(input_ptr + input_offsets, mask=input_offsets < n_features, other=0.0)
     
     # Linear transformation: input @ weight.T + bias
-    linear_result = tl.zeros((n_out,), dtype=tl.float32)
-    for i in range(0, n_features, BLOCK_SIZE):
-        mask = (i + tl.arange(0, BLOCK_SIZE)) < n_features
-        input_vals = tl.load(input_ptr + row * input_row_stride + i + tl.arange(0, BLOCK_SIZE), mask=mask, other=0.0)
+    linear_out = tl.zeros((n_out,), dtype=tl.float32)
+    for i in range(0, n_features, BLOCK):
+        input_offsets = row * input_row_stride + i + tl.arange(0, BLOCK)
+        input_vals = tl.load(input_ptr + input_offsets, mask=input_offsets < n_features, other=0.0)
+        
         for j in range(n_out):
-            weight_offsets = j * weight_row_stride + i + tl.arange(0, BLOCK_SIZE)
-            weight_vals = tl.load(weight_ptr + weight_offsets, mask=mask, other=0.0)
-            linear_result[j] += tl.sum(input_vals * weight_vals)
+            weight_offsets = j * weight_row_stride + i + tl.arange(0, BLOCK)
+            weight_vals = tl.load(weight_ptr + weight_offsets, mask=weight_offsets < n_features, other=0.0)
+            linear_out[j] += tl.sum(input_vals * weight_vals)
     
     # Add bias
     if bias_ptr is not None:
         bias_offsets = tl.arange(0, n_out)
         bias_vals = tl.load(bias_ptr + bias_offsets, mask=bias_offsets < n_out, other=0.0)
-        linear_result += bias_vals
+        linear_out += bias_vals
     
     # Apply ReLU
-    linear_result = tl.where(linear_result > 0, linear_result, 0.0)
+    linear_out = tl.where(linear_out > 0.0, linear_out, 0.0)
     
     # Layer normalization
     # Compute mean
-    mean = tl.sum(linear_result) / n_out
+    mean = tl.sum(linear_out) / n_out
     
     # Compute variance
-    diff = linear_result - mean
+    diff = linear_out - mean
     variance = tl.sum(diff * diff) / n_out
     
     # Normalize
-    normalized = diff / tl.sqrt(variance + eps)
+    std = tl.sqrt(variance + eps)
+    normalized = diff / std
     
     # Store result
     output_offsets = row * output_row_stride + tl.arange(0, n_out)
@@ -68,25 +70,109 @@ def fused_layer_norm_relu_linear(input, weight, bias=None, normalized_shape=None
         assert bias.shape[0] == weight.shape[0], "Bias must have same size as weight output dimension"
     
     # Prepare output tensor
-    out_shape = list(input.shape[:-1]) + [weight.shape[0]]
-    out = torch.empty(out_shape, dtype=input.dtype, device=input.device)
+    input_shape = input.shape
+    output_shape = input_shape[:-1] + (weight.shape[0],)
+    out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
     
-    # Get dimensions
-    batch_size = input.numel() // input.shape[-1]
-    n_features = input.shape[-1]
-    n_out = weight.shape[0]
+    # Flatten input for processing
+    input_flat = input.view(-1, input.shape[-1])
+    out_flat = out.view(-1, weight.shape[0])
     
-    # Set up kernel launch parameters
-    BLOCK_SIZE = 256
-    grid = (batch_size,)
+    # Get strides
+    input_row_stride = input_flat.stride(0)
+    weight_row_stride = weight.stride(0)
+    weight_col_stride = weight.stride(1)
+    output_row_stride = out_flat.stride(0)
+    output_col_stride = out_flat.stride(1)
     
     # Launch kernel
-    _fused_layer_norm_relu_linear_kernel[grid](
-        input, weight, bias, out,
-        input.stride(-2) if input.dim() > 1 else 1,
-        weight.stride(0), weight.stride(1),
-        out.stride(-2) if out.dim() > 1 else 1, 1,
-        n_features, n_out, eps, BLOCK_SIZE
+    n_rows = input_flat.shape[0]
+    n_features = input_flat.shape[1]
+    n_out = weight.shape[0]
+    block = 256
+    grid = (n_rows,)
+    
+    # Create a temporary tensor for the linear output before normalization
+    temp_linear = torch.empty(n_rows, n_out, dtype=torch.float32, device=input.device)
+    
+    # First compute linear transformation
+    _linear_kernel[grid](
+        input_flat, weight, bias, temp_linear,
+        input_row_stride, weight_row_stride, weight_col_stride,
+        temp_linear.stride(0), temp_linear.stride(1),
+        n_features, n_out, BLOCK=block
+    )
+    
+    # Then apply ReLU and LayerNorm
+    _relu_layer_norm_kernel[grid](
+        temp_linear, out_flat,
+        temp_linear.stride(0), out_flat.stride(0),
+        n_out, eps, BLOCK=block
     )
     
     return out
+
+@triton.jit
+def _linear_kernel(
+    input_ptr, weight_ptr, bias_ptr, output_ptr,
+    input_row_stride, weight_row_stride, weight_col_stride,
+    output_row_stride, output_col_stride,
+    n_features: tl.constexpr, n_out: tl.constexpr,
+    BLOCK: tl.constexpr
+):
+    pid = tl.program_id(0)
+    row = pid
+    
+    # Linear transformation: input @ weight.T + bias
+    for j in range(n_out):
+        linear_out = 0.0
+        for i in range(0, n_features, BLOCK):
+            input_offsets = row * input_row_stride + i + tl.arange(0, BLOCK)
+            input_vals = tl.load(input_ptr + input_offsets, mask=input_offsets < n_features, other=0.0)
+            
+            weight_offsets = j * weight_row_stride + i + tl.arange(0, BLOCK)
+            weight_vals = tl.load(weight_ptr + weight_offsets, mask=weight_offsets < n_features, other=0.0)
+            
+            linear_out += tl.sum(input_vals * weight_vals)
+        
+        # Add bias if provided
+        if bias_ptr is not None:
+            bias_val = tl.load(bias_ptr + j, mask=j < n_out, other=0.0)
+            linear_out += bias_val
+        
+        # Store result
+        output_offsets = row * output_row_stride + j
+        tl.store(output_ptr + output_offsets, linear_out, mask=output_offsets < n_out)
+
+@triton.jit
+def _relu_layer_norm_kernel(
+    input_ptr, output_ptr,
+    input_row_stride, output_row_stride,
+    n_out: tl.constexpr, eps: tl.constexpr,
+    BLOCK: tl.constexpr
+):
+    pid = tl.program_id(0)
+    row = pid
+    
+    # Load input row
+    input_offsets = row * input_row_stride + tl.arange(0, BLOCK)
+    input_row = tl.load(input_ptr + input_offsets, mask=input_offsets < n_out, other=0.0)
+    
+    # Apply ReLU
+    input_row = tl.where(input_row > 0.0, input_row, 0.0)
+    
+    # Layer normalization
+    # Compute mean
+    mean = tl.sum(input_row) / n_out
+    
+    # Compute variance
+    diff = input_row - mean
+    variance = tl.sum(diff * diff) / n_out
+    
+    # Normalize
+    std = tl.sqrt(variance + eps)
+    normalized = diff / std
+    
+    # Store result
+    output_offsets = row * output_row_stride + tl.arange(0, n_out)
+    tl.store(output_ptr + output_offsets, normalized, mask=output_offsets < n_out)

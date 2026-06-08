@@ -4,129 +4,114 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _cholesky_solve_kernel(B_ptr, L_ptr, out_ptr, batch_size, n, k, upper: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    batch_idx = pid // (n * k)
+def _cholesky_solve_kernel(
+    B_ptr, L_ptr, out_ptr,
+    batch_size, n, k,
+    stride_B_batch, stride_B_n, stride_B_k,
+    stride_L_batch, stride_L_n, stride_L_n,
+    stride_out_batch, stride_out_n, stride_out_k,
+    upper,
+    BLOCK_SIZE: tl.constexpr
+):
+    batch_idx = tl.program_id(0)
+    k_idx = tl.program_id(1)
+    
     if batch_idx >= batch_size:
         return
     
-    # Calculate offsets for this batch
-    batch_offset_B = batch_idx * n * k
-    batch_offset_L = batch_idx * n * n
+    # Load B and L for this batch
+    B_batch = B_ptr + batch_idx * stride_B_batch
+    L_batch = L_ptr + batch_idx * stride_L_batch
+    out_batch = out_ptr + batch_idx * stride_out_batch
     
-    # Process each column of the batch
-    for col in range(k):
-        # Solve L * y = B for y (forward substitution)
+    # Load B and L for this batch
+    B = tl.load(B_batch + tl.arange(0, n)[:, None] * stride_B_n + tl.arange(0, k)[None, :] * stride_B_k)
+    L = tl.load(L_batch + tl.arange(0, n)[:, None] * stride_L_n + tl.arange(0, n)[None, :] * stride_L_n)
+    
+    # Solve L * Y = B (forward substitution)
+    Y = tl.zeros((n, k), dtype=tl.float32)
+    if not upper:
         for i in range(n):
-            if upper:
-                # For upper triangular: L^T * y = B
-                # We need to solve L^T * y = B, so we go from bottom to top
-                # But we need to be careful about the indexing
-                y = tl.load(B_ptr + batch_offset_B + i * k + col, mask=i < n, other=0.0)
-                for j in range(i + 1, n):
-                    if j < n:
-                        y -= tl.load(L_ptr + batch_offset_L + j * n + i, mask=j < n, other=0.0) * tl.load(out_ptr + batch_offset_B + j * k + col, mask=j < n, other=0.0)
-                # Divide by diagonal element
-                diag = tl.load(L_ptr + batch_offset_L + i * n + i, mask=i < n, other=1.0)
-                y = y / diag
-                tl.store(out_ptr + batch_offset_B + i * k + col, y, mask=i < n)
-            else:
-                # For lower triangular: L * y = B
-                y = tl.load(B_ptr + batch_offset_B + i * k + col, mask=i < n, other=0.0)
-                for j in range(0, i):
-                    if j < n:
-                        y -= tl.load(L_ptr + batch_offset_L + i * n + j, mask=j < n, other=0.0) * tl.load(out_ptr + batch_offset_B + j * k + col, mask=j < n, other=0.0)
-                # Divide by diagonal element
-                diag = tl.load(L_ptr + batch_offset_L + i * n + i, mask=i < n, other=1.0)
-                y = y / diag
-                tl.store(out_ptr + batch_offset_B + i * k + col, y, mask=i < n)
-        
-        # Solve L^T * x = y for x (backward substitution)
+            for j in range(k):
+                Y_i_j = B[i, j]
+                for l in range(i):
+                    Y_i_j -= L[i, l] * Y[l, j]
+                Y[i, j] = Y_i_j / L[i, i]
+    else:
         for i in range(n - 1, -1, -1):
-            if upper:
-                # For upper triangular: L^T * x = y
-                x = tl.load(out_ptr + batch_offset_B + i * k + col, mask=i < n, other=0.0)
-                for j in range(i + 1, n):
-                    if j < n:
-                        x -= tl.load(L_ptr + batch_offset_L + i * n + j, mask=j < n, other=0.0) * tl.load(out_ptr + batch_offset_B + j * k + col, mask=j < n, other=0.0)
-                # Divide by diagonal element
-                diag = tl.load(L_ptr + batch_offset_L + i * n + i, mask=i < n, other=1.0)
-                x = x / diag
-                tl.store(out_ptr + batch_offset_B + i * k + col, x, mask=i < n)
-            else:
-                # For lower triangular: L^T * x = y
-                x = tl.load(out_ptr + batch_offset_B + i * k + col, mask=i < n, other=0.0)
-                for j in range(i + 1, n):
-                    if j < n:
-                        x -= tl.load(L_ptr + batch_offset_L + j * n + i, mask=j < n, other=0.0) * tl.load(out_ptr + batch_offset_B + j * k + col, mask=j < n, other=0.0)
-                # Divide by diagonal element
-                diag = tl.load(L_ptr + batch_offset_L + i * n + i, mask=i < n, other=1.0)
-                x = x / diag
-                tl.store(out_ptr + batch_offset_B + i * k + col, x, mask=i < n)
+            for j in range(k):
+                Y_i_j = B[i, j]
+                for l in range(i + 1, n):
+                    Y_i_j -= L[i, l] * Y[l, j]
+                Y[i, j] = Y_i_j / L[i, i]
+    
+    # Solve L^T * X = Y (backward substitution)
+    X = tl.zeros((n, k), dtype=tl.float32)
+    if not upper:
+        for i in range(n - 1, -1, -1):
+            for j in range(k):
+                X_i_j = Y[i, j]
+                for l in range(i + 1, n):
+                    X_i_j -= L[l, i] * X[l, j]
+                X[i, j] = X_i_j / L[i, i]
+    else:
+        for i in range(n):
+            for j in range(k):
+                X_i_j = Y[i, j]
+                for l in range(i):
+                    X_i_j -= L[l, i] * X[l, j]
+                X[i, j] = X_i_j / L[i, i]
+    
+    # Store result
+    tl.store(out_batch + tl.arange(0, n)[:, None] * stride_out_n + tl.arange(0, k)[None, :] * stride_out_k, X)
 
 def cholesky_solve(B, L, upper=False, *, out=None):
-    # Validate inputs
-    assert B.dim() >= 2, "B must have at least 2 dimensions"
-    assert L.dim() >= 2, "L must have at least 2 dimensions"
-    assert B.shape[-1] == L.shape[-1], "Last dimension of B must match last dimension of L"
-    assert L.shape[-1] == L.shape[-2], "L must be square"
-    
-    # Handle batch dimensions
-    batch_dims_B = B.shape[:-2]
-    batch_dims_L = L.shape[:-2]
-    
-    # Check if batch dimensions match
-    if batch_dims_B != batch_dims_L:
-        # Broadcast batch dimensions
-        batch_size_B = 1
-        for dim in batch_dims_B:
-            batch_size_B *= dim
-        batch_size_L = 1
-        for dim in batch_dims_L:
-            batch_size_L *= dim
-            
-        if batch_size_B == 1 and batch_size_L > 1:
-            # B is broadcasted to match L
-            B = B.expand(batch_dims_L + B.shape[-2:])
-        elif batch_size_L == 1 and batch_size_B > 1:
-            # L is broadcasted to match B
-            L = L.expand(batch_dims_B + L.shape[-2:])
-        else:
-            raise ValueError("Batch dimensions must be broadcastable")
-    
-    # Get final batch size
-    batch_size = 1
-    for dim in B.shape[:-2]:
-        batch_size *= dim
-    
-    n = L.shape[-1]
-    k = B.shape[-1]
-    
-    # Create output tensor
     if out is None:
         out = torch.empty_like(B)
-    else:
-        assert out.shape == B.shape, "Output tensor must have the same shape as B"
     
-    # Handle special case of scalar inputs
-    if batch_size == 1 and n == 1 and k == 1:
-        # Simple scalar case
-        out.fill_(B[0] / L[0] ** 2)
-        return out
+    # Ensure inputs are contiguous
+    B = B.contiguous()
+    L = L.contiguous()
+    out = out.contiguous()
+    
+    # Get dimensions
+    batch_dims = B.shape[:-2]
+    n, k = B.shape[-2], B.shape[-1]
+    batch_size = 1
+    for dim in batch_dims:
+        batch_size *= dim
     
     # Launch kernel
-    block = 256
-    grid = (batch_size * n * k,)
+    grid = (batch_size, k)
+    BLOCK_SIZE = 32
     
-    # Create a temporary tensor for intermediate results
-    temp = torch.empty_like(out)
-    
-    # Copy B to temp for processing
-    temp.copy_(B)
+    # Determine data type
+    if B.dtype == torch.float32:
+        dtype = tl.float32
+    elif B.dtype == torch.float64:
+        dtype = tl.float64
+    elif B.dtype == torch.complex64:
+        dtype = tl.complex64
+    elif B.dtype == torch.complex128:
+        dtype = tl.complex128
+    else:
+        raise ValueError(f"Unsupported dtype: {B.dtype}")
     
     # Launch kernel
     _cholesky_solve_kernel[grid](
-        temp, L, out, batch_size, n, k, upper, BLOCK=block
+        B, L, out,
+        batch_size, n, k,
+        B.stride(-3) if len(B.shape) > 2 else 0,
+        B.stride(-2),
+        B.stride(-1),
+        L.stride(-3) if len(L.shape) > 2 else 0,
+        L.stride(-2),
+        L.stride(-1),
+        out.stride(-3) if len(out.shape) > 2 else 0,
+        out.stride(-2),
+        out.stride(-1),
+        upper,
+        BLOCK_SIZE
     )
     
     return out

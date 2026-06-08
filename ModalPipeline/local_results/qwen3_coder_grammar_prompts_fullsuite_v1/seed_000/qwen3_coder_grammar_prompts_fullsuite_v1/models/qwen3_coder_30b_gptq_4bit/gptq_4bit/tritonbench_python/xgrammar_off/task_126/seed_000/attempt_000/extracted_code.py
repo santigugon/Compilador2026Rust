@@ -3,57 +3,42 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def gelu_kernel(
-    input_ptr,
-    output_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-    APPROXIMATE: tl.constexpr
-):
+def _gelu_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    block_end = min(block_start + BLOCK_SIZE, n_elements)
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    input = tl.load(input_ptr + offsets, mask=mask)
-    
-    if APPROXIMATE == "tanh":
-        # Approximate GELU using tanh
-        output = 0.5 * input * (1 + tl.tanh(1.702 * input))
-    else:
-        # Exact GELU using error function
-        output = 0.5 * input * (1 + tl.erf(input / tl.sqrt(2.0)))
-    
-    tl.store(output_ptr + offsets, output, mask=mask)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    # GELU approximation using tanh: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    sqrt_2_over_pi = 0.7978845608028654  # sqrt(2/pi)
+    x_cubed = x * x * x
+    tanh_arg = sqrt_2_over_pi * (x + 0.044715 * x_cubed)
+    gelu_val = 0.5 * x * (1.0 + tl.tanh(tanh_arg))
+    tl.store(out_ptr + offsets, gelu_val, mask=mask)
 
 def gelu(input, approximate='none'):
-    """
-    Applies the Gaussian Error Linear Unit (GELU) activation function element-wise to the input tensor.
+    out = torch.empty_like(input)
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
     
-    Args:
-        input (torch.Tensor): Input tensor
-        approximate (str): Approximation method, either 'none' for exact GELU or 'tanh' for approximate GELU
+    if approximate == 'none':
+        # Use exact GELU computation
+        @triton.jit
+        def _gelu_exact_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+            pid = tl.program_id(0)
+            offsets = pid * BLOCK + tl.arange(0, BLOCK)
+            mask = offsets < n
+            x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+            # Exact GELU: x * normal_cdf(x)
+            # Using approximation for normal CDF
+            sqrt_2 = 1.4142135623730951
+            cdf_val = 0.5 * (1.0 + tl.erf(x / sqrt_2))
+            gelu_val = x * cdf_val
+            tl.store(out_ptr + offsets, gelu_val, mask=mask)
+        
+        _gelu_exact_kernel[grid](input, out, n, BLOCK=block)
+    else:
+        # Use tanh approximation
+        _gelu_kernel[grid](input, out, n, BLOCK=block)
     
-    Returns:
-        torch.Tensor: Output tensor with GELU applied
-    """
-    output = torch.empty_like(input)
-    
-    # Determine the approximate method
-    approximate_method = "tanh" if approximate == "tanh" else "none"
-    
-    # Calculate grid and block size
-    n_elements = input.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    # Launch kernel
-    gelu_kernel[grid](
-        input_ptr=input,
-        output_ptr=output,
-        n_elements=n_elements,
-        BLOCK_SIZE=BLOCK_SIZE,
-        APPROXIMATE=approximate_method
-    )
-    
-    return output
+    return out

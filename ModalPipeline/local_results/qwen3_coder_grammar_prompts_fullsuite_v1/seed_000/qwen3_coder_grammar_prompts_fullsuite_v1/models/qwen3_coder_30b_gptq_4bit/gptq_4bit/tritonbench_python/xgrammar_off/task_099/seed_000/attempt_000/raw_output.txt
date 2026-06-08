@@ -2,149 +2,56 @@
 import torch
 import triton
 import triton.language as tl
-import math
 
 @triton.jit
-def gelu_kernel(
-    input_ptr,
-    output_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-    APPROXIMATE: tl.constexpr
-):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    input = tl.load(input_ptr + offsets, mask=mask)
+def _gelu_kernel(x_ptr, out_ptr, n: tl.constexpr, approximate: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     
-    if APPROXIMATE == "tanh":
-        output = 0.5 * input * (1 + tl.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * input * input * input)))
+    # GELU approximation
+    if approximate == 'tanh':
+        # GELU with tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        x_cubed = x * x * x
+        tanh_arg = 0.7978845608 * (x + 0.044715 * x_cubed)  # sqrt(2/pi) ≈ 0.7978845608
+        gelu_x = 0.5 * x * (1.0 + tl.tanh(tanh_arg))
     else:
-        output = 0.5 * input * (1 + tl.erf(input / math.sqrt(2.0)))
+        # Standard GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
+        erf_arg = x / 1.4142135623730951  # sqrt(2)
+        gelu_x = 0.5 * x * (1.0 + tl.erf(erf_arg))
     
-    tl.store(output_ptr + offsets, output, mask=mask)
-
-@triton.jit
-def std_kernel(
-    input_ptr,
-    output_ptr,
-    n_elements,
-    n_reduced,
-    keepdim,
-    correction,
-    BLOCK_SIZE: tl.constexpr
-):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    input = tl.load(input_ptr + offsets, mask=mask)
-    
-    # Compute mean
-    mean = tl.sum(input, axis=0) / n_reduced
-    
-    # Compute variance
-    squared_diff = (input - mean) * (input - mean)
-    variance = tl.sum(squared_diff, axis=0) / (n_reduced - correction)
-    
-    # Compute standard deviation
-    std = tl.sqrt(variance)
-    
-    tl.store(output_ptr + pid, std, mask=pid < 1)
+    tl.store(out_ptr + offsets, gelu_x, mask=mask)
 
 def gelu_std(input, dim=None, keepdim=False, correction=1, approximate='none', out=None):
-    if approximate == 'none':
-        approx = 0
-    elif approximate == 'tanh':
-        approx = 1
-    else:
-        raise ValueError("approximate must be 'none' or 'tanh'")
-    
-    # Apply GELU
+    # Apply GELU activation
     input_flat = input.flatten()
-    output_gelu = torch.empty_like(input_flat)
+    n = input_flat.numel()
+    
+    # Allocate output tensor for GELU
+    gelu_out = torch.empty_like(input_flat)
     
     # Launch GELU kernel
-    n_elements = input_flat.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    gelu_kernel[grid](
-        input_flat,
-        output_gelu,
-        n_elements,
-        BLOCK_SIZE=BLOCK_SIZE,
-        APPROXIMATE=approx
-    )
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    approximate_val = 1 if approximate == 'tanh' else 0
+    _gelu_kernel[grid](input_flat, gelu_out, n, approximate_val, BLOCK=block)
     
     # Reshape to original shape
-    output_gelu = output_gelu.view(input.shape)
+    gelu_out = gelu_out.view(input.shape)
     
     # Compute standard deviation
     if dim is None:
-        # Reduce all dimensions
-        reduced_elements = output_gelu.numel()
-        reduced_shape = []
-        keepdim_shape = list(output_gelu.shape)
+        # Compute over all dimensions
+        std_tensor = torch.std(gelu_out, correction=correction)
     else:
-        if isinstance(dim, int):
-            dim = [dim]
-        else:
-            dim = list(dim)
-        
-        # Normalize negative dimensions
-        dim = [d if d >= 0 else d + len(output_gelu.shape) for d in dim]
-        
-        # Compute reduced elements
-        reduced_elements = 1
-        reduced_shape = []
-        keepdim_shape = list(output_gelu.shape)
-        
-        for i, s in enumerate(output_gelu.shape):
-            if i in dim:
-                reduced_elements *= s
-                reduced_shape.append(s)
-            else:
-                keepdim_shape[i] = 1
-        
-        # Compute elements to reduce
-        if len(reduced_shape) == 0:
-            reduced_elements = 1
-        else:
-            reduced_elements = reduced_elements
+        # Compute over specified dimensions
+        std_tensor = torch.std(gelu_out, dim=dim, keepdim=keepdim, correction=correction)
     
-    # Compute standard deviation
+    # Return result
     if out is not None:
-        result = out
+        out.copy_(std_tensor)
+        return out
     else:
-        result = torch.empty(1, dtype=torch.float32)
-    
-    # Launch standard deviation kernel
-    if reduced_elements > 0:
-        n_reduced = reduced_elements
-        if correction > 1:
-            correction = 1
-        grid = (1,)
-        std_kernel[grid](
-            output_gelu,
-            result,
-            n_elements,
-            n_reduced,
-            keepdim,
-            correction,
-            BLOCK_SIZE=BLOCK_SIZE
-        )
-    else:
-        result = torch.tensor(0.0)
-    
-    # Handle keepdim
-    if keepdim and dim is not None:
-        # Create output tensor with proper dimensions
-        output_shape = list(output_gelu.shape)
-        for i in dim:
-            output_shape[i] = 1
-        result = result.view(output_shape)
-    
-    return result
+        return std_tensor
 ```

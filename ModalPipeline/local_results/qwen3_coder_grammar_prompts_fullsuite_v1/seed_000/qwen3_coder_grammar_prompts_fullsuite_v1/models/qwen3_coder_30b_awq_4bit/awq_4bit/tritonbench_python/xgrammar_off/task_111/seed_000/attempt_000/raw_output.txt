@@ -4,96 +4,70 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _svd_approximation_kernel(
-    A_ptr, U_ptr, S_ptr, V_ptr, 
-    batch_size, m, n, k,
-    A_stride_0, A_stride_1, A_stride_2,
-    U_stride_0, U_stride_1, U_stride_2,
-    S_stride_0, S_stride_1,
-    V_stride_0, V_stride_1, V_stride_2,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
-):
-    batch_idx = tl.program_id(0)
-    if batch_idx >= batch_size:
-        return
+def _svd_kernel(A_ptr, U_ptr, S_ptr, V_ptr, m, n, k, stride_A, stride_U, stride_S, stride_V, BLOCK_M=32, BLOCK_N=32):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
     
-    # Load matrix A for this batch
-    A_base = A_ptr + batch_idx * A_stride_0
-    U_base = U_ptr + batch_idx * U_stride_0
-    V_base = V_ptr + batch_idx * V_stride_0
+    # Shared memory for tile computation
+    tile_A = tl.shared.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    tile_U = tl.shared.zeros((BLOCK_M, BLOCK_M), dtype=tl.float32)
+    tile_V = tl.shared.zeros((BLOCK_N, BLOCK_N), dtype=tl.float32)
     
-    # For simplicity, we'll use a basic approach for SVD approximation
-    # In practice, a full SVD implementation would be more complex
-    # This is a simplified version that demonstrates the concept
+    # Load tile
+    for i in range(0, BLOCK_M, BLOCK_M):
+        for j in range(0, BLOCK_N, BLOCK_N):
+            tile_A[i:i+BLOCK_M, j:j+BLOCK_N] = tl.load(A_ptr + i * stride_A + j * stride_A)
     
-    # Initialize output matrices
-    for i in range(m):
-        for j in range(k):
-            if i < m and j < k:
-                # Simple approximation - just copy first k columns of U
-                # and first k rows of V^T
-                u_val = tl.load(A_base + i * A_stride_1 + j * A_stride_2)
-                tl.store(U_base + i * U_stride_1 + j * U_stride_2, u_val)
+    # Compute SVD for tile
+    # Simplified SVD computation for demonstration
+    for i in range(BLOCK_M):
+        for j in range(BLOCK_N):
+            if i < k and j < k:
+                tl.store(U_ptr + i * stride_U + j * stride_U, tile_A[i, j])
+            if i < k and j < k:
+                tl.store(V_ptr + i * stride_V + j * stride_V, tile_A[i, j])
     
-    # For S, we just copy the first k singular values (simplified)
+    # Store singular values
     for i in range(k):
-        if i < k:
-            s_val = tl.load(A_base + i * A_stride_1 + i * A_stride_2)
-            tl.store(S_ptr + batch_idx * S_stride_0 + i * S_stride_1, s_val)
-    
-    # For V, we copy first k rows of V^T (simplified)
-    for i in range(k):
-        for j in range(n):
-            if i < k and j < n:
-                v_val = tl.load(A_base + i * A_stride_1 + j * A_stride_2)
-                tl.store(V_base + i * V_stride_1 + j * V_stride_2, v_val)
+        tl.store(S_ptr + i * stride_S, tile_A[i, i])
 
-def low_rank_svd_approximation(A, k, *, full_matrices=True, out=None):
-    # Validate inputs
-    if A.dim() < 2:
-        raise ValueError("Input tensor A must have at least 2 dimensions")
+def low_rank_svd_approximation(A, k, *, full_matrices=True, out=None) -> torch.Tensor:
+    if A.dtype not in [torch.float32, torch.float64, torch.complex64, torch.complex128]:
+        raise ValueError("Unsupported dtype")
+    
+    if k <= 0 or k > min(A.shape[-2], A.shape[-1]):
+        raise ValueError("k must satisfy 1 <= k <= min(m, n)")
     
     batch_dims = A.shape[:-2]
     m, n = A.shape[-2], A.shape[-1]
     
-    if not (1 <= k <= min(m, n)):
-        raise ValueError(f"k must satisfy 1 <= k <= min(m, n), got k={k}, m={m}, n={n}")
+    if out is None:
+        if full_matrices:
+            out = torch.empty(*batch_dims, m, k, dtype=A.dtype, device=A.device)
+        else:
+            out = torch.empty(*batch_dims, m, k, dtype=A.dtype, device=A.device)
     
-    # Create output tensors
-    if out is not None:
-        if out.shape != A.shape:
-            raise ValueError("Output tensor must have the same shape as input tensor A")
-        if out.dtype != A.dtype:
-            raise ValueError("Output tensor must have the same dtype as input tensor A")
-        if out.device != A.device:
-            raise ValueError("Output tensor must be on the same device as input tensor A")
-        out_U = out
-    else:
-        out_U = torch.empty_like(A)
+    # Prepare for Triton kernel
+    A_flat = A.view(-1, m, n)
+    out_flat = out.view(-1, m, k)
     
-    # For this simplified implementation, we'll just return the first k columns
-    # of the input matrix as the approximation
-    # In a real implementation, we would compute the actual SVD and use the top k components
+    # Launch kernel
+    grid = (triton.cdiv(m, 32), triton.cdiv(n, 32))
+    _svd_kernel[grid](
+        A_flat,
+        out_flat,
+        None,
+        None,
+        m,
+        n,
+        k,
+        A_flat.stride(-2),
+        out_flat.stride(-2),
+        1,
+        1,
+        BLOCK_M=32,
+        BLOCK_N=32
+    )
     
-    # Create output tensors for U, S, V
-    if full_matrices:
-        out_U = torch.empty(A.shape[:-2] + (m, m), dtype=A.dtype, device=A.device)
-        out_S = torch.empty(A.shape[:-2] + (min(m, n),), dtype=A.dtype, device=A.device)
-        out_V = torch.empty(A.shape[:-2] + (n, n), dtype=A.dtype, device=A.device)
-    else:
-        out_U = torch.empty(A.shape[:-2] + (m, k), dtype=A.dtype, device=A.device)
-        out_S = torch.empty(A.shape[:-2] + (k,), dtype=A.dtype, device=A.device)
-        out_V = torch.empty(A.shape[:-2] + (k, n), dtype=A.dtype, device=A.device)
-    
-    # For demonstration, we'll just return the first k columns of A as U
-    # and set S to identity (simplified)
-    out_U = A[..., :k]
-    out_S = torch.ones(A.shape[:-2] + (k,), dtype=A.dtype, device=A.device)
-    out_V = torch.zeros(A.shape[:-2] + (k, n), dtype=A.dtype, device=A.device)
-    
-    # In a real implementation, we would compute the actual SVD
-    # and return the top-k components
-    
-    # Return the approximation as a tuple (U, S, V)
-    return (out_U, out_S, out_V)
+    return out
 ```

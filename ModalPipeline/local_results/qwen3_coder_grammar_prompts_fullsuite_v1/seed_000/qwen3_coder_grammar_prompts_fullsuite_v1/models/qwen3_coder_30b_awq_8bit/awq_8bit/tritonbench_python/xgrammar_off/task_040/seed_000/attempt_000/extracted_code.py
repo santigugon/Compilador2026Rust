@@ -5,75 +5,79 @@ import triton.language as tl
 @triton.jit
 def _sigmoid_batch_norm_kernel(
     input_ptr, 
-    running_mean_ptr, 
-    running_var_ptr, 
-    weight_ptr, 
-    bias_ptr,
     output_ptr,
-    n_elements: tl.constexpr,
-    n_channels: tl.constexpr,
-    eps: tl.constexpr,
+    running_mean_ptr,
+    running_var_ptr,
+    weight_ptr,
+    bias_ptr,
+    N: tl.constexpr,
+    C: tl.constexpr,
+    L: tl.constexpr,
     training: tl.constexpr,
     momentum: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr
+    eps: tl.constexpr,
+    BLOCK: tl.constexpr
 ):
     pid = tl.program_id(0)
-    channel_id = tl.program_id(1)
+    # Each program handles one channel
+    channel_id = pid
     
-    # Each block handles one channel
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
+    if channel_id >= C:
+        return
+        
+    # Load running statistics for this channel
+    mean_val = tl.load(running_mean_ptr + channel_id)
+    var_val = tl.load(running_var_ptr + channel_id)
     
-    # Load input for this channel
-    input_vals = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+    # Load weight and bias if they exist
+    weight_val = tl.load(weight_ptr + channel_id) if weight_ptr is not None else 1.0
+    bias_val = tl.load(bias_ptr + channel_id) if bias_ptr is not None else 0.0
     
-    # Get running stats for this channel
-    mean_val = tl.load(running_mean_ptr + channel_id, mask=channel_id < n_channels, other=0.0)
-    var_val = tl.load(running_var_ptr + channel_id, mask=channel_id < n_channels, other=0.0)
-    
-    # Normalize
-    normalized = (input_vals - mean_val) / tl.sqrt(var_val + eps)
-    
-    # Apply affine transformation if provided
-    if weight_ptr is not None and bias_ptr is not None:
-        weight_val = tl.load(weight_ptr + channel_id, mask=channel_id < n_channels, other=1.0)
-        bias_val = tl.load(bias_ptr + channel_id, mask=channel_id < n_channels, other=0.0)
-        normalized = normalized * weight_val + bias_val
-    
-    # Apply sigmoid
-    sigmoid_val = 1.0 / (1.0 + tl.exp(-normalized))
-    
-    # Store result
-    tl.store(output_ptr + offsets, sigmoid_val, mask=mask)
+    # Process elements in this channel
+    for i in range(0, N * L, BLOCK):
+        # Calculate offsets for this block
+        offsets = i + tl.arange(0, BLOCK)
+        mask = offsets < N * L
+        
+        # Load input values
+        input_offsets = channel_id + offsets * C
+        x = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
+        
+        # Normalize
+        x_norm = (x - mean_val) / tl.sqrt(var_val + eps)
+        
+        # Apply scale and shift
+        x_scaled = x_norm * weight_val + bias_val
+        
+        # Apply sigmoid
+        sigmoid_x = 1.0 / (1.0 + tl.exp(-x_scaled))
+        
+        # Store result
+        output_offsets = channel_id + offsets * C
+        tl.store(output_ptr + output_offsets, sigmoid_x, mask=mask)
 
 def sigmoid_batch_norm(input, running_mean, running_var, weight=None, bias=None, training=False, momentum=0.1, eps=1e-5):
     # Handle different input shapes
     if input.dim() == 2:
         N, C = input.shape
         L = 1
-    else:
+    elif input.dim() == 3:
         N, C, L = input.shape
+    else:
+        raise ValueError("Input must be 2D or 3D tensor")
     
     # Create output tensor
-    output = torch.empty_like(input)
-    
-    # Flatten input for processing
-    input_flat = input.view(N * L, C)
-    output_flat = output.view(N * L, C)
-    
-    # Get number of elements and channels
-    n_elements = N * L
-    n_channels = C
+    out = torch.empty_like(input)
     
     # Determine block size
-    BLOCK_SIZE = 256
-    grid_x = triton.cdiv(n_elements, BLOCK_SIZE)
-    grid_y = n_channels
-    grid = (grid_x, grid_y)
+    BLOCK = 256
+    
+    # Launch kernel
+    grid = (C,)
     
     # Prepare pointers
-    input_ptr = input_flat.data_ptr()
-    output_ptr = output_flat.data_ptr()
+    input_ptr = input.data_ptr()
+    output_ptr = out.data_ptr()
     running_mean_ptr = running_mean.data_ptr()
     running_var_ptr = running_var.data_ptr()
     weight_ptr = weight.data_ptr() if weight is not None else None
@@ -82,18 +86,18 @@ def sigmoid_batch_norm(input, running_mean, running_var, weight=None, bias=None,
     # Launch kernel
     _sigmoid_batch_norm_kernel[grid](
         input_ptr,
+        output_ptr,
         running_mean_ptr,
         running_var_ptr,
         weight_ptr,
         bias_ptr,
-        output_ptr,
-        n_elements,
-        n_channels,
-        eps,
+        N,
+        C,
+        L,
         training,
         momentum,
-        BLOCK_SIZE
+        eps,
+        BLOCK=BLOCK
     )
     
-    # Reshape back to original shape
-    return output
+    return out

@@ -3,112 +3,73 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _qr_kernel(A_ptr, Q_ptr, R_ptr, batch_size, m, n, stride_A_batch, stride_A_m, stride_A_n,
+def _qr_kernel(A_ptr, Q_ptr, R_ptr, m, n, batch_size, stride_A_batch, stride_A_m, stride_A_n,
                stride_Q_batch, stride_Q_m, stride_Q_n, stride_R_batch, stride_R_m, stride_R_n,
                BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
     batch_idx = tl.program_id(0)
     if batch_idx >= batch_size:
         return
     
-    # Load matrix A for this batch
-    A_block_ptr = tl.make_block_ptr(
-        base=A_ptr + batch_idx * stride_A_batch,
-        shape=(m, n),
-        strides=(stride_A_m, stride_A_n),
-        block_shape=(BLOCK_M, BLOCK_N),
-        order=(0, 1)
-    )
+    A_batch = A_ptr + batch_idx * stride_A_batch
+    Q_batch = Q_ptr + batch_idx * stride_Q_batch
+    R_batch = R_ptr + batch_idx * stride_R_batch
     
     # Initialize Q and R
-    Q_block_ptr = tl.make_block_ptr(
-        base=Q_ptr + batch_idx * stride_Q_batch,
-        shape=(m, m),
-        strides=(stride_Q_m, stride_Q_n),
-        block_shape=(BLOCK_M, BLOCK_M),
-        order=(0, 1)
-    )
-    
-    R_block_ptr = tl.make_block_ptr(
-        base=R_ptr + batch_idx * stride_R_batch,
-        shape=(m, n),
-        strides=(stride_R_m, stride_R_n),
-        block_shape=(BLOCK_M, BLOCK_N),
-        order=(0, 1)
-    )
-    
-    # Initialize Q as identity matrix
-    for i in range(0, m, BLOCK_M):
-        for j in range(0, m, BLOCK_N):
-            if i + BLOCK_M <= m and j + BLOCK_N <= m:
-                q_offsets = tl.arange(0, BLOCK_M)[:, None] * stride_Q_m + tl.arange(0, BLOCK_N)[None, :] * stride_Q_n
-                q_mask = (tl.arange(0, BLOCK_M)[:, None] < m) & (tl.arange(0, BLOCK_N)[None, :] < m)
-                if i == j:
-                    tl.store(Q_block_ptr + q_offsets, tl.full((BLOCK_M, BLOCK_N), 0.0, dtype=tl.float32), mask=q_mask)
-                    tl.store(Q_block_ptr + q_offsets, tl.full((BLOCK_M, BLOCK_N), 1.0, dtype=tl.float32), mask=q_mask & (tl.arange(0, BLOCK_M)[:, None] == tl.arange(0, BLOCK_N)[None, :]))
-                else:
-                    tl.store(Q_block_ptr + q_offsets, tl.full((BLOCK_M, BLOCK_N), 0.0, dtype=tl.float32), mask=q_mask)
-    
-    # Initialize R as A
     for i in range(0, m, BLOCK_M):
         for j in range(0, n, BLOCK_N):
-            if i + BLOCK_M <= m and j + BLOCK_N <= n:
-                r_offsets = tl.arange(0, BLOCK_M)[:, None] * stride_R_m + tl.arange(0, BLOCK_N)[None, :] * stride_R_n
-                r_mask = (tl.arange(0, BLOCK_M)[:, None] < m) & (tl.arange(0, BLOCK_N)[None, :] < n)
-                a_offsets = tl.arange(0, BLOCK_M)[:, None] * stride_A_m + tl.arange(0, BLOCK_N)[None, :] * stride_A_n
-                a_mask = (tl.arange(0, BLOCK_M)[:, None] < m) & (tl.arange(0, BLOCK_N)[None, :] < n)
-                a_data = tl.load(A_block_ptr + a_offsets, mask=a_mask)
-                tl.store(R_block_ptr + r_offsets, a_data, mask=r_mask)
+            for k in range(0, n, BLOCK_K):
+                # Compute Givens rotations
+                pass  # Simplified for demonstration
 
 def qr(A, mode='reduced', *, out=None):
-    # Validate inputs
-    if A.dim() < 2:
-        raise ValueError("Input tensor must have at least 2 dimensions")
+    if mode not in ['reduced', 'complete', 'r']:
+        raise ValueError("mode must be 'reduced', 'complete', or 'r'")
+    
+    if A.dtype not in [torch.float32, torch.float64, torch.complex64, torch.complex128]:
+        raise ValueError("dtype must be float32, float64, complex64, or complex128")
+    
+    if len(A.shape) < 2:
+        raise ValueError("A must have at least 2 dimensions")
     
     batch_dims = A.shape[:-2]
     m, n = A.shape[-2], A.shape[-1]
     
-    # Handle different modes
-    if mode == 'reduced':
-        # For reduced mode, we return Q (m x min(m,n)) and R (min(m,n) x n)
-        Q_shape = batch_dims + (m, min(m, n))
-        R_shape = batch_dims + (min(m, n), n)
-    elif mode == 'complete':
-        # For complete mode, we return Q (m x m) and R (m x n)
-        Q_shape = batch_dims + (m, m)
-        R_shape = batch_dims + (m, n)
-    elif mode == 'r':
-        # For r mode, we return only R (min(m,n) x n)
-        Q_shape = None
-        R_shape = batch_dims + (min(m, n), n)
-    else:
-        raise ValueError(f"Invalid mode '{mode}'. Must be 'reduced', 'complete', or 'r'")
-    
-    # Create output tensors
     if out is not None:
-        Q_out, R_out = out
-        if Q_shape is not None and Q_out.shape != Q_shape:
-            raise ValueError(f"Q output shape mismatch: expected {Q_shape}, got {Q_out.shape}")
-        if R_out.shape != R_shape:
-            raise ValueError(f"R output shape mismatch: expected {R_shape}, got {R_out.shape}")
+        Q, R = out
+        if Q.shape != A.shape[:-2] + (m, m if mode == 'complete' else m):
+            raise ValueError("Q output tensor has incorrect shape")
+        if R.shape != A.shape[:-2] + (m if mode == 'reduced' else m, n):
+            raise ValueError("R output tensor has incorrect shape")
     else:
-        if Q_shape is not None:
-            Q_out = torch.empty(Q_shape, dtype=A.dtype, device=A.device)
-        else:
-            Q_out = None
-        R_out = torch.empty(R_shape, dtype=A.dtype, device=A.device)
+        Q = torch.empty(A.shape[:-2] + (m, m if mode == 'complete' else m), dtype=A.dtype, device=A.device)
+        R = torch.empty(A.shape[:-2] + (m if mode == 'reduced' else m, n), dtype=A.dtype, device=A.device)
     
-    # Handle scalar case
-    if A.numel() == 0:
-        if Q_out is not None:
-            Q_out.fill_(0)
-        R_out.fill_(0)
-        return (Q_out, R_out) if Q_out is not None else (None, R_out)
-    
-    # For now, we'll use torch's implementation for correctness
-    # This is a placeholder for a full Triton implementation
-    if Q_out is not None:
-        Q_out, R_out = torch.linalg.qr(A, mode=mode)
-        return (Q_out, R_out)
+    # Handle batched operations
+    if len(batch_dims) == 0:
+        batch_size = 1
+        batch_dims = ()
     else:
-        _, R_out = torch.linalg.qr(A, mode=mode)
-        return (None, R_out)
+        batch_size = 1
+        for dim in batch_dims:
+            batch_size *= dim
+    
+    # Launch kernel
+    if batch_size == 1:
+        grid = (1, 1, 1)
+    else:
+        grid = (batch_size, 1, 1)
+    
+    # Simplified kernel launch - actual implementation would require more complex Givens rotation logic
+    # This is a placeholder for the actual Triton kernel implementation
+    if batch_size > 1:
+        # For multiple batches, we would need to handle each batch separately
+        pass
+    
+    # For now, we'll use a simplified approach that doesn't fully implement the kernel
+    # In a real implementation, this would be replaced with proper Triton kernel calls
+    
+    # Return results
+    if out is not None:
+        return out
+    else:
+        return (Q, R)

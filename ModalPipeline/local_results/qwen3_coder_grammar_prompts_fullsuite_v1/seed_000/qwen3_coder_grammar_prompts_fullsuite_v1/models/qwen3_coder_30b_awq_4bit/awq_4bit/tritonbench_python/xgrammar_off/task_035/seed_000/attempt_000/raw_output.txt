@@ -4,85 +4,101 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _fused_mv_sigmoid_sub_kernel(
-    input_ptr, vec_ptr, other_ptr, out_ptr,
-    n: tl.constexpr, m: tl.constexpr,
-    input_stride_0: tl.constexpr, input_stride_1: tl.constexpr,
-    vec_stride_0: tl.constexpr,
-    other_stride_0: tl.constexpr,
-    out_stride_0: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr
+def fused_mv_sigmoid_sub_kernel(
+    A_ptr, vec_ptr, other_ptr, out_ptr,
+    n, m,
+    alpha,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr
 ):
-    pid = tl.program_id(0)
-    # Each program processes one row of the input matrix
-    row = pid
-    if row >= n:
-        return
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
     
-    # Initialize output row
-    out_row = tl.full((m,), 0.0, dtype=tl.float32)
+    # Compute the output for this block
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     
-    # Compute matrix-vector multiplication: row * vec
-    for i in range(0, m, BLOCK_SIZE):
-        vec_offsets = i + tl.arange(0, BLOCK_SIZE)
-        vec_mask = vec_offsets < m
-        vec_vals = tl.load(vec_ptr + vec_offsets * vec_stride_0, mask=vec_mask, other=0.0)
+    # Loop over the K dimension
+    for k in range(0, m, BLOCK_SIZE_K):
+        # Load A and vec
+        A_block = tl.load(
+            A_ptr + (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)[:, None]) * m +
+            (k + tl.arange(0, BLOCK_SIZE_K)[None, :]),
+            mask=(pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)[:, None]) < n,
+            other=0.0
+        )
+        vec_block = tl.load(
+            vec_ptr + (k + tl.arange(0, BLOCK_SIZE_K)),
+            mask=(k + tl.arange(0, BLOCK_SIZE_K)) < m,
+            other=0.0
+        )
         
-        input_offsets = row * input_stride_0 + vec_offsets * input_stride_1
-        input_mask = vec_offsets < m
-        input_vals = tl.load(input_ptr + input_offsets, mask=input_mask, other=0.0)
-        
-        out_row += input_vals * vec_vals
+        # Compute matrix-vector multiplication
+        acc += tl.dot(A_block, vec_block)
     
-    # Apply sigmoid to the result
-    out_row = 1.0 / (1.0 + tl.exp(-out_row))
+    # Apply sigmoid activation
+    sigmoid_out = 1.0 / (1.0 + tl.exp(-acc))
     
-    # Apply subtraction with scaling
-    other_val = tl.load(other_ptr)
-    out_row = out_row - other_val * 1.0  # alpha is 1.0 by default
+    # Load other and apply alpha scaling
+    other = tl.load(other_ptr)
+    scaled_other = other * alpha
     
-    # Store the result
-    out_offsets = row * out_stride_0
-    tl.store(out_ptr + out_offsets, out_row, mask=tl.arange(0, m) < m)
+    # Subtract scaled other from sigmoid output
+    result = sigmoid_out - scaled_other
+    
+    # Store result
+    tl.store(
+        out_ptr + (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)[:, None]) * BLOCK_SIZE_N +
+        (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)[None, :]),
+        result,
+        mask=(pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)[:, None]) < n
+    )
 
 def fused_mv_sigmoid_sub(input, vec, other, alpha=1, *, out=None):
     # Validate input shapes
+    assert input.dim() == 2, "input must be a 2D tensor"
+    assert vec.dim() == 1, "vec must be a 1D tensor"
+    assert input.size(1) == vec.size(0), "input and vec dimensions must match"
+    
     n, m = input.shape
-    assert vec.shape == (m,), f"Expected vec shape ({m},), got {vec.shape}"
-    
-    # Handle scalar other
-    if not torch.is_tensor(other):
-        other = torch.tensor(other, dtype=torch.float32, device=input.device)
-    
-    # Prepare output tensor
+    # Create output tensor if not provided
     if out is None:
-        out = torch.empty(n, dtype=torch.float32, device=input.device)
-    else:
-        assert out.shape == (n,), f"Expected out shape ({n},), got {out.shape}"
+        out = torch.empty_like(input)
+    
+    # Ensure output tensor has the correct shape
+    assert out.shape == input.shape, "out tensor must have the same shape as input"
+    
+    # Prepare kernel launch parameters
+    BLOCK_SIZE_M = 16
+    BLOCK_SIZE_N = 16
+    BLOCK_SIZE_K = 32
     
     # Launch kernel
-    block_size = 256
-    grid_size = triton.cdiv(n, 1)  # One program per row
-    
-    # Create a temporary tensor for the intermediate result
-    temp = torch.empty(n, dtype=torch.float32, device=input.device)
-    
-    # Compute matrix-vector multiplication + sigmoid + subtraction
-    _fused_mv_sigmoid_sub_kernel[grid_size](
-        input, vec, other, temp,
-        n, m,
-        input.stride(0), input.stride(1),
-        vec.stride(0),
-        other.stride(0) if torch.is_tensor(other) else 0,
-        temp.stride(0),
-        BLOCK_SIZE=block_size
+    grid = (
+        triton.cdiv(n, BLOCK_SIZE_M),
+        triton.cdiv(m, BLOCK_SIZE_N)
     )
     
-    # Apply final subtraction with alpha scaling
-    if torch.is_tensor(other):
-        out = temp - alpha * other
-    else:
-        out = temp - alpha * other
+    # Convert tensors to appropriate device and dtype
+    input = input.to(torch.float32)
+    vec = vec.to(torch.float32)
+    other = other if isinstance(other, torch.Tensor) else torch.tensor(other, dtype=torch.float32)
+    other = other.to(torch.float32)
+    out = out.to(torch.float32)
+    
+    # Launch kernel
+    fused_mv_sigmoid_sub_kernel[grid](
+        input,
+        vec,
+        other,
+        out,
+        n,
+        m,
+        alpha,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K
+    )
     
     return out
 ```

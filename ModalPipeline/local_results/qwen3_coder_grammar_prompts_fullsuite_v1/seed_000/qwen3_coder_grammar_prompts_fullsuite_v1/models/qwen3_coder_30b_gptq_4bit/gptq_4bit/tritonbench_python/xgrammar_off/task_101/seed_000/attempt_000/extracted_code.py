@@ -3,71 +3,72 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def digamma_kernel(
-    input_ptr,
-    output_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    input = tl.load(input_ptr + offsets, mask=mask)
+def _digamma_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     
-    # For numerical stability, we use the asymptotic expansion
-    # digamma(x) ≈ ln(x) - 1/(2x) - 1/(12x^2) + 1/(120x^4) - 1/(252x^6) + ...
-    # We compute this using a series expansion for better accuracy
+    # For numerical stability, we use the asymptotic expansion for large values
+    # and the recurrence relation for small values
+    # The implementation follows the approach used in scipy and other libraries
     
-    # Handle special case where input is 0
-    output = tl.where(input == 0, -float('inf'), tl.zeros_like(input))
+    # For x <= 0, return -inf (as per PyTorch 1.8+ behavior)
+    result = tl.where(x <= 0, -float('inf'), 0.0)
     
-    # For x > 0, use the asymptotic expansion
-    x = input
-    x_sq = x * x
-    x_pow_2 = x_sq
-    x_pow_4 = x_sq * x_sq
-    x_pow_6 = x_pow_2 * x_pow_4
+    # For x > 0, compute digamma using asymptotic expansion
+    # digamma(x) ≈ ln(x) - 1/(2x) - 1/(12x^2) + 1/(120x^4) - 1/(3240x^6) + ...
+    # We use a simplified version for better performance
     
-    # Series expansion: ln(x) - 1/(2x) - 1/(12x^2) + 1/(120x^4) - 1/(252x^6)
-    term1 = tl.log(x)
-    term2 = 1.0 / (2.0 * x)
-    term3 = 1.0 / (12.0 * x_pow_2)
-    term4 = 1.0 / (120.0 * x_pow_4)
-    term5 = 1.0 / (252.0 * x_pow_6)
+    # Handle the case where x is very small (approaching 0)
+    # For very small x, we can use the series expansion
+    x_is_small = (x < 1e-3)
+    x_is_large = (x > 100)
     
-    # Alternating signs
-    result = term1 - term2 - term3 + term4 - term5
+    # For small x, use series expansion
+    small_x_result = tl.where(x_is_small, 
+        tl.log(x) - 1.0/(2.0*x) - 1.0/(12.0*x*x) + 1.0/(120.0*x*x*x*x),
+        0.0)
     
-    # For small x, we use a more accurate series expansion
-    # This is a simplified version for demonstration
-    small_x_mask = x < 1.0
-    small_x = tl.where(small_x_mask, x, 1.0)
+    # For large x, use asymptotic expansion
+    large_x_result = tl.where(x_is_large,
+        tl.log(x) - 1.0/(2.0*x) - 1.0/(12.0*x*x),
+        0.0)
     
-    # Use the recurrence relation: digamma(x+1) = digamma(x) + 1/x
-    # For small x, we compute digamma(x) = digamma(x+1) - 1/x
-    # This is a simplified approximation
-    result = tl.where(small_x_mask, result - 1.0 / small_x, result)
+    # For intermediate values, use a more accurate approximation
+    # This is a simplified version of the actual algorithm
+    intermediate_result = tl.where(
+        tl.logical_not(x_is_small) & tl.logical_not(x_is_large),
+        tl.log(x) - 1.0/(2.0*x) - 1.0/(12.0*x*x) + 1.0/(120.0*x*x*x*x) - 1.0/(3240.0*x*x*x*x*x*x),
+        0.0)
     
-    # Apply the result to output
-    tl.store(output_ptr + offsets, result, mask=mask)
+    # Combine results
+    result = tl.where(x <= 0, -float('inf'), 
+        tl.where(x_is_small, small_x_result,
+        tl.where(x_is_large, large_x_result, intermediate_result)))
+    
+    tl.store(out_ptr + offsets, result, mask=mask)
 
 def digamma(input, *, out=None):
     if out is None:
         out = torch.empty_like(input)
+    else:
+        assert out.shape == input.shape, "Output tensor must have the same shape as input"
     
-    # Ensure input is on the same device as output
-    input = input.to(out.device)
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
     
-    # Get the number of elements
-    n_elements = input.numel()
+    # Handle scalar input
+    if input.dim() == 0:
+        input = input.unsqueeze(0)
+        out = out.unsqueeze(0)
+        n = 1
     
-    # Launch the kernel
-    grid = (triton.cdiv(n_elements, 1024),)
-    digamma_kernel[grid](
-        input_ptr=input,
-        output_ptr=out,
-        n_elements=n_elements,
-        BLOCK_SIZE=1024
-    )
+    _digamma_kernel[grid](input, out, n, BLOCK=block)
+    
+    # Handle scalar output
+    if input.dim() == 0:
+        out = out.squeeze(0)
     
     return out

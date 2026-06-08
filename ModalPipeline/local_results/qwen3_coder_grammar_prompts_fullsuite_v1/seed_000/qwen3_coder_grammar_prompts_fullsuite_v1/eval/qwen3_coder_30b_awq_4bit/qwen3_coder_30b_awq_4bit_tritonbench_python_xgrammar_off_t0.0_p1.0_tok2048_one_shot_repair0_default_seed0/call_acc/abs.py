@@ -22,11 +22,11 @@ def abs(input, *, out=None):
         out = torch.empty_like(input, device=input.device, dtype=input.dtype)
     else:
         if out.shape != input.shape:
-            raise ValueError("Output tensor must have the same shape as input tensor")
+            raise ValueError("out tensor must have the same shape as input tensor")
         if out.device != input.device:
-            raise ValueError("Output tensor must be on the same device as input tensor")
+            raise ValueError("out tensor must be on the same device as input tensor")
         if out.dtype != input.dtype:
-            raise ValueError("Output tensor must have the same dtype as input tensor")
+            raise ValueError("out tensor must have the same dtype as input tensor")
     
     n_elements = input.numel()
     BLOCK_SIZE = 1024

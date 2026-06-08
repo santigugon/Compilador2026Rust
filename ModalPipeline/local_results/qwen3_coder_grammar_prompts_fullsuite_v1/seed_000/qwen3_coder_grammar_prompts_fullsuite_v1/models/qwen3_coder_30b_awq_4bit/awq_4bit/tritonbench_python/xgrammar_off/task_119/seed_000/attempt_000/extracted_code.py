@@ -3,108 +3,104 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _pixel_shuffle_conv2d_kernel(
+def pixel_shuffle_conv2d_kernel(
     input_ptr, weight_ptr, bias_ptr, output_ptr,
-    batch_size, in_channels, out_channels, iH, iW, oH, oW,
+    in_channels, out_channels, iH, iW, oH, oW,
     kH, kW, stride, padding, dilation, groups, upscale_factor,
-    BLOCK_SIZE: tl.constexpr
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr
 ):
-    pid = tl.program_id(0)
-    batch_idx = pid // (out_channels * oH * oW)
-    channel_idx = (pid // (oH * oW)) % out_channels
-    h_idx = (pid // oW) % oH
-    w_idx = pid % oW
+    # Get block indices
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
     
-    if batch_idx >= batch_size:
-        return
+    # Compute output indices
+    out_h = pid_m * BLOCK_SIZE_M
+    out_w = pid_n * BLOCK_SIZE_N
+    group_id = pid_k
     
-    # Calculate output channel index for groups
-    group_idx = channel_idx // (out_channels // groups)
-    group_offset = (channel_idx % (out_channels // groups)) * (in_channels // groups)
+    # Shared memory for input tiles
+    input_tile = tl.shared_ptr(input_ptr, (BLOCK_SIZE_M, BLOCK_SIZE_K), (1, 1))
+    weight_tile = tl.shared_ptr(weight_ptr, (BLOCK_SIZE_K, BLOCK_SIZE_N), (1, 1))
     
     # Initialize accumulator
-    acc = tl.zeros((1,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     
     # Perform convolution
-    for g in range(groups):
-        for kh in range(kH):
-            for kw in range(kW):
-                # Calculate input indices
-                ih = h_idx * stride - padding + kh * dilation
-                iw = w_idx * stride - padding + kw * dilation
-                
-                # Check bounds
-                if ih >= 0 and ih < iH and iw >= 0 and iw < iW:
-                    # Calculate input channel index
-                    in_ch = g * (in_channels // groups) + (channel_idx % (out_channels // groups))
-                    
-                    # Load input and weight
-                    input_val = tl.load(input_ptr + 
-                                       batch_idx * (in_channels * iH * iW) +
-                                       in_ch * (iH * iW) +
-                                       ih * iW + iw)
-                    weight_val = tl.load(weight_ptr + 
-                                        channel_idx * (in_channels // groups * kH * kW) +
-                                        (in_ch % (in_channels // groups)) * (kH * kW) +
-                                        kh * kW + kw)
-                    acc += input_val * weight_val
+    for k in range(0, in_channels, BLOCK_SIZE_K):
+        # Load input tile
+        input_tile = tl.load(input_ptr + (out_h * iW + out_w) * in_channels + k)
+        # Load weight tile
+        weight_tile = tl.load(weight_ptr + (k * out_channels + out_w) * kH * kW)
+        # Compute dot product
+        acc += tl.dot(input_tile, weight_tile)
     
-    # Add bias if present
+    # Apply bias if present
     if bias_ptr is not None:
-        acc += tl.load(bias_ptr + channel_idx)
+        bias_tile = tl.load(bias_ptr + out_w)
+        acc += bias_tile
+    
+    # Apply pixel shuffle
+    shuffle_h = out_h // upscale_factor
+    shuffle_w = out_w // upscale_factor
+    shuffle_c = out_w % upscale_factor
     
     # Store result
-    tl.store(output_ptr + 
-             batch_idx * (out_channels * oH * oW) +
-             channel_idx * (oH * oW) +
-             h_idx * oW + w_idx, acc)
+    tl.store(output_ptr + (shuffle_h * oW + shuffle_w) * out_channels + shuffle_c, acc)
 
 def pixel_shuffle_conv2d(input: torch.Tensor, weight: torch.Tensor, bias=None, stride=1, padding=0, dilation=1, groups=1, upscale_factor=2) -> torch.Tensor:
-    # Calculate output dimensions
+    # Input shapes
     batch_size, in_channels, iH, iW = input.shape
     out_channels, _, kH, kW = weight.shape
     
-    # Calculate output spatial dimensions
-    oH = (iH + 2 * padding - (kH - 1) * dilation - 1) // stride + 1
-    oW = (iW + 2 * padding - (kW - 1) * dilation - 1) // stride + 1
+    # Calculate output dimensions
+    oH = (iH + 2 * padding - (dilation * (kH - 1) + 1)) // stride + 1
+    oW = (iW + 2 * padding - (dilation * (kW - 1) + 1)) // stride + 1
     
     # Calculate output shape after pixel shuffle
     out_H = oH * upscale_factor
     out_W = oW * upscale_factor
-    out_C = out_channels // (upscale_factor * upscale_factor)
     
     # Create output tensor
-    out = torch.empty(batch_size, out_C, out_H, out_W, device=input.device, dtype=input.dtype)
+    output = torch.empty(batch_size, out_channels, out_H, out_W, device=input.device, dtype=input.dtype)
     
-    # Calculate output size
-    out_size = batch_size * out_C * out_H * out_W
+    # Define block sizes
+    BLOCK_SIZE_M = 16
+    BLOCK_SIZE_N = 16
+    BLOCK_SIZE_K = 16
     
-    # Create a temporary tensor for convolution result
-    conv_out = torch.empty(batch_size, out_channels, oH, oW, device=input.device, dtype=input.dtype)
+    # Launch kernel
+    grid = (
+        triton.cdiv(out_H, BLOCK_SIZE_M),
+        triton.cdiv(out_W, BLOCK_SIZE_N),
+        groups
+    )
     
-    # Launch convolution kernel
-    BLOCK_SIZE = 256
-    grid_size = triton.cdiv(out_size, BLOCK_SIZE)
+    # Create kernel
+    kernel = pixel_shuffle_conv2d_kernel
     
-    # For simplicity, we'll use PyTorch's convolution for now
-    # and then apply pixel shuffle
-    conv_out = torch.nn.functional.conv2d(input, weight, bias, stride, padding, dilation, groups)
+    # Launch kernel with appropriate parameters
+    kernel[grid](
+        input,
+        weight,
+        bias,
+        output,
+        in_channels,
+        out_channels,
+        iH,
+        iW,
+        oH,
+        oW,
+        kH,
+        kW,
+        stride,
+        padding,
+        dilation,
+        groups,
+        upscale_factor,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K
+    )
     
-    # Apply pixel shuffle
-    # Reshape to separate spatial and channel dimensions
-    conv_out = conv_out.view(batch_size, out_channels, oH, oW)
-    
-    # Rearrange to increase spatial resolution
-    # Each channel is split into upscale_factor * upscale_factor channels
-    # and arranged in spatial dimensions
-    conv_out = conv_out.reshape(batch_size, out_channels // (upscale_factor * upscale_factor), 
-                               upscale_factor, upscale_factor, oH, oW)
-    
-    # Transpose to move channel dimensions to the right
-    conv_out = conv_out.permute(0, 1, 4, 2, 5, 3)
-    
-    # Reshape to final output
-    out = conv_out.reshape(batch_size, out_channels // (upscale_factor * upscale_factor), 
-                          oH * upscale_factor, oW * upscale_factor)
-    
-    return out
+    return output

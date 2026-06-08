@@ -4,86 +4,69 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def tanh_linear_kernel(
-    input_ptr, weight_ptr, bias_ptr, output_ptr,
-    input_row_stride, weight_row_stride, weight_col_stride,
-    output_row_stride, output_col_stride,
-    n_rows, n_cols, out_features,
-    BLOCK_SIZE: tl.constexpr
-):
-    row = tl.program_id(0)
-    if row >= n_rows:
-        return
+def _tanh_linear_kernel(input_ptr, weight_ptr, bias_ptr, output_ptr, 
+                        in_features: tl.constexpr, out_features: tl.constexpr, 
+                        batch_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    # Get the batch dimension
+    batch_idx = tl.program_id(0)
     
-    output_row = output_ptr + row * output_row_stride
-    input_row = input_ptr + row * input_row_stride
+    # Load weight matrix (out_features x in_features)
+    weight_row = tl.load(weight_ptr + batch_idx * out_features * in_features + 
+                        tl.arange(0, out_features)[:, None] * in_features + 
+                        tl.arange(0, in_features)[None, :])
     
-    for i in range(0, out_features, BLOCK_SIZE):
-        cols = i + tl.arange(0, BLOCK_SIZE)
-        mask = cols < out_features
-        
-        # Compute linear transformation
-        acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-        for j in range(0, n_cols, BLOCK_SIZE):
-            input_cols = j + tl.arange(0, BLOCK_SIZE)
-            input_mask = input_cols < n_cols
-            
-            input_vals = tl.load(input_ptr + row * input_row_stride + input_cols, mask=input_mask, other=0.0)
-            weight_vals = tl.load(weight_ptr + cols * weight_col_stride + j, mask=mask & input_mask, other=0.0)
-            acc += tl.sum(input_vals * weight_vals, axis=0)
-        
-        # Add bias if present
-        if bias_ptr is not None:
-            bias_vals = tl.load(bias_ptr + cols, mask=mask, other=0.0)
-            acc += bias_vals
-        
-        # Apply tanh activation
-        acc = tl.tanh(acc)
-        
-        # Store result
-        tl.store(output_row + cols, acc, mask=mask)
+    # Load input (in_features)
+    input_row = tl.load(input_ptr + batch_idx * in_features + 
+                       tl.arange(0, in_features))
+    
+    # Compute linear transformation: input @ weight.T + bias
+    # Using tl.dot for matrix multiplication
+    linear_output = tl.dot(weight_row, input_row[None, :])
+    
+    # Add bias if provided
+    if bias_ptr is not None:
+        bias = tl.load(bias_ptr + tl.arange(0, out_features))
+        linear_output = linear_output + bias[None, :]
+    
+    # Apply tanh activation
+    tanh_output = 2.0 / (1.0 + tl.exp(-2.0 * linear_output)) - 1.0
+    
+    # Store result
+    tl.store(output_ptr + batch_idx * out_features + tl.arange(0, out_features), 
+             tanh_output[0, :])
 
 def tanh_linear(input, weight, bias=None):
-    assert input.dim() >= 2
-    assert weight.dim() == 2
-    assert input.size(-1) == weight.size(1)
-    
-    if bias is not None:
-        assert bias.dim() == 1
-        assert bias.size(0) == weight.size(0)
-    
+    # Handle the case where input has multiple dimensions
     input_shape = input.shape
     batch_size = 1
     for dim in input_shape[:-1]:
         batch_size *= dim
-    
     in_features = input_shape[-1]
     out_features = weight.shape[0]
     
-    input_reshaped = input.view(-1, in_features)
+    # Reshape input to 2D for processing
+    input_2d = input.view(batch_size, in_features)
     
+    # Create output tensor
     output = torch.empty(batch_size, out_features, device=input.device, dtype=input.dtype)
     
-    # Configure kernel launch parameters
-    BLOCK_SIZE = 128
-    grid = (batch_size, 1)
-    
     # Launch kernel
-    tanh_linear_kernel[grid](
-        input_reshaped,
-        weight,
-        bias,
-        output,
-        input_reshaped.stride(0),
-        weight.stride(0),
-        weight.stride(1),
-        output.stride(0),
-        output.stride(1),
-        batch_size,
-        in_features,
-        out_features,
-        BLOCK_SIZE
-    )
+    block_size = 256
+    grid_size = batch_size
     
-    return output.view(*input_shape[:-1], out_features)
+    if bias is not None:
+        _tanh_linear_kernel[grid_size](
+            input_2d, weight, bias, output,
+            in_features, out_features, batch_size, block_size
+        )
+    else:
+        _tanh_linear_kernel[grid_size](
+            input_2d, weight, None, output,
+            in_features, out_features, batch_size, block_size
+        )
+    
+    # Reshape output back to original shape
+    output = output.view(*input_shape[:-1], out_features)
+    
+    return output
 ```

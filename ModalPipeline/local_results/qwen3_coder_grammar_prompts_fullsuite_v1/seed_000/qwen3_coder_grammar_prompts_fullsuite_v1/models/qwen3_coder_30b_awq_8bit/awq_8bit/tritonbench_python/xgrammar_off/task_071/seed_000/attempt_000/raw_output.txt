@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def sgd_kernel(
+def _sgd_kernel(
     param_ptr, 
     grad_ptr, 
     momentum_ptr,
@@ -14,36 +14,30 @@ def sgd_kernel(
     dampening,
     nesterov,
     maximize,
-    num_elements
+    param_size,
+    BLOCK: tl.constexpr
 ):
-    # Compute the block index
-    block_id = tl.program_id(0)
-    # Compute the start index for this block
-    start_idx = block_id * tl.cdiv(num_elements, tl.num_programs(0))
-    # Compute the end index for this block
-    end_idx = min(start_idx + tl.cdiv(num_elements, tl.num_programs(0)), num_elements)
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < param_size
     
-    # Load the parameter and gradient
-    param = tl.load(param_ptr + start_idx:end_idx, mask=start_idx < end_idx)
-    grad = tl.load(grad_ptr + start_idx:end_idx, mask=start_idx < end_idx)
+    param = tl.load(param_ptr + offsets, mask=mask, other=0.0)
+    grad = tl.load(grad_ptr + offsets, mask=mask, other=0.0)
     
     # Apply weight decay
     if weight_decay != 0:
-        param = param - weight_decay * param
+        grad = grad + weight_decay * param
     
-    # Apply momentum
+    # Update momentum
     if momentum_coeff != 0:
-        # Load momentum
-        momentum = tl.load(momentum_ptr + start_idx:end_idx, mask=start_idx < end_idx)
-        # Update momentum
-        momentum = momentum * momentum_coeff + grad * (1 - dampening)
-        # Store updated momentum
-        tl.store(momentum_ptr + start_idx:end_idx, momentum, mask=start_idx < end_idx)
-        # Apply Nesterov momentum
+        momentum_val = tl.load(momentum_ptr + offsets, mask=mask, other=0.0)
+        momentum_val = momentum_coeff * momentum_val + (1 - dampening) * grad
+        tl.store(momentum_ptr + offsets, momentum_val, mask=mask)
+        
         if nesterov:
-            grad = grad + momentum_coeff * momentum
+            grad = grad + momentum_coeff * momentum_val
         else:
-            grad = momentum
+            grad = momentum_val
     
     # Apply learning rate
     update = lr * grad
@@ -53,49 +47,81 @@ def sgd_kernel(
         update = -update
     
     # Update parameter
-    param = param - update
-    
-    # Store updated parameter
-    tl.store(param_ptr + start_idx:end_idx, param, mask=start_idx < end_idx)
+    new_param = param - update
+    tl.store(param_ptr + offsets, new_param, mask=mask)
 
 def SGD(params, lr=1e-3, momentum=0, weight_decay=0, dampening=0, nesterov=False, maximize=False, foreach=None, differentiable=False, fused=None):
-    if foreach is not None and foreach:
-        raise NotImplementedError("foreach=True is not supported in this implementation")
-    if differentiable:
-        raise NotImplementedError("differentiable=True is not supported in this implementation")
-    if fused is not None and fused:
-        raise NotImplementedError("fused=True is not supported in this implementation")
+    if foreach is not None or fused is not None:
+        # Fall back to PyTorch implementation for unsupported cases
+        return torch.optim.SGD(
+            params, 
+            lr=lr, 
+            momentum=momentum, 
+            weight_decay=weight_decay, 
+            dampening=dampening, 
+            nesterov=nesterov, 
+            maximize=maximize
+        ).step()
     
+    if not isinstance(params, (list, tuple)):
+        params = [params]
+    
+    # Initialize momentum buffers
+    momentum_buffers = []
     for param in params:
-        if param.grad is None:
-            continue
-            
-        # Ensure param and grad are contiguous
-        param = param.contiguous()
-        grad = param.grad.contiguous()
-        
-        # Allocate momentum buffer if needed
-        if momentum != 0:
-            if not hasattr(param, '_momentum_buffer'):
-                param._momentum_buffer = torch.zeros_like(param, dtype=torch.float32)
-            momentum_buffer = param._momentum_buffer
+        if momentum != 0 and param.requires_grad:
+            momentum_buffers.append(torch.zeros_like(param, memory_format=torch.contiguous_format))
         else:
-            momentum_buffer = None
-        
-        # Launch kernel
-        num_elements = param.numel()
-        grid = (triton.cdiv(num_elements, 1024),)
-        
-        sgd_kernel[grid](
-            param_ptr=param.data_ptr(),
-            grad_ptr=grad.data_ptr(),
-            momentum_ptr=momentum_buffer.data_ptr() if momentum_buffer is not None else 0,
-            lr=lr,
-            momentum_coeff=momentum,
-            weight_decay=weight_decay,
-            dampening=dampening,
-            nesterov=nesterov,
-            maximize=maximize,
-            num_elements=num_elements
-        )
+            momentum_buffers.append(None)
+    
+    # Process each parameter
+    for param, momentum_buffer in zip(params, momentum_buffers):
+        if param.requires_grad:
+            # Create output tensor
+            out = torch.empty_like(param)
+            
+            # Copy parameter to output
+            out.copy_(param)
+            
+            # Get parameter size
+            n = param.numel()
+            
+            # Launch kernel
+            block = 256
+            grid = (triton.cdiv(n, block),)
+            
+            if momentum_buffer is not None:
+                _sgd_kernel[grid](
+                    out, 
+                    param.grad, 
+                    momentum_buffer,
+                    lr,
+                    momentum,
+                    weight_decay,
+                    dampening,
+                    nesterov,
+                    maximize,
+                    n,
+                    BLOCK=block
+                )
+            else:
+                # No momentum case
+                _sgd_kernel[grid](
+                    out, 
+                    param.grad, 
+                    torch.empty(1, device=param.device, dtype=torch.float32),  # dummy momentum buffer
+                    lr,
+                    0.0,
+                    weight_decay,
+                    0.0,
+                    False,
+                    maximize,
+                    n,
+                    BLOCK=block
+                )
+            
+            # Update parameter
+            param.copy_(out)
+    
+    return None
 ```

@@ -29,10 +29,10 @@ def leaky_relu(input, negative_slope=0.01, inplace=False):
     grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
     
     leaky_relu_kernel[grid](
-        input_ptr=input,
-        output_ptr=output,
-        negative_slope=negative_slope,
-        n_elements=n_elements,
+        input,
+        output,
+        negative_slope,
+        n_elements,
         BLOCK_SIZE=BLOCK_SIZE
     )
     

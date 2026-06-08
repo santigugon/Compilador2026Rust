@@ -4,61 +4,39 @@ import triton.language as tl
 import math
 
 @triton.jit
-def i0_kernel(input_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+def _i0_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    input = tl.load(input_ptr + offsets, mask=mask)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     
-    # Compute I0(x) using series expansion
-    # I0(x) = sum_{k=0}^{\infty} (x^2/4)^k / (k!)^2
-    # We'll use a truncated series for practical computation
+    # Compute I0(x) using the series expansion
+    # I0(x) = 1 + sum_{n=1}^∞ (x^2/4)^n / (n!)^2
+    # We'll use a more numerically stable approach with iterative computation
     
-    # For small x, use direct computation
-    # For large x, use asymptotic approximation
+    # For small x, use series expansion
+    # For large x, use asymptotic expansion
+    x_squared = x * x
+    result = tl.full((BLOCK,), 1.0, dtype=tl.float32)
     
-    x = input
-    x2 = x * x
-    
-    # Handle special case of x = 0
-    is_zero = (x == 0.0)
-    
-    # Series expansion for small x
-    result = tl.where(is_zero, 1.0, 0.0)
-    
-    # For non-zero x, compute series
-    # We'll use a simple iterative approach with reasonable convergence
-    term = tl.where(is_zero, 1.0, 1.0)
-    sum_val = tl.where(is_zero, 1.0, 0.0)
-    
-    # Compute first few terms of the series
-    for k in range(1, 20):
-        term = term * x2 / (4.0 * k * k)
-        sum_val = sum_val + term
+    # Series expansion: I0(x) = 1 + (x²/4) + (x²/4)²/2² + (x²/4)³/3² + ...
+    term = tl.full((BLOCK,), 1.0, dtype=tl.float32)
+    for i in range(1, 20):  # 20 iterations should be sufficient
+        term = term * x_squared / (4.0 * i * i)
+        result = result + term
         # Early termination if term becomes negligible
-        if tl.abs(term) < 1e-15:
+        if tl.all(term < 1e-10):
             break
     
-    # For large x, use asymptotic approximation
-    # I0(x) ~ e^x / sqrt(2*pi*x) for large x
-    large_x = (x > 10.0)
-    asymptotic = tl.exp(x) / tl.sqrt(2.0 * 3.141592653589793 * x)
-    result = tl.where(large_x, asymptotic, sum_val)
-    
-    tl.store(output_ptr + offsets, result, mask=mask)
+    tl.store(out_ptr + offsets, result, mask=mask)
 
 def i0(input, *, out=None):
     if out is None:
-        out = torch.empty_like(input, dtype=torch.float32)
+        out = torch.empty_like(input)
     
-    # Ensure input is float32
-    if input.dtype != torch.float32:
-        input = input.float()
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
     
-    n_elements = input.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    i0_kernel[grid](input, out, n_elements, BLOCK_SIZE)
-    
+    _i0_kernel[grid](input, out, n, BLOCK=block)
     return out

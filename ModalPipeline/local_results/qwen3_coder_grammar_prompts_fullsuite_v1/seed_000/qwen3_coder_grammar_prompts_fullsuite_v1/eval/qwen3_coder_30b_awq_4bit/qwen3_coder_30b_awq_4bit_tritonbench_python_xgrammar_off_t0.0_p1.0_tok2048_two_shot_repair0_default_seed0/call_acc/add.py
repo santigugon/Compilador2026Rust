@@ -26,24 +26,26 @@ def add(input, other, *, alpha=1, out=None):
     # Handle broadcasting
     # For simplicity, we'll use PyTorch's built-in broadcasting
     # since Triton doesn't handle complex broadcasting natively
-    out_shape = torch.broadcast_shapes(input.shape, other.shape)
-    
-    # Create output tensor
     if out is None:
-        out = torch.empty(out_shape, dtype=input.dtype, device=input.device)
+        out = torch.empty_like(input)
     else:
-        if out.shape != out_shape:
-            raise ValueError(f"Output tensor shape {out.shape} does not match expected broadcast shape {out_shape}")
+        if out.shape != torch.broadcast_tensors(input, other)[0].shape:
+            raise ValueError("Output tensor shape does not match expected broadcast shape")
     
-    # If shapes match exactly, use Triton kernel
-    if input.shape == other.shape:
+    # If tensors are not contiguous, we need to handle strides
+    # For simplicity, we'll use the standard PyTorch approach for broadcasting
+    # and just compute the result directly using PyTorch's optimized operations
+    # when broadcasting is needed
+    
+    # For the case where we can use Triton directly (same shape, contiguous)
+    if input.shape == other.shape and input.is_contiguous() and other.is_contiguous() and out.is_contiguous():
         n = input.numel()
         block = 256
         grid = (triton.cdiv(n, block),)
         _add_kernel[grid](input, other, out, n, alpha, BLOCK=block)
         return out
     else:
-        # Fall back to PyTorch for broadcasting
+        # Fall back to PyTorch for complex cases
         return torch.add(input, other, alpha=alpha, out=out)
 
 ##################################################################################################################################################

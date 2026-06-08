@@ -9,9 +9,8 @@ def _ones_like_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     mask = offsets < n
     # Load input to ensure we have the right shape and stride info
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    # Store ones with the same dtype as input
-    ones = tl.full(mask.shape, 1.0, x.dtype)
-    tl.store(out_ptr + offsets, ones, mask=mask)
+    # Store ones with the same shape and stride
+    tl.store(out_ptr + offsets, 1.0, mask=mask)
 
 def ones_like(input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format):
     # Handle device and dtype defaults
@@ -22,23 +21,20 @@ def ones_like(input, *, dtype=None, layout=None, device=None, requires_grad=Fals
     if layout is None:
         layout = input.layout
     
-    # Create output tensor with same shape, but new dtype and device
-    out = torch.empty_like(input, dtype=dtype, device=device, layout=layout, memory_format=memory_format)
+    # Create output tensor with same shape and desired properties
+    out = torch.empty_like(input, dtype=dtype, layout=layout, device=device, requires_grad=requires_grad)
     
-    # Handle requires_grad
-    if requires_grad:
-        out.requires_grad_(True)
-    
-    # If input is empty, return empty tensor
-    if input.numel() == 0:
-        return out
+    # Handle memory format preservation
+    if memory_format == torch.preserve_format:
+        # For preserve_format, we just need to ensure the output has the same memory layout
+        pass
     
     # Launch kernel
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
-    
     _ones_like_kernel[grid](input, out, n, BLOCK=block)
+    
     return out
 
 ##################################################################################################################################################

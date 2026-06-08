@@ -3,23 +3,27 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _relu_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+def relu_kernel(X, Y, N, BLOCK_SIZE: int = 1024):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    y = tl.maximum(x, 0.0)
-    tl.store(out_ptr + offsets, y, mask=mask)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    x = tl.load(X + offsets, mask=mask)
+    y = tl.where(x > 0, x, 0)
+    tl.store(Y + offsets, y, mask=mask)
 
 def relu(input, inplace=False):
     if inplace:
-        out = input
+        output = input
     else:
-        out = torch.empty_like(input)
+        output = torch.empty_like(input)
     
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    if input.numel() == 0:
+        return input if inplace else output
     
-    _relu_kernel[grid](input, out, n, BLOCK=block)
-    return out
+    N = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(N, BLOCK_SIZE),)
+    
+    relu_kernel[grid](input, output, N, BLOCK_SIZE=BLOCK_SIZE)
+    
+    return output

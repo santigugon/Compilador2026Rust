@@ -3,52 +3,42 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def mul_kernel(
-    input_ptr,
-    other_ptr,
-    output_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    input = tl.load(input_ptr + offsets, mask=mask)
-    other = tl.load(other_ptr + offsets, mask=mask)
-    output = input * other
-    tl.store(output_ptr + offsets, output, mask=mask)
+def _mul_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+    result = x * y
+    tl.store(out_ptr + offsets, result, mask=mask)
 
 def mul(input, other, *, out=None):
-    if out is None:
-        out = torch.empty_like(input)
+    # Handle scalar other case
+    if not torch.is_tensor(other):
+        if out is not None:
+            return torch.mul(input, other, out=out)
+        else:
+            return torch.mul(input, other)
     
-    if isinstance(other, (int, float, complex)):
-        other = torch.tensor(other, dtype=input.dtype, device=input.device)
+    # Ensure tensors have compatible shapes for broadcasting
+    out_shape = torch.broadcast_tensors(input, other)[0].shape
     
-    if input.shape != other.shape:
-        # Handle broadcasting
-        input, other = torch.broadcast_tensors(input, other)
+    # Create output tensor
+    if out is not None:
+        if out.shape != out_shape:
+            raise ValueError("Output tensor shape does not match expected broadcast shape")
+        out = out
+    else:
+        out = torch.empty(out_shape, dtype=input.dtype, device=input.device)
     
-    # Ensure both tensors are on the same device
-    if other.device != input.device:
-        other = other.to(input.device)
+    # Get total number of elements
+    n = input.numel()
     
-    # Ensure both tensors have the same dtype
-    if other.dtype != input.dtype:
-        other = other.to(input.dtype)
+    # Set block size and grid
+    block = 256
+    grid = (triton.cdiv(n, block),)
     
-    # Get the total number of elements
-    n_elements = input.numel()
-    
-    # Launch the kernel
-    grid = (triton.cdiv(n_elements, 1024),)
-    mul_kernel[grid](
-        input_ptr=input.data_ptr(),
-        other_ptr=other.data_ptr(),
-        output_ptr=out.data_ptr(),
-        n_elements=n_elements,
-        BLOCK_SIZE=1024
-    )
+    # Launch kernel
+    _mul_kernel[grid](input, other, out, n, BLOCK=block)
     
     return out

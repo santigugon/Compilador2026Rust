@@ -15,39 +15,39 @@ def _sigmoid_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
 def _argmax_kernel(x_ptr, out_ptr, n: tl.constexpr, dim_size: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     # For each block, we compute argmax along the specified dimension
-    # This is a simplified version that assumes we're working on a single dimension
-    # In practice, this would need more complex logic for multi-dimensional cases
+    # This is a simplified version that assumes we're working on the last dimension
+    # In a real implementation, we'd need to handle multi-dimensional cases more carefully
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     # For simplicity, we'll compute argmax over all elements
-    # In a real implementation, we'd need to handle the dimension properly
+    # In a full implementation, we'd need to handle the dimension properly
     max_val = tl.max(x, axis=0)
-    # This is a placeholder for actual argmax computation
-    # A full implementation would require more complex logic
-    tl.store(out_ptr + offsets, x, mask=mask)
+    # This is a simplified approach - in practice, we'd need to track indices properly
+    # For now, we'll just return the index of the maximum element
+    # This is not a complete implementation but shows the structure
+    tl.store(out_ptr + pid, tl.argmax(x, axis=0), mask=mask)
 
 def sigmoid_argmax(input, dim=None, keepdim=False):
-    # Apply sigmoid to input
-    input_sigmoid = torch.empty_like(input)
+    # First compute sigmoid
+    input = input.float()
+    out = torch.empty_like(input)
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
-    _sigmoid_kernel[grid](input, input_sigmoid, n, BLOCK=block)
     
-    # Compute argmax
+    _sigmoid_kernel[grid](input, out, n, BLOCK=block)
+    
+    # Now compute argmax
     if dim is None:
-        # Flatten the tensor and find argmax
-        flat_tensor = input_sigmoid.flatten()
-        argmax_idx = torch.argmax(flat_tensor)
+        # Return index of maximum value in flattened tensor
+        max_idx = torch.argmax(out)
         if keepdim:
-            return argmax_idx.unsqueeze(0)
-        else:
-            return argmax_idx
+            return max_idx.unsqueeze(0)
+        return max_idx
     else:
-        # Find argmax along specified dimension
-        argmax_idx = torch.argmax(input_sigmoid, dim=dim, keepdim=keepdim)
-        return argmax_idx
+        # Return argmax along specified dimension
+        return torch.argmax(out, dim=dim, keepdim=keepdim)
 
 ##################################################################################################################################################
 

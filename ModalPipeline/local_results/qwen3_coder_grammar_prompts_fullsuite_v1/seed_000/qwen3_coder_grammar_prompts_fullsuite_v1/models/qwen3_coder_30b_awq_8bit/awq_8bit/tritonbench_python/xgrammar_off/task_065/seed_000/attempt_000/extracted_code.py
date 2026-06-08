@@ -25,5 +25,6 @@ def asin(input, *, out=None):
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
+    
     _asin_kernel[grid](input, out, n, BLOCK=block)
     return out

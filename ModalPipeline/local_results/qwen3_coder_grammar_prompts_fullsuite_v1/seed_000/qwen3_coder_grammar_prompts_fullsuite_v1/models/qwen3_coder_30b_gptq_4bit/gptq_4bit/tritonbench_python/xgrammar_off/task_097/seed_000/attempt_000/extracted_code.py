@@ -3,39 +3,39 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def bitwise_and_kernel(
-    input_ptr,
-    other_ptr,
-    output_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    input_vals = tl.load(input_ptr + offsets, mask=mask)
-    other_vals = tl.load(other_ptr + offsets, mask=mask)
-    output_vals = input_vals & other_vals
-    tl.store(output_ptr + offsets, output_vals, mask=mask)
+def _bitwise_and_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0)
+    result = x & y
+    tl.store(out_ptr + offsets, result, mask=mask)
 
 def bitwise_and(input, other, *, out=None):
-    assert input.dtype in [torch.bool, torch.int32, torch.int64]
-    assert other.dtype in [torch.bool, torch.int32, torch.int64]
-    assert input.shape == other.shape
+    # Ensure inputs are of compatible types
+    if not (torch.is_tensor(input) and torch.is_tensor(other)):
+        raise TypeError("Both input and other must be tensors")
     
-    if out is None:
+    # Check if the tensors have compatible shapes for broadcasting
+    if input.shape != other.shape:
+        # Broadcasting is supported by PyTorch
+        pass
+    
+    # Determine output tensor
+    if out is not None:
+        out = out
+    else:
         out = torch.empty_like(input)
     
-    n_elements = input.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    # Get total number of elements
+    n = input.numel()
     
-    bitwise_and_kernel[grid](
-        input_ptr=input.data_ptr(),
-        other_ptr=other.data_ptr(),
-        output_ptr=out.data_ptr(),
-        n_elements=n_elements,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
+    # Set block size and grid size
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    
+    # Launch kernel
+    _bitwise_and_kernel[grid](input, other, out, n, BLOCK=block)
     
     return out

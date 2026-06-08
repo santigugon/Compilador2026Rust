@@ -1,18 +1,18 @@
 {
   "total_predictions": 166,
   "phase1_call_acc": {
-    "passed": 84,
-    "rate": 50.6,
-    "duration_ms": 518473.5154110001
+    "passed": 90,
+    "rate": 54.22,
+    "duration_ms": 405988.60750500014
   },
   "phase2_exec_acc": {
-    "passed": 84,
-    "rate": 50.6
+    "passed": 90,
+    "rate": 54.22
   },
   "phase3_efficiency": {
-    "speedup_vs_pytorch": 1.32,
-    "raw_output_tail": "\nifftshift.json: 0.5974\ninvert_matrix_lu.json: 2.8515\nldl_factor.json failed\nleaky_relu.json: 0.96\nlog.json: 0.9526\nlog1p.json: 0.9561\nlog_tanh.json: 2.9665\nlogit.json: 0.8372\nlogsumexp.json: 0.9637\nlow_rank_svd_approximation.json failed\nlu.py.json: 0.9402\nmatrix_multiply_and_row_dot.json: 0.9439\nmatrix_multiply_symmetric.json: 0.597\nmul_relu.json: 1.5627\nnormalize_pairwise_distance.json failed\nnormalized_cosine_similarity.json: 0.4324\nones_like.json: 1.6\npermute_copy.json failed\npixel_shuffle_conv2d.json: 1.0974\npolygamma.json: 0.6824\npseudoinverse_svd.json: 0.9708\nrad2deg_sqrt.json: 1.1879\nrand.json: 0.944\nreciprocal.json: 0.9543\nrelu.json: 0.9578\nrelu_batch_norm_conv2d.json: 0.8939\nrelu_conv2d.json: 0.9289\nrelu_sqrt.json: 1.8465\nrsqrt.json: 3.9485\nscaled_add_norm.json: 1.101\nselu.json: 7.9187\nsigmoid.json: 0.9528\nsigmoid_argmax.json: 0.9518\nsoftmax_log.json: 0.9501\nsoftmax_mul.json: 2.0859\nsoftplus_linear.json failed\nsolve_multiple_lu.json: 0.9639\nspectral_norm_eig.json failed\nsqrt.json: 0.9571\nsqrt_exp.json: 1.8418\nsqrt_tanh.json: 3.4612\nstd.json: 0.6617\nsum.json: 0.9891\nsum_std.json: 1.3905\nsymmetric_mm_and_abs_sum.json: 1.1095\ntanh.json: 0.9514\ntensordot.json: 0.8672\ntensordot_rsqrt.json: 1.005\ntrunc.json: 0.955\n[0.9585, 0.9557, 0.9923, 0.1059, 3.599, 0.9547, 0.1948, 0.9103, 0.9986, 1.5023, 2.3516, 0.9567, 0.9539, 0.9565, 1.8376, 0.9611, 0.886, 0.6827, 2.7462, 0.7557, 0.9509, 0.1305, 1.1436, 1.0961, 0.932, 3.5526, 0.7337, 0.9851, 0.9683, 0.9972, 0.5974, 2.8515, 0.96, 0.9526, 0.9561, 2.9665, 0.8372, 0.9637, 0.9402, 0.9439, 0.597, 1.5627, 0.4324, 1.6, 1.0974, 0.6824, 0.9708, 1.1879, 0.944, 0.9543, 0.9578, 0.8939, 0.9289, 1.8465, 3.9485, 1.101, 7.9187, 0.9528, 0.9518, 0.9501, 2.0859, 0.9639, 0.9571, 1.8418, 3.4612, 0.6617, 0.9891, 1.3905, 1.1095, 0.9514, 0.8672, 1.005, 0.955]\n\nperf_results\nspeed up: 1.32\n================================================================================================================================================================\n",
-    "duration_ms": 220.2449730002627
+    "speedup_vs_pytorch": 1.48,
+    "raw_output_tail": "struct.json failed\nifftshift.json: 0.9662\ninvert_matrix_lu.json: 2.8679\nleaky_relu.json: 0.994\nlog.json: 0.9888\nlog1p.json: 0.994\nlog_tanh.json: 3.0851\nlogit.json: 0.9117\nmatrix_multiply_symmetric.json: 0.9124\nmatrix_power_eig.json failed\nmatrix_vector_dot.json: 1.0165\nmax.json: 1.03\nmean.json: 0.9398\nmin.json: 1.0031\nnormalize_pairwise_distance.json failed\nnormalized_cosine_similarity.json: 1.3045\nones_like.json: 1.6\npermute_copy.json failed\npolygamma.json: 0.8997\npseudoinverse_svd.json: 0.9834\nqr.json: 1.1292\nrad2deg_sqrt.json: 1.2151\nreciprocal.json: 0.9895\nrelu.json: 0.9887\nrelu_conv2d.json: 0.9295\nrelu_sqrt.json: 1.9119\nrsqrt.json: 4.0848\nscaled_add_norm.json: 1.1568\nselu.json: 8.1983\nsigmoid.json: 0.9857\nsigmoid_adaptive_avg_pool2d.json: 1.0764\nsigmoid_argmax.json: 0.9697\nsigmoid_conv2d.json failed\nsoftmax.json failed\nsoftmax_log.json: 0.9965\nsolve_and_add_scaled_vector..json: 1.0178\nspectral_norm_eig.json failed\nsqrt.json: 0.9895\nsqrt_exp.json: 1.9011\nsqrt_tanh.json: 3.578\nsum.json: 1.0366\nsum_std.json: 0.9438\nsymmetric_matrix_vector_norm.json failed\nsymmetric_mm_and_abs_sum.json: 1.0165\ntanh.json: 0.9857\ntanh_linear.json failed\ntensordot.json: 0.8579\ntensordot_rsqrt.json: 1.0059\ntrunc.json: 0.991\n[0.9917, 0.9703, 2.208, 1.4379, 0.9927, 0.1079, 0.1365, 4.5015, 0.9703, 5.4553, 1.6, 0.951, 1.0262, 1.9057, 4.3491, 1.5117, 0.9719, 1.7855, 0.9968, 0.991, 2.3233, 0.9917, 0.9915, 1.9024, 0.8495, 0.9876, 0.8856, 0.4801, 0.1835, 0.1787, 0.8478, 2.1702, 0.8877, 1.6138, 2.3262, 0.9662, 2.8679, 0.994, 0.9888, 0.994, 3.0851, 0.9117, 0.9124, 1.0165, 1.03, 0.9398, 1.0031, 1.3045, 1.6, 0.8997, 0.9834, 1.1292, 1.2151, 0.9895, 0.9887, 0.9295, 1.9119, 4.0848, 1.1568, 8.1983, 0.9857, 1.0764, 0.9697, 0.9965, 1.0178, 0.9895, 1.9011, 3.578, 1.0366, 0.9438, 1.0165, 0.9857, 0.8579, 1.0059, 0.991]\n\nperf_results\nspeed up: 1.48\n================================================================================================================================================================\n",
+    "duration_ms": 121.35910799952399
   },
   "per_op": {
     "abs.py": {
@@ -24,6 +24,10 @@
       "exe_acc_passed": true
     },
     "add_gelu.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "add_mean.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
@@ -39,6 +43,10 @@
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
+    "batch_norm.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
     "bessel_j1.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
@@ -47,11 +55,11 @@
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
-    "broadcast_tensors.py": {
+    "bitwise_and_binomial.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
-    "chebyshev_polynomial_t.py": {
+    "broadcast_tensors.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
@@ -60,6 +68,10 @@
       "exe_acc_passed": true
     },
     "cos_signbit.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "determinant_lu.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
@@ -75,7 +87,19 @@
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
+    "dropout_relu_batch_norm_conv2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "elu_linear.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
     "erf.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "erfc_sqrt.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
@@ -83,11 +107,19 @@
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
+    "exp_mean.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
     "exp_sqrt.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
-    "fftn.py": {
+    "fused_bmm_dropout_gelu.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_bmm_rmsnorm_gelu_dropout.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
@@ -103,7 +135,7 @@
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
-    "fused_cross_entropy_softmax_layernorm.py": {
+    "fused_embedding_add_tanh.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
@@ -111,7 +143,7 @@
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
-    "fused_gather_masked_fill.py": {
+    "fused_hardshrink_dropout.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
@@ -120,6 +152,10 @@
       "exe_acc_passed": true
     },
     "fused_index_select_eq.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_instance_norm_selu_conv2d.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
@@ -135,19 +171,11 @@
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
-    "fused_repeat_interleave_log_softmax.py": {
+    "fused_silu_layer_norm_conv2d.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
     "fused_svd_reconstruct.py": {
-      "call_acc_passed": true,
-      "exe_acc_passed": true
-    },
-    "fused_transformer_block.py": {
-      "call_acc_passed": true,
-      "exe_acc_passed": true
-    },
-    "gammaln.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
@@ -156,10 +184,6 @@
       "exe_acc_passed": true
     },
     "invert_matrix_lu.py": {
-      "call_acc_passed": true,
-      "exe_acc_passed": true
-    },
-    "ldl_factor.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
@@ -187,23 +211,27 @@
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
-    "low_rank_svd_approximation.py": {
-      "call_acc_passed": true,
-      "exe_acc_passed": true
-    },
-    "lu.py": {
-      "call_acc_passed": true,
-      "exe_acc_passed": true
-    },
-    "matrix_multiply_and_row_dot.py": {
-      "call_acc_passed": true,
-      "exe_acc_passed": true
-    },
     "matrix_multiply_symmetric.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
-    "mul_relu.py": {
+    "matrix_power_eig.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "matrix_vector_dot.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "max.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "mean.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "min.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
@@ -223,10 +251,6 @@
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
-    "pixel_shuffle_conv2d.py": {
-      "call_acc_passed": true,
-      "exe_acc_passed": true
-    },
     "polygamma.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
@@ -235,11 +259,11 @@
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
-    "rad2deg_sqrt.py": {
+    "qr.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
-    "rand.py": {
+    "rad2deg_sqrt.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
@@ -248,10 +272,6 @@
       "exe_acc_passed": true
     },
     "relu.py": {
-      "call_acc_passed": true,
-      "exe_acc_passed": true
-    },
-    "relu_batch_norm_conv2d.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
@@ -279,7 +299,19 @@
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
+    "sigmoid_adaptive_avg_pool2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
     "sigmoid_argmax.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "sigmoid_conv2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "softmax.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
@@ -287,15 +319,7 @@
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
-    "softmax_mul.py": {
-      "call_acc_passed": true,
-      "exe_acc_passed": true
-    },
-    "softplus_linear.py": {
-      "call_acc_passed": true,
-      "exe_acc_passed": true
-    },
-    "solve_multiple_lu.py": {
+    "solve_and_add_scaled_vector.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
@@ -315,15 +339,15 @@
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
-    "std.py": {
-      "call_acc_passed": true,
-      "exe_acc_passed": true
-    },
     "sum.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
     "sum_std.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "symmetric_matrix_vector_norm.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
@@ -335,15 +359,15 @@
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
+    "tanh_linear.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
     "tensordot.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },
     "tensordot_rsqrt.py": {
-      "call_acc_passed": true,
-      "exe_acc_passed": true
-    },
-    "tril_mm_and_scale.py": {
       "call_acc_passed": true,
       "exe_acc_passed": true
     },

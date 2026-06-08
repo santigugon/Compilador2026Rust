@@ -3,75 +3,91 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _softmax_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=-float('inf'))
-    x = x - tl.max(x, axis=0)
-    exp_x = tl.exp(x)
-    sum_exp_x = tl.sum(exp_x, axis=0)
-    softmax_x = exp_x / sum_exp_x
-    tl.store(out_ptr + offsets, softmax_x, mask=mask)
+def softmax_kernel(
+    output_ptr, input_ptr, row_size, 
+    BLOCK_SIZE: tl.constexpr
+):
+    row_idx = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    input_row = input_ptr + row_idx * row_size + col_offsets
+    output_row = output_ptr + row_idx * row_size + col_offsets
+    
+    row = tl.load(input_row, mask=col_offsets < row_size)
+    row = row - tl.max(row, axis=0)
+    exp_row = tl.exp(row)
+    sum_exp = tl.sum(exp_row, axis=0)
+    softmax_row = exp_row / sum_exp
+    tl.store(output_row, softmax_row, mask=col_offsets < row_size)
 
 @triton.jit
-def _dropout_kernel(x_ptr, out_ptr, n: tl.constexpr, p: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    # Generate random mask
-    rand = tl.rand(0, 0)  # This is a placeholder; actual random generation is complex in Triton
-    # For simplicity, we'll use a deterministic approach for testing
-    # In practice, you'd need to handle random number generation properly
-    keep_mask = rand > p
-    y = tl.where(keep_mask, x / (1.0 - p), 0.0)
-    tl.store(out_ptr + offsets, y, mask=mask)
+def dropout_kernel(
+    output_ptr, input_ptr, dropout_p, row_size,
+    BLOCK_SIZE: tl.constexpr, seed: tl.constexpr
+):
+    row_idx = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    input_row = input_ptr + row_idx * row_size + col_offsets
+    output_row = output_ptr + row_idx * row_size + col_offsets
+    
+    row = tl.load(input_ptr + row_idx * row_size + col_offsets, mask=col_offsets < row_size)
+    rand = tl.rand(seed, row_idx * row_size + col_offsets)
+    mask = rand > dropout_p
+    output = row * mask / (1.0 - dropout_p)
+    tl.store(output_row, output, mask=col_offsets < row_size)
 
 @triton.jit
-def _layer_norm_kernel(x_ptr, weight_ptr, bias_ptr, out_ptr, n: tl.constexpr, eps: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    mean = tl.sum(x, axis=0) / n
-    var = tl.sum((x - mean) ** 2, axis=0) / n
-    x_norm = (x - mean) / tl.sqrt(var + eps)
-    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0)
-    bias = tl.load(bias_ptr + offsets, mask=mask, other=0.0)
-    out = x_norm * weight + bias
-    tl.store(out_ptr + offsets, out, mask=mask)
+def layer_norm_kernel(
+    output_ptr, input_ptr, weight_ptr, bias_ptr, row_size, eps,
+    BLOCK_SIZE: tl.constexpr
+):
+    row_idx = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    input_row = input_ptr + row_idx * row_size + col_offsets
+    output_row = output_ptr + row_idx * row_size + col_offsets
+    weight_row = weight_ptr + col_offsets
+    bias_row = bias_ptr + col_offsets
+    
+    input_vals = tl.load(input_row, mask=col_offsets < row_size)
+    mean = tl.sum(input_vals, axis=0) / row_size
+    var = tl.sum((input_vals - mean) ** 2, axis=0) / row_size
+    norm = (input_vals - mean) / tl.sqrt(var + eps)
+    weight_vals = tl.load(weight_row, mask=col_offsets < row_size)
+    bias_vals = tl.load(bias_row, mask=col_offsets < row_size)
+    output = norm * weight_vals + bias_vals
+    tl.store(output_row, output, mask=col_offsets < row_size)
 
 def fused_transformer_block(input, weight1, weight2, residual, dropout_p=0.1, eps=1e-5, *, out=None):
-    # Compute Z1 = input @ weight1
-    Z1 = torch.matmul(input, weight1)
+    device = input.device
+    batch_shape = input.shape[:-2]
+    N, D_in = input.shape[-2], input.shape[-1]
+    D_k, D_out = weight1.shape[1], weight2.shape[1]
     
-    # Compute Z2 = softmax(Z1)
-    Z2 = torch.empty_like(Z1)
-    n = Z1.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    # For simplicity, we'll use PyTorch's softmax
-    Z2 = torch.softmax(Z1, dim=-1)
+    # First matmul: input @ weight1
+    Z_1 = torch.empty((N, D_k), device=device, dtype=torch.float32)
+    Z_1 = torch.mm(input.view(-1, D_in), weight1)
     
-    # Compute Z3 = dropout(Z2)
-    Z3 = torch.empty_like(Z2)
-    # For simplicity, we'll use PyTorch's dropout
-    Z3 = torch.nn.functional.dropout(Z2, p=dropout_p, training=True)
+    # Softmax
+    Z_2 = torch.empty_like(Z_1)
+    BLOCK_SIZE = 1024
+    grid = (Z_1.shape[0], 1)
+    softmax_kernel[grid](Z_2, Z_1, Z_1.shape[1], BLOCK_SIZE=BLOCK_SIZE)
     
-    # Compute Z4 = Z3 @ weight2
-    Z4 = torch.matmul(Z3, weight2)
+    # Dropout
+    Z_3 = torch.empty_like(Z_2)
+    seed = torch.randint(0, 2**32, (1,), device=device).item()
+    dropout_kernel[grid](Z_3, Z_2, dropout_p, Z_2.shape[1], BLOCK_SIZE=BLOCK_SIZE, seed=seed)
     
-    # Compute Z5 = Z4 + residual
-    Z5 = Z4 + residual
+    # Second matmul: Z_3 @ weight2
+    Z_4 = torch.mm(Z_3, weight2)
     
-    # Compute Z6 = layer_norm(Z5)
-    Z6 = torch.empty_like(Z5)
-    # For simplicity, we'll use PyTorch's layer norm
-    Z6 = torch.nn.functional.layer_norm(Z5, Z5.shape[-1:], eps=eps)
+    # Add residual
+    Z_4 = Z_4 + residual
     
-    # Return the result
+    # Layer norm
+    Z_5 = torch.empty_like(Z_4)
+    layer_norm_kernel[grid](Z_5, Z_4, torch.ones(D_out, device=device), torch.zeros(D_out, device=device), Z_4.shape[1], eps, BLOCK_SIZE=BLOCK_SIZE)
+    
     if out is not None:
-        out.copy_(Z6)
+        out.copy_(Z_5)
         return out
-    return Z6
+    return Z_5

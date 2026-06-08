@@ -30,21 +30,28 @@ def logit(input, eps=None, *, out=None):
         assert out.shape == input.shape, "Output tensor must have the same shape as input"
         assert out.dtype == input.dtype, "Output tensor must have the same dtype as input"
     
-    # Handle case where eps is None and input is outside [0, 1]
+    # Handle case where eps is None
     if eps is None:
-        # Check for invalid values that would produce NaN
-        if (input < 0).any() or (input > 1).any():
-            # For this case, we let PyTorch handle it naturally
-            return torch.logit(input, eps=eps, out=out)
+        # For eps=None, we let the computation produce NaN for inputs outside [0, 1]
+        # This is handled naturally by the logit computation
+        pass
+    else:
+        # Validate eps is in valid range
+        if eps <= 0 or eps >= 0.5:
+            raise ValueError("eps must be between 0 and 0.5")
     
+    # Get number of elements
     n = input.numel()
+    
+    # Launch kernel
     block = 256
     grid = (triton.cdiv(n, block),)
     
-    # Convert eps to a constexpr value
+    # Convert eps to a constexpr value for the kernel
     eps_val = eps if eps is not None else 0.0
     
     _logit_kernel[grid](input, out, n, eps_val, BLOCK=block)
+    
     return out
 
 ##################################################################################################################################################

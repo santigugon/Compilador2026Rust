@@ -4,42 +4,37 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def digamma_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+def _digamma_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     
-    # Handle special cases
-    result = tl.where(x == 0.0, -tl.inf, 0.0)
+    # For x <= 0, return -inf
+    # For x > 0, compute digamma using asymptotic expansion
+    # digamma(x) = log(x) - 1/(2x) - 1/(12x^2) + 1/(120x^4) - 1/(252x^6) + ...
     
-    # For positive values, compute digamma using asymptotic expansion
-    positive_mask = (x > 0.0) & (x != tl.inf)
-    x_pos = tl.load(x_ptr + offsets, mask=positive_mask)
+    # Handle special case where x <= 0
+    result = tl.where(x <= 0, -tl.inf, 0.0)
     
-    # Simple approximation for digamma function
-    # For large x: digamma(x) ≈ ln(x) - 1/(2x) - 1/(12x^2) + 1/(120x^4) - 1/(252x^6)
-    x_large = x_pos > 10.0
-    x_small = ~x_large & (x_pos > 0.0)
+    # For positive x, compute the series expansion
+    # We'll use a simplified version for better numerical stability
+    # digamma(x) ≈ log(x) - 1/(2x) - 1/(12x^2) + 1/(120x^4) - 1/(252x^6)
+    x_positive = tl.where(x > 0, x, 1.0)  # Avoid division by zero
     
-    # Large x approximation
-    x_large_val = tl.log(x_pos) - 1.0 / (2.0 * x_pos) - 1.0 / (12.0 * x_pos * x_pos)
-    x_large_val = x_large_val + 1.0 / (120.0 * x_pos * x_pos * x_pos * x_pos)
-    x_large_val = x_large_val - 1.0 / (252.0 * x_pos * x_pos * x_pos * x_pos * x_pos * x_pos)
+    # Compute the series expansion
+    log_x = tl.log(x_positive)
+    term1 = 1.0 / (2.0 * x_positive)
+    term2 = 1.0 / (12.0 * x_positive * x_positive)
+    term3 = 1.0 / (120.0 * x_positive * x_positive * x_positive * x_positive)
+    term4 = 1.0 / (252.0 * x_positive * x_positive * x_positive * x_positive * x_positive * x_positive)
     
-    # Small x approximation using recurrence relation
-    # digamma(x) = digamma(x+1) - 1/x for x < 1
-    x_small_val = tl.zeros_like(x_pos)
-    x_small_val = tl.where(x_pos < 1.0, 
-                          tl.log(x_pos) - 1.0 / x_pos + 1.0 / (12.0 * x_pos * x_pos) - 1.0 / (120.0 * x_pos * x_pos * x_pos * x_pos),
-                          x_small_val)
+    series = log_x - term1 - term2 + term3 - term4
     
     # Combine results
-    result = tl.where(x_large, x_large_val, result)
-    result = tl.where(x_small, x_small_val, result)
+    result = tl.where(x > 0, series, -tl.inf)
     
-    tl.store(output_ptr + offsets, result, mask=mask)
+    tl.store(out_ptr + offsets, result, mask=mask)
 
 def digamma(input, *, out=None):
     if out is None:
@@ -48,20 +43,10 @@ def digamma(input, *, out=None):
         if out.shape != input.shape:
             raise ValueError("Output tensor must have the same shape as input tensor")
     
-    if input.numel() == 0:
-        return out
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
     
-    # Launch kernel
-    n_elements = input.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    digamma_kernel[grid](
-        input,
-        out,
-        n_elements,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    
+    _digamma_kernel[grid](input, out, n, BLOCK=block)
     return out
 ```

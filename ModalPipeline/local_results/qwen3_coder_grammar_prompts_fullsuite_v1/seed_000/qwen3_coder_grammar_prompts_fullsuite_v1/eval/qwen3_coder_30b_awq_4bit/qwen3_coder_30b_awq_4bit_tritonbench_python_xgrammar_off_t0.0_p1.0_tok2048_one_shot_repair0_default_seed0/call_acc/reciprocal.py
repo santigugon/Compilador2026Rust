@@ -1,6 +1,6 @@
+import torch
 import triton
 import triton.language as tl
-import torch
 
 @triton.jit
 def reciprocal_kernel(X_ptr, Y_ptr, N, BLOCK_SIZE: tl.constexpr):

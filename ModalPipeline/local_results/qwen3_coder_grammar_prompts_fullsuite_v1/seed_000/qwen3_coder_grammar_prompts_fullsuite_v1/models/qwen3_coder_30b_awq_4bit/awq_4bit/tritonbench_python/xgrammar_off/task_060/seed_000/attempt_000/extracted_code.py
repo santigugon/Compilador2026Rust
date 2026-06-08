@@ -3,23 +3,32 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _exp_sqrt_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+def exp_sqrt_kernel(X, Y, N, BLOCK_SIZE: int = 1024):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    x = tl.load(X + offsets, mask=mask)
     y = tl.sqrt(tl.exp(x))
-    tl.store(out_ptr + offsets, y, mask=mask)
+    tl.store(Y + offsets, y, mask=mask)
 
-def exp_sqrt(input, out=None):
+def exp_sqrt(input, out=None) -> torch.Tensor:
     if out is None:
-        out = torch.empty_like(input)
-    else:
-        assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
-        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input tensor"
+        out = torch.empty_like(input, device=input.device, dtype=input.dtype)
     
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    _exp_sqrt_kernel[grid](input, out, n, BLOCK=block)
+    assert input.is_contiguous(), "Input tensor must be contiguous"
+    assert out.is_contiguous(), "Output tensor must be contiguous"
+    
+    N = input.numel()
+    BLOCK_SIZE = 1024
+    
+    grid = (triton.cdiv(N, BLOCK_SIZE),)
+    
+    exp_sqrt_kernel[grid](
+        input,
+        out,
+        N,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
     return out

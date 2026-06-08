@@ -20,21 +20,36 @@ def sub(input, other, *, alpha=1, out=None):
         else:
             return torch.sub(input, other, alpha=alpha)
     
-    # Ensure tensors have compatible shapes for broadcasting
-    # We'll use PyTorch's broadcasting rules
+    # Ensure tensors have the same dtype for computation
+    if input.dtype != other.dtype:
+        # Use torch's type promotion rules
+        common_dtype = torch.result_type(input, other)
+        input = input.to(common_dtype)
+        other = other.to(common_dtype)
+    
+    # Handle broadcasting
+    try:
+        # This will raise an error if shapes are not broadcastable
+        torch.broadcast_tensors(input, other)
+    except RuntimeError:
+        raise ValueError("Input tensors are not broadcastable")
+    
+    # Determine output shape and create output tensor
     if out is not None:
-        # If out is provided, we need to make sure it's compatible
-        # For simplicity, we'll compute the result and copy to out
-        result = torch.empty_like(input)
-        # Handle broadcasting by using torch's implementation
-        result = torch.sub(input, other, alpha=alpha)
-        out.copy_(result)
-        return out
+        if out.shape != torch.broadcast_shapes(input.shape, other.shape):
+            raise ValueError("Output tensor shape does not match expected broadcast shape")
+        out = out.to(input.dtype)
     else:
-        # For the general case, we'll use Triton for the core operation
-        # but handle broadcasting with PyTorch's native implementation
-        # since Triton doesn't handle broadcasting directly in this context
-        # We'll compute the result using PyTorch's native implementation
-        # to ensure correct broadcasting behavior
-        return torch.sub(input, other, alpha=alpha)
+        out = torch.empty(torch.broadcast_shapes(input.shape, other.shape), dtype=input.dtype, device=input.device)
+    
+    # Get total number of elements
+    n = out.numel()
+    
+    # Launch kernel
+    if n > 0:
+        block = 256
+        grid = (triton.cdiv(n, block),)
+        _sub_kernel[grid](input, other, out, n, alpha, BLOCK=block)
+    
+    return out
 ```

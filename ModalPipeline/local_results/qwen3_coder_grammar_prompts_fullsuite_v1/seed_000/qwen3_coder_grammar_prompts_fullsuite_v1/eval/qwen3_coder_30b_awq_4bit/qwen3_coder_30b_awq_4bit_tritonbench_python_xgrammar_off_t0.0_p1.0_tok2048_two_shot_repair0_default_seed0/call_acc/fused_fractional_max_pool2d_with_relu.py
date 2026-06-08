@@ -22,8 +22,8 @@ def _fractional_max_pool2d_kernel(
     output_width,
     kernel_height, 
     kernel_width,
-    BLOCK_HEIGHT: tl.constexpr, 
-    BLOCK_WIDTH: tl.constexpr,
+    BLOCK_H: tl.constexpr, 
+    BLOCK_W: tl.constexpr,
     BLOCK_SIZE: tl.constexpr
 ):
     pid_h = tl.program_id(0)
@@ -85,76 +85,86 @@ def fused_fractional_max_pool2d_with_relu(input: torch.Tensor, kernel_size, outp
         output_width = input_width // kernel_width
     
     # Create output tensor
-    out = torch.empty(input_re.shape[:-2] + (output_height, output_width), device=input.device, dtype=input.dtype)
-    
-    # Create indices tensor if needed
-    indices = None
-    if return_indices:
-        indices = torch.empty(input_re.shape[:-2] + (output_height, output_width), device=input.device, dtype=torch.long)
-    
-    # Handle batch dimensions
-    batch_size = input_re.shape[:-2]
-    total_batch_elements = 1
-    for dim in batch_size:
-        total_batch_elements *= dim
-    
-    # Flatten batch dimensions for processing
-    if len(batch_size) > 0:
-        input_flat = input_re.view(-1, input_height, input_width)
-        out_flat = out.view(-1, output_height, output_width)
+    if len(input.shape) == 4:
+        out = torch.empty(input.shape[0], input.shape[1], output_height, output_width, device=input.device, dtype=input.dtype)
         if return_indices:
-            indices_flat = indices.view(-1, output_height, output_width)
+            indices = torch.empty(input.shape[0], input.shape[1], output_height, output_width, device=input.device, dtype=torch.long)
     else:
-        input_flat = input_re.unsqueeze(0)
-        out_flat = out.unsqueeze(0)
+        out = torch.empty(output_height, output_width, device=input.device, dtype=input.dtype)
         if return_indices:
-            indices_flat = indices.unsqueeze(0)
+            indices = torch.empty(output_height, output_width, device=input.device, dtype=torch.long)
     
-    # Process each batch element
-    for i in range(total_batch_elements):
-        # Get the current batch element
-        if len(batch_size) > 0:
-            input_batch = input_flat[i]
-            out_batch = out_flat[i]
-            if return_indices:
-                indices_batch = indices_flat[i]
-        else:
-            input_batch = input_flat[0]
-            out_batch = out_flat[0]
-            if return_indices:
-                indices_batch = indices_flat[0]
-        
-        # Launch kernel
-        grid_h = triton.cdiv(output_height, 16)
-        grid_w = triton.cdiv(output_width, 16)
-        grid = (grid_h, grid_w)
-        
-        # For simplicity, we'll use a single block size for now
-        BLOCK_SIZE = 256
-        _fractional_max_pool2d_kernel[grid](
-            input_batch, 
-            out_batch, 
-            indices_batch if return_indices else None,
-            input_height, 
-            input_width, 
-            output_height, 
-            output_width,
-            kernel_height, 
-            kernel_width,
-            BLOCK_HEIGHT=16, 
-            BLOCK_WIDTH=16,
-            BLOCK_SIZE=BLOCK_SIZE
-        )
+    # Handle batch dimension
+    batch_size = 1
+    if len(input.shape) == 4:
+        batch_size = input.shape[0]
     
-    # Reshape back to original batch dimensions
-    if len(batch_size) > 0:
-        out = out.view(input.shape[:-2] + (output_height, output_width,))
-        if return_indices:
-            indices = indices.view(input.shape[:-2] + (output_height, output_width,))
-    
+    # Launch kernel
     if return_indices:
+        if len(input.shape) == 4:
+            for b in range(batch_size):
+                _fractional_max_pool2d_kernel[(output_height, output_width)](
+                    input_re[b], 
+                    out[b], 
+                    indices[b],
+                    input_height, 
+                    input_width, 
+                    output_height, 
+                    output_width,
+                    kernel_height, 
+                    kernel_width,
+                    BLOCK_H=16, 
+                    BLOCK_W=16,
+                    BLOCK_SIZE=256
+                )
+        else:
+            _fractional_max_pool2d_kernel[(output_height, output_width)](
+                input_re, 
+                out, 
+                indices,
+                input_height, 
+                input_width, 
+                output_height, 
+                output_width,
+                kernel_height, 
+                kernel_width,
+                BLOCK_H=16, 
+                BLOCK_W=16,
+                BLOCK_SIZE=256
+            )
         return out, indices
     else:
+        if len(input.shape) == 4:
+            for b in range(batch_size):
+                _fractional_max_pool2d_kernel[(output_height, output_width)](
+                    input_re[b], 
+                    out[b], 
+                    None,
+                    input_height, 
+                    input_width, 
+                    output_height, 
+                    output_width,
+                    kernel_height, 
+                    kernel_width,
+                    BLOCK_H=16, 
+                    BLOCK_W=16,
+                    BLOCK_SIZE=256
+                )
+        else:
+            _fractional_max_pool2d_kernel[(output_height, output_width)](
+                input_re, 
+                out, 
+                None,
+                input_height, 
+                input_width, 
+                output_height, 
+                output_width,
+                kernel_height, 
+                kernel_width,
+                BLOCK_H=16, 
+                BLOCK_W=16,
+                BLOCK_SIZE=256
+            )
         return out
 
 ##################################################################################################################################################

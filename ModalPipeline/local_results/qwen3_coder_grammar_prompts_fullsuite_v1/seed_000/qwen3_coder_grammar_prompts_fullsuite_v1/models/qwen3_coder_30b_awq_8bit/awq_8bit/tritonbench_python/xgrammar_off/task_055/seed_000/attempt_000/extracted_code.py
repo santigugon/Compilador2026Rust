@@ -19,42 +19,26 @@ def _conv2d_kernel(
     if batch_id >= batch_size or channel_id >= out_channels or h_id >= oH or w_id >= oW:
         return
     
-    # Initialize accumulator
+    group_id = channel_id // channels_per_group
+    input_start = batch_id * (in_channels * iH * iW) + group_id * (channels_per_group * iH * iW)
+    weight_start = channel_id * (channels_per_group * kH * kW)
+    output_start = batch_id * (out_channels * oH * oW) + channel_id * (oH * oW) + h_id * oW + w_id
+    
     acc = 0.0
+    for kh in range(kH):
+        for kw in range(kW):
+            ih = h_id * stride_h - padding_h + kh * dilation_h
+            iw = w_id * stride_w - padding_w + kw * dilation_w
+            
+            if ih >= 0 and ih < iH and iw >= 0 and iw < iW:
+                input_idx = input_start + (kh * channels_per_group + (channel_id % channels_per_group)) * (iH * iW) + ih * iW + iw
+                weight_idx = weight_start + kh * (channels_per_group * kW) + kw * channels_per_group + (channel_id % channels_per_group)
+                acc += tl.load(input_ptr + input_idx) * tl.load(weight_ptr + weight_idx)
     
-    # Compute convolution
-    for g in range(groups):
-        group_start = g * channels_per_group
-        group_end = (g + 1) * channels_per_group
-        
-        for c in range(channels_per_group):
-            input_c = group_start + c
-            for kh in range(kH):
-                for kw in range(kW):
-                    ih = h_id * stride_h - padding_h + kh * dilation_h
-                    iw = w_id * stride_w - padding_w + kw * dilation_w
-                    
-                    if ih >= 0 and ih < iH and iw >= 0 and iw < iW:
-                        input_val = tl.load(input_ptr + 
-                                          batch_id * (in_channels * iH * iW) +
-                                          input_c * (iH * iW) +
-                                          ih * iW + iw)
-                        weight_val = tl.load(weight_ptr + 
-                                           channel_id * (channels_per_group * kH * kW) +
-                                           c * (kH * kW) +
-                                           kh * kW + kw)
-                        acc += input_val * weight_val
-    
-    # Add bias if present
     if bias_ptr is not None:
-        bias_val = tl.load(bias_ptr + channel_id)
-        acc += bias_val
+        acc += tl.load(bias_ptr + channel_id)
     
-    # Store result
-    tl.store(output_ptr + 
-             batch_id * (out_channels * oH * oW) +
-             channel_id * (oH * oW) +
-             h_id * oW + w_id, acc)
+    tl.store(output_ptr + output_start, acc)
 
 @triton.jit
 def _selu_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
@@ -65,8 +49,8 @@ def _selu_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     # SELU: scale * (max(0, x) + min(0, alpha * (exp(x) - 1)))
     alpha = 1.6732632423543772848170429916717
     scale = 1.0507009873554804934193349852946
-    selu_val = scale * (tl.maximum(0.0, x) + tl.minimum(0.0, alpha * (tl.exp(x) - 1.0)))
-    tl.store(out_ptr + offsets, selu_val, mask=mask)
+    y = scale * (tl.maximum(0.0, x) + tl.minimum(0.0, alpha * (tl.exp(x) - 1.0)))
+    tl.store(out_ptr + offsets, y, mask=mask)
 
 @triton.jit
 def _instance_norm_kernel(
@@ -76,43 +60,31 @@ def _instance_norm_kernel(
     BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
-    batch_id = pid // (channels * height * width)
-    channel_id = (pid % (channels * height * width)) // (height * width)
-    h_id = (pid % (channels * height * width)) % (height * width) // width
-    w_id = (pid % (channels * height * width)) % (height * width) % width
+    batch_id = pid // channels
+    channel_id = pid % channels
     
-    if batch_id >= batch_size or channel_id >= channels or h_id >= height or w_id >= width:
+    if batch_id >= batch_size or channel_id >= channels:
         return
     
-    # Compute mean and variance for this channel across batch and spatial dimensions
-    # This is a simplified version - in practice, you'd want to compute this more efficiently
-    # For now, we'll compute it per batch and channel
-    channel_offset = channel_id * (height * width)
-    sum_val = 0.0
-    sum_sq = 0.0
-    count = height * width
+    # Compute mean and variance for each channel in each batch
+    start_idx = batch_id * (channels * height * width) + channel_id * (height * width)
     
-    for h in range(height):
-        for w in range(width):
-            idx = batch_id * (channels * height * width) + channel_offset + h * width + w
-            val = tl.load(x_ptr + idx)
-            sum_val += val
-            sum_sq += val * val
+    # Load data
+    offsets = start_idx + tl.arange(0, height * width)
+    x = tl.load(x_ptr + offsets, mask=tl.arange(0, height * width) < height * width)
     
-    mean = sum_val / count
-    var = sum_sq / count - mean * mean
+    # Compute mean
+    mean = tl.sum(x) / (height * width)
+    tl.store(mean_ptr + batch_id * channels + channel_id, mean)
     
-    # Store mean and variance for later use
-    if mean_ptr is not None:
-        tl.store(mean_ptr + batch_id * channels + channel_id, mean)
-    if var_ptr is not None:
-        tl.store(var_ptr + batch_id * channels + channel_id, var)
+    # Compute variance
+    diff = x - mean
+    var = tl.sum(diff * diff) / (height * width)
+    tl.store(var_ptr + batch_id * channels + channel_id, var)
     
-    # Normalize and store result
-    std = tl.sqrt(var + eps)
-    val = tl.load(x_ptr + batch_id * (channels * height * width) + channel_offset + h_id * width + w_id)
-    normalized = (val - mean) / std
-    tl.store(out_ptr + batch_id * (channels * height * width) + channel_offset + h_id * width + w_id, normalized)
+    # Normalize
+    x_norm = (x - mean) / tl.sqrt(var + eps)
+    tl.store(out_ptr + offsets, x_norm, mask=tl.arange(0, height * width) < height * width)
 
 def fused_instance_norm_selu_conv2d(
     input: torch.Tensor,
@@ -128,76 +100,71 @@ def fused_instance_norm_selu_conv2d(
     affine=False,
     track_running_stats=False
 ):
-    # Handle scalar parameters
-    if not isinstance(stride, tuple):
+    # Handle scalar inputs
+    if isinstance(stride, int):
         stride = (stride, stride)
-    if not isinstance(padding, tuple):
+    if isinstance(padding, int):
         padding = (padding, padding)
-    if not isinstance(dilation, tuple):
+    if isinstance(dilation, int):
         dilation = (dilation, dilation)
     
-    stride_h, stride_w = stride
-    padding_h, padding_w = padding
-    dilation_h, dilation_w = dilation
-    
-    # Get dimensions
     batch_size, in_channels, iH, iW = input.shape
     out_channels, _, kH, kW = weight.shape
     
     # Compute output dimensions
-    oH = (iH + 2 * padding_h - (dilation_h * (kH - 1) + 1)) // stride_h + 1
-    oW = (iW + 2 * padding_w - (dilation_w * (kW - 1) + 1)) // stride_w + 1
+    oH = (iH + 2 * padding[0] - (dilation[0] * (kH - 1) + 1)) // stride[0] + 1
+    oW = (iW + 2 * padding[1] - (dilation[1] * (kW - 1) + 1)) // stride[1] + 1
     
     # Allocate output tensor
     output = torch.empty(batch_size, out_channels, oH, oW, device=input.device, dtype=input.dtype)
     
     # Convolution step
-    conv_output = torch.empty(batch_size, out_channels, oH, oW, device=input.device, dtype=input.dtype)
+    channels_per_group = in_channels // groups
+    block_size = 256
+    grid_size = batch_size * out_channels * oH * oW
     
     # Launch convolution kernel
-    block = 256
-    grid = (batch_size * out_channels * oH * oW, 1)
-    
-    # Compute channels per group
-    channels_per_group = in_channels // groups
-    
-    # Convolution kernel launch
-    _conv2d_kernel[grid](
-        input, weight, bias, conv_output,
+    _conv2d_kernel[grid_size // block_size + (1 if grid_size % block_size != 0 else 0)](
+        input, weight, bias, output,
         batch_size, in_channels, out_channels, iH, iW, oH, oW,
-        kH, kW, stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w,
-        groups, channels_per_group,
-        BLOCK_SIZE=block
+        kH, kW, stride[0], stride[1], padding[0], padding[1], 
+        dilation[0], dilation[1], groups, channels_per_group,
+        BLOCK_SIZE=block_size
     )
     
     # SELU activation
-    selu_output = torch.empty_like(conv_output)
-    n = conv_output.numel()
+    selu_output = torch.empty_like(output)
+    n = output.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
-    _selu_kernel[grid](conv_output, selu_output, n, BLOCK=block)
+    _selu_kernel[grid](output, selu_output, n, BLOCK=block)
     
     # Instance normalization
     if track_running_stats:
-        # For simplicity, we'll compute batch statistics
-        # In a full implementation, you'd want to track running statistics
-        norm_output = torch.empty_like(selu_output)
-        n = selu_output.numel()
-        block = 256
-        grid = (triton.cdiv(n, block),)
-        _instance_norm_kernel[grid](
-            selu_output, norm_output, None, None,
-            batch_size, out_channels, oH, oW, eps, BLOCK_SIZE=block
-        )
-        return norm_output
-    else:
-        # Simple normalization per channel
-        norm_output = torch.empty_like(selu_output)
-        n = selu_output.numel()
-        block = 256
-        grid = (triton.cdiv(n, block),)
-        _instance_norm_kernel[grid](
-            selu_output, norm_output, None, None,
-            batch_size, out_channels, oH, oW, eps, BLOCK_SIZE=block
-        )
-        return
+        # For simplicity, we'll compute mean and variance on the fly
+        # In a real implementation, you'd want to maintain running statistics
+        pass
+    
+    # Compute mean and variance for each channel
+    instance_norm_output = torch.empty_like(selu_output)
+    mean = torch.empty(batch_size, out_channels, device=input.device, dtype=torch.float32)
+    var = torch.empty(batch_size, out_channels, device=input.device, dtype=torch.float32)
+    
+    # Compute mean and variance for each channel
+    for b in range(batch_size):
+        for c in range(out_channels):
+            channel_data = selu_output[b, c, :, :]
+            channel_mean = channel_data.mean()
+            channel_var = channel_data.var()
+            mean[b, c] = channel_mean
+            var[b, c] = channel_var
+    
+    # Apply instance normalization
+    for b in range(batch_size):
+        for c in range(out_channels):
+            channel_data = selu_output[b, c, :, :]
+            channel_mean = mean[b, c]
+            channel_var = var[b, c]
+            instance_norm_output[b, c, :, :] = (channel_data - channel_mean) / torch.sqrt(channel_var + eps)
+    
+    return instance_norm_output

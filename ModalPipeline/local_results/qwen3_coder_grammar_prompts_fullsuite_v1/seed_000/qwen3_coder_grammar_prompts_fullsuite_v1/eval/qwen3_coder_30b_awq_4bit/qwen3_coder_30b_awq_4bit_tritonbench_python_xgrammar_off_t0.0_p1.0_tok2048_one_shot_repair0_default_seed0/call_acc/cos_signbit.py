@@ -10,20 +10,20 @@ def cos_signbit_kernel(
     n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
     input = tl.load(input_ptr + offsets, mask=mask)
     output = tl.cos(input)
+    signbit = tl.where(output >= 0, 0.0, 1.0)
     tl.store(output_ptr + offsets, output, mask=mask)
-    signbit = tl.where(output >= 0, 0, 1)
     tl.store(signbit_ptr + offsets, signbit, mask=mask)
 
 def cos_signbit(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     output = torch.empty_like(input)
-    signbit = torch.empty_like(input, dtype=torch.int8)
-    n_elements = input.numel()
+    signbit = torch.empty_like(input)
+    n_elements = output.numel()
     BLOCK_SIZE = 1024
     grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
     cos_signbit_kernel[grid](

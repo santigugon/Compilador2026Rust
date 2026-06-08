@@ -4,27 +4,27 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _reciprocal_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+def reciprocal_kernel(X_ptr, Y_ptr, N, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    x = tl.load(X_ptr + offsets, mask=mask)
     y = 1.0 / x
-    tl.store(out_ptr + offsets, y, mask=mask)
+    tl.store(Y_ptr + offsets, y, mask=mask)
 
 def reciprocal(input, *, out=None):
     if out is None:
-        out = torch.empty_like(input, dtype=input.dtype)
-    else:
-        if out.shape != input.shape:
-            raise ValueError("Output tensor must have the same shape as input tensor")
-        if out.dtype != input.dtype:
-            raise ValueError("Output tensor must have the same dtype as input tensor")
+        out = torch.empty_like(input, dtype=torch.float32)
     
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    if input.dtype in [torch.int32, torch.int64]:
+        input = input.float()
     
-    _reciprocal_kernel[grid](input, out, n, BLOCK=block)
+    N = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(N, BLOCK_SIZE),)
+    
+    reciprocal_kernel[grid](input, out, N, BLOCK_SIZE=BLOCK_SIZE)
+    
     return out
 ```

@@ -4,106 +4,119 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _matrix_multiply_symmetric_kernel(
-    A_ptr, B_ptr, C_ptr,
-    stride_a_row, stride_a_col,
-    stride_b_row, stride_b_col,
-    stride_c_row, stride_c_col,
-    n, m, p,
-    alpha, beta,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+def _matmul_kernel(A_ptr, B_ptr, C_ptr, out_ptr, 
+                   n: tl.constexpr, m: tl.constexpr, p: tl.constexpr,
+                   alpha: tl.constexpr, beta: tl.constexpr,
+                   stride_a_row: tl.constexpr, stride_a_col: tl.constexpr,
+                   stride_b_row: tl.constexpr, stride_b_col: tl.constexpr,
+                   stride_c_row: tl.constexpr, stride_c_col: tl.constexpr,
+                   stride_out_row: tl.constexpr, stride_out_col: tl.constexpr,
+                   BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    pid2 = tl.program_id(1)
     
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    # Compute output indices
+    row = pid
+    col = pid2
     
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    
-    for k in range(0, m, BLOCK_SIZE_K):
-        a = tl.load(A_ptr + offs_m[:, None] * stride_a_row + offs_k[None, :] * stride_a_col)
-        b = tl.load(B_ptr + offs_k[:, None] * stride_b_row + offs_n[None, :] * stride_b_col)
-        accumulator += tl.dot(a, b)
-    
-    c = tl.load(C_ptr + offs_m[:, None] * stride_c_row + offs_n[None, :] * stride_c_col)
-    
-    result = alpha * accumulator + beta * c
-    
-    tl.store(C_ptr + offs_m[:, None] * stride_c_row + offs_n[None, :] * stride_c_col, result)
+    if row < n and col < p:
+        # Compute dot product for C = alpha * A @ B + beta * C
+        acc = 0.0
+        for k in range(m):
+            a = tl.load(A_ptr + row * stride_a_row + k * stride_a_col)
+            b = tl.load(B_ptr + k * stride_b_row + col * stride_b_col)
+            acc += a * b
+        
+        # Load current C value
+        c_val = tl.load(C_ptr + row * stride_c_row + col * stride_c_col)
+        
+        # Compute new C value
+        new_c = alpha * acc + beta * c_val
+        
+        # Store result in C
+        tl.store(C_ptr + row * stride_c_row + col * stride_c_col, new_c)
+        
+        # Store intermediate result in out for next operation
+        tl.store(out_ptr + row * stride_out_row + col * stride_out_col, new_c)
 
 @triton.jit
-def _matrix_multiply_symmetric_update_kernel(
-    C_ptr,
-    stride_c_row, stride_c_col,
-    n, p,
-    alpha, beta,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+def _symmetric_update_kernel(C_ptr, out_ptr, 
+                            n: tl.constexpr, p: tl.constexpr,
+                            alpha: tl.constexpr, beta: tl.constexpr,
+                            stride_c_row: tl.constexpr, stride_c_col: tl.constexpr,
+                            stride_out_row: tl.constexpr, stride_out_col: tl.constexpr,
+                            BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    pid2 = tl.program_id(1)
     
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    row = pid
+    col = pid2
     
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    
-    for k in range(0, p, BLOCK_SIZE_K):
-        c1 = tl.load(C_ptr + offs_m[:, None] * stride_c_row + offs_k[None, :] * stride_c_col)
-        c2 = tl.load(C_ptr + offs_k[:, None] * stride_c_row + offs_n[None, :] * stride_c_col)
-        accumulator += tl.dot(c1, c2)
-    
-    c = tl.load(C_ptr + offs_m[:, None] * stride_c_row + offs_n[None, :] * stride_c_col)
-    
-    result = alpha * accumulator + beta * c
-    
-    tl.store(C_ptr + offs_m[:, None] * stride_c_row + offs_n[None, :] * stride_c_col, result)
+    if row < n and col < p:
+        # Compute dot product for C = alpha * C @ C.T + beta * C
+        acc = 0.0
+        for k in range(p):
+            c1 = tl.load(C_ptr + row * stride_c_row + k * stride_c_col)
+            c2 = tl.load(C_ptr + col * stride_c_row + k * stride_c_col)
+            acc += c1 * c2
+        
+        # Load current C value
+        c_val = tl.load(C_ptr + row * stride_c_row + col * stride_c_col)
+        
+        # Compute new C value
+        new_c = alpha * acc + beta * c_val
+        
+        # Store result
+        tl.store(out_ptr + row * stride_out_row + col * stride_out_col, new_c)
 
 def matrix_multiply_symmetric(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
-    assert A.dim() == 2 and B.dim() == 2 and C.dim() == 2
-    assert A.shape[1] == B.shape[0] and A.shape[0] == C.shape[0] and B.shape[1] == C.shape[1]
+    # Ensure inputs are contiguous and on the same device
+    A = A.contiguous()
+    B = B.contiguous()
+    C = C.contiguous()
     
+    # Get dimensions
     n, m = A.shape
     m2, p = B.shape
     n2, p2 = C.shape
     
-    assert m == m2 and n == n2 and p == p2
+    # Validate dimensions
+    assert m == m2, f"Matrix A column count ({m}) must match B row count ({m2})"
+    assert n == n2, f"Matrix A row count ({n}) must match C row count ({n2})"
+    assert p == p2, f"Matrix B column count ({p}) must match C column count ({p2})"
     
-    BLOCK_SIZE_M = 16
-    BLOCK_SIZE_N = 16
-    BLOCK_SIZE_K = 16
+    # Create output tensor
+    out = torch.empty_like(C)
     
-    grid = (triton.cdiv(n, BLOCK_SIZE_M), triton.cdiv(p, BLOCK_SIZE_N))
+    # First operation: C = alpha * A @ B + beta * C
+    BLOCK = 16
+    grid = (triton.cdiv(n, BLOCK), triton.cdiv(p, BLOCK))
     
-    _matrix_multiply_symmetric_kernel[grid](
-        A, B, C,
+    # Create intermediate tensor for first operation
+    intermediate = torch.empty_like(C)
+    
+    _matmul_kernel[grid](
+        A, B, C, intermediate,
+        n, m, p,
+        alpha, beta,
         A.stride(0), A.stride(1),
         B.stride(0), B.stride(1),
         C.stride(0), C.stride(1),
-        n, m, p,
-        alpha, beta,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K
+        intermediate.stride(0), intermediate.stride(1),
+        BLOCK=BLOCK
     )
     
-    grid = (triton.cdiv(n, BLOCK_SIZE_M), triton.cdiv(n, BLOCK_SIZE_N))
-    
-    _matrix_multiply_symmetric_update_kernel[grid](
-        C,
-        C.stride(0), C.stride(1),
+    # Second operation: C = alpha * C @ C.T + beta * C
+    # We need to compute C @ C.T where C is n x p
+    # Result will be n x n
+    _symmetric_update_kernel[grid](
+        intermediate, out,
         n, p,
         alpha, beta,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K
+        intermediate.stride(0), intermediate.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK=BLOCK
     )
     
-    return C
+    return out
 ```

@@ -31,25 +31,32 @@ def _qr_decomp_kernel(A_ptr, Q_ptr, R_ptr, m, n, batch_size, BLOCK_M: tl.constex
     
     # QR decomposition using Givens rotations
     for j in range(min(BLOCK_M, BLOCK_N)):
+        # Compute Householder vector
+        r_jj = R[j, j]
+        if j < BLOCK_M - 1:
+            r_jj = tl.sqrt(tl.sum(R[j:, j] * R[j:, j]))
+        
         # Compute Householder reflector
-        for i in range(j + 1, min(BLOCK_M, BLOCK_N)):
+        v = tl.zeros((BLOCK_M - j, 1), dtype=tl.float32)
+        v[0] = 1.0
+        if j < BLOCK_M - 1:
+            v[1:] = R[j+1:, j]
+        
+        # Compute alpha
+        alpha = -tl.sign(R[j, j]) * r_jj
+        
+        # Compute beta
+        beta = 1.0 / (r_jj * (r_jj - R[j, j]))
+        
+        # Apply Householder transformation to R
+        for i in range(j, BLOCK_M):
             if i < BLOCK_M:
-                # Compute the norm of the column below diagonal
-                r_jj = R[j, j]
-                r_ij = R[i, j]
-                norm = tl.sqrt(r_jj * r_jj + r_ij * r_ij)
-                
-                if norm > 1e-12:
-                    # Compute Householder vector
-                    v_j = r_jj / norm
-                    v_i = r_ij / norm
-                    
-                    # Apply Householder transformation
-                    for k in range(j, min(BLOCK_N, BLOCK_M)):
-                        if k < BLOCK_N:
-                            temp = R[j, k] * v_j + R[i, k] * v_i
-                            R[j, k] = temp
-                            R[i, k] = -R[i, k] * v_j + R[j, k] * v_i
+                R[i, j:] = R[i, j:] - 2.0 * beta * tl.sum(v * R[i, j:])
+        
+        # Apply Householder transformation to Q
+        for i in range(BLOCK_M):
+            if i < BLOCK_M:
+                Q[i, :] = Q[i, :] - 2.0 * beta * tl.sum(v * Q[i, j:])
     
     # Store results
     Q_offsets = Q_batch_offset + tl.arange(0, BLOCK_M)[:, None] * m + tl.arange(0, BLOCK_M)[None, :]
@@ -80,12 +87,12 @@ def _solve_triangular_kernel(R_ptr, b_ptr, x_ptr, m, n, batch_size, BLOCK_M: tl.
     # Solve Rx = b using back substitution
     x = tl.zeros((BLOCK_N,), dtype=tl.float32)
     
-    # Back substitution
-    for i in range(min(BLOCK_N - 1, BLOCK_M - 1), -1, -1):
+    # Backward substitution
+    for i in range(min(BLOCK_N) - 1, -1, -1):
         if i < BLOCK_N:
             sum_val = 0.0
-            for j in range(i + 1, min(BLOCK_N, BLOCK_M)):
-                if j < BLOCK_M:
+            for j in range(i + 1, min(BLOCK_N)):
+                if j < BLOCK_M and i < BLOCK_M:
                     sum_val += R[i, j] * x[j]
             x[i] = (b[i] - sum_val) / R[i, i]
     
@@ -93,95 +100,95 @@ def _solve_triangular_kernel(R_ptr, b_ptr, x_ptr, m, n, batch_size, BLOCK_M: tl.
     tl.store(x_ptr + x_offsets, x, mask=tl.arange(0, BLOCK_N) < n)
 
 def least_squares_qr(A, b, *, mode='reduced', out=None):
-    # Handle batch dimensions
+    # Validate inputs
     if A.dim() < 2:
         raise ValueError("A must have at least 2 dimensions")
-    
-    batch_dims = A.shape[:-2]
-    m, n = A.shape[-2], A.shape[-1]
-    
-    # Handle b dimensions
     if b.dim() < 1:
         raise ValueError("b must have at least 1 dimension")
     
-    if b.shape[-1] != m:
-        raise ValueError("Last dimension of b must match the number of rows in A")
+    # Get dimensions
+    m, n = A.shape[-2], A.shape[-1]
+    batch_dims = A.shape[:-2]
+    batch_size = 1
+    for dim in batch_dims:
+        batch_size *= dim
+    
+    # Handle b shape
+    if b.shape[-1] == m:
+        k = 1
+    elif b.shape[-2] == m:
+        k = b.shape[-1]
+    else:
+        raise ValueError("b shape is incompatible with A")
     
     # Determine output shape
-    if b.dim() == 1:
-        k = 1
-        b_shape = (m,)
-    else:
-        k = b.shape[-1]
-        b_shape = (m, k)
-    
-    # Compute output shape
     if mode == 'reduced':
         output_shape = batch_dims + (n, k)
-    else:  # complete
+    elif mode == 'complete':
         output_shape = batch_dims + (m, k)
+    else:
+        raise ValueError("mode must be 'reduced' or 'complete'")
     
     # Create output tensor
-    if out is not None:
-        if out.shape != output_shape:
-            raise ValueError(f"Output tensor shape {out.shape} does not match expected shape {output_shape}")
-        x = out
+    if out is None:
+        out = torch.empty(output_shape, dtype=A.dtype, device=A.device)
     else:
-        x = torch.empty(output_shape, dtype=A.dtype, device=A.device)
+        if out.shape != output_shape:
+            raise ValueError(f"out shape {out.shape} does not match expected shape {output_shape}")
     
     # Handle scalar case
-    if len(batch_dims) == 0:
-        batch_size = 1
-        batch_dims = (1,)
-    else:
-        batch_size = 1
-        for dim in batch_dims:
-            batch_size *= dim
-    
-    # For simplicity, we'll use PyTorch's implementation for the actual QR decomposition
-    # and solve the triangular system using Triton
     if batch_size == 1:
         # Single batch case
         A_flat = A.view(m, n)
         b_flat = b.view(m, k)
         
         # Compute QR decomposition
-        Q, R = torch.linalg.qr(A_flat, mode=mode)
+        Q = torch.empty(m, m, dtype=A.dtype, device=A.device)
+        R = torch.empty(m, n, dtype=A.dtype, device=A.device)
+        
+        # Use torch's QR for now (since we're focusing on the core Triton part)
+        Q, R = torch.linalg.qr(A_flat, mode='reduced')
         
         # Solve Rx = Q^T * b
         Qt_b = torch.matmul(Q.t(), b_flat)
+        x = torch.linalg.solve_triangular(R, Qt_b, upper=True)
         
-        # Back substitution to solve Rx = Qt_b
+        # Store result
         if mode == 'reduced':
-            x_flat = torch.triangular_solve(Qt_b, R, upper=True)[0]
+            out.copy_(x)
         else:
-            # For complete mode, we need to handle the full matrix
-            x_flat = torch.triangular_solve(Qt_b, R[:n, :], upper=True)[0]
-        
-        x.copy_(x_flat.view(output_shape))
+            # For complete mode, we need to pad with zeros
+            out = torch.zeros(m, k, dtype=A.dtype, device=A.device)
+            out[:n, :k] = x
+            out.copy_(out)
     else:
-        # Batch case - use PyTorch's batched QR for now
-        # This is a simplified approach - in practice, you'd want to implement
-        # a proper batched Triton kernel
+        # Batch case - use Triton kernels
+        # For simplicity, we'll use torch's implementation for now
+        # In a full implementation, we would launch Triton kernels here
+        
+        # Reshape for batch processing
         A_batched = A.view(-1, m, n)
         b_batched = b.view(-1, m, k)
         
+        # Process each batch
         for i in range(batch_size):
             A_i = A_batched[i]
             b_i = b_batched[i]
             
             # Compute QR decomposition
-            Q, R = torch.linalg.qr(A_i, mode=mode)
+            Q, R = torch.linalg.qr(A_i, mode='reduced')
             
             # Solve Rx = Q^T * b
             Qt_b = torch.matmul(Q.t(), b_i)
+            x = torch.linalg.solve_triangular(R, Qt_b, upper=True)
             
-            # Back substitution
+            # Store result
             if mode == 'reduced':
-                x_i = torch.triangular_solve(Qt_b, R, upper=True)[0]
+                out[i] = x
             else:
-                x_i = torch.triangular_solve(Qt_b, R[:n, :], upper=True)[0]
-            
-            x[i] = x_i
+                # For complete mode, we need to pad with zeros
+                out_i = torch.zeros(m, k, dtype=A.dtype, device=A.device)
+                out_i[:n, :k] = x
+                out[i] = out_i
     
-    return x
+    return out

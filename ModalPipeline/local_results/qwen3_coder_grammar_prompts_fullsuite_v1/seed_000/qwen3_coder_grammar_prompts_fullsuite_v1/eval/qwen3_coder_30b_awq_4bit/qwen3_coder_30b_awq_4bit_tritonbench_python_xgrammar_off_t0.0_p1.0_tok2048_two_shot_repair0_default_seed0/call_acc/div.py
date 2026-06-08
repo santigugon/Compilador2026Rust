@@ -32,10 +32,11 @@ def div(input, other, *, rounding_mode=None, out=None):
         input, other = torch.broadcast_tensors(input, other)
     
     # Create output tensor
-    if out is not None:
-        out = out
-    else:
+    if out is None:
         out = torch.empty_like(input)
+    else:
+        if out.shape != input.shape:
+            raise ValueError("Output tensor shape must match input tensor shape")
     
     # Get total number of elements
     n = input.numel()

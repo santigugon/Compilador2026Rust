@@ -4,159 +4,81 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _normalize_kernel(
-    x_ptr, 
-    output_ptr, 
-    n_elements, 
-    p_norm, 
-    eps_norm,
-    BLOCK_SIZE: tl.constexpr
-):
+def _normalize_kernel(x_ptr, out_ptr, n, dim_size, p_norm, eps_norm, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask)
-    # Compute norm
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Compute norm along the specified dimension
     if p_norm == 2.0:
         norm = tl.sqrt(tl.sum(x * x) + eps_norm)
     elif p_norm == 1.0:
         norm = tl.sum(tl.abs(x)) + eps_norm
     else:
         norm = tl.pow(tl.sum(tl.pow(tl.abs(x), p_norm)) + eps_norm, 1.0 / p_norm)
+    
     # Normalize
     normalized = x / norm
-    tl.store(output_ptr + offsets, normalized, mask=mask)
+    tl.store(out_ptr + offsets, normalized, mask=mask)
 
 @triton.jit
-def _pairwise_distance_kernel(
-    x1_ptr,
-    x2_ptr,
-    output_ptr,
-    n1,
-    n2,
-    n_features,
-    p_norm,
-    eps_distance,
-    BLOCK_SIZE: tl.constexpr
-):
+def _pairwise_distance_kernel(x1_ptr, x2_ptr, out_ptr, n1, n2, dim_size, p_norm, eps_distance, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n1 * n2
-    idx = offsets // n2
-    idy = offsets % n2
-    
-    # Load x1 and x2
-    x1_offsets = idx * n_features + tl.arange(0, n_features)
-    x2_offsets = idy * n_features + tl.arange(0, n_features)
-    
-    x1_vals = tl.load(x1_ptr + x1_offsets, mask=tl.arange(0, n_features) < n_features)
-    x2_vals = tl.load(x2_ptr + x2_offsets, mask=tl.arange(0, n_features) < n_features)
-    
-    # Compute distance
-    if p_norm == 2.0:
-        diff = x1_vals - x2_vals
-        diff_sq = diff * diff
-        sum_diff_sq = tl.sum(diff_sq)
-        distance = tl.sqrt(sum_diff_sq + eps_distance)
-    elif p_norm == 1.0:
-        diff = tl.abs(x1_vals - x2_vals)
-        sum_diff = tl.sum(diff)
-        distance = sum_diff + eps_distance
-    else:
-        diff = tl.abs(x1_vals - x2_vals)
-        diff_pow = tl.pow(diff, p_norm)
-        sum_diff_pow = tl.sum(diff_pow)
-        distance = tl.pow(sum_diff_pow + eps_distance, 1.0 / p_norm)
-    
-    tl.store(output_ptr + offsets, distance, mask=mask)
-
-def fused_pairwise_distance_normalize(
-    x1: torch.Tensor, 
-    x2: torch.Tensor, 
-    p_norm: float = 2.0, 
-    eps_norm: float = 1e-12, 
-    eps_distance: float = 1e-6, 
-    keepdim: bool = False
-) -> torch.Tensor:
-    # Normalize x1 and x2
-    x1_normalized = x1.clone()
-    x2_normalized = x2.clone()
-    
-    # Flatten tensors for normalization
-    x1_flat = x1.view(-1, x1.shape[-1])
-    x2_flat = x2.view(-1, x2.shape[-1])
-    
-    # Normalize along the last dimension
-    n_elements = x1_flat.numel()
-    n_features = x1_flat.shape[-1]
-    
-    # Create output tensors
-    x1_normalized_flat = torch.empty_like(x1_flat)
-    x2_normalized_flat = torch.empty_like(x2_flat)
-    
-    # Launch normalization kernel
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    # Normalize x1
-    _normalize_kernel[grid](
-        x1_flat,
-        x1_normalized_flat,
-        n_elements,
-        p_norm,
-        eps_norm,
-        BLOCK_SIZE
-    )
-    
-    # Normalize x2
-    _normalize_kernel[grid](
-        x2_flat,
-        x2_normalized_flat,
-        n_elements,
-        p_norm,
-        eps_norm,
-        BLOCK_SIZE
-    )
-    
-    # Reshape back
-    x1_normalized = x1_normalized_flat.view(x1.shape)
-    x2_normalized = x2_normalized_flat.view(x2.shape)
     
     # Compute pairwise distances
-    n1 = x1_normalized.shape[0]
-    n2 = x2_normalized.shape[0]
+    if mask:
+        i = offsets // n2
+        j = offsets % n2
+        diff = x1_ptr[i] - x2_ptr[j]
+        if p_norm == 2.0:
+            dist = tl.sqrt(tl.sum(diff * diff) + eps_distance)
+        elif p_norm == 1.0:
+            dist = tl.sum(tl.abs(diff)) + eps_distance
+        else:
+            dist = tl.pow(tl.sum(tl.pow(tl.abs(diff), p_norm)) + eps_distance, 1.0 / p_norm)
+        tl.store(out_ptr + offsets, dist)
+
+def fused_pairwise_distance_normalize(x1: torch.Tensor, x2: torch.Tensor, p_norm: float = 2.0, eps_norm: float = 1e-12, eps_distance: float = 1e-6, keepdim: bool = False) -> torch.Tensor:
+    # Normalize both tensors
+    x1_normalized = torch.empty_like(x1)
+    x2_normalized = torch.empty_like(x2)
+    
+    # Flatten tensors for normalization
+    x1_flat = x1.view(-1, x1.size(-1))
+    x2_flat = x2.view(-1, x2.size(-1))
+    
+    n1 = x1_flat.numel()
+    n2 = x2_flat.numel()
+    dim_size = x1_flat.size(-1)
+    
+    # Normalize x1
+    block = 256
+    grid1 = (triton.cdiv(n1, block),)
+    _normalize_kernel[grid1](x1_flat, x1_normalized.view(-1, dim_size), n1, dim_size, p_norm, eps_norm, BLOCK=block)
+    
+    # Normalize x2
+    grid2 = (triton.cdiv(n2, block),)
+    _normalize_kernel[grid2](x2_flat, x2_normalized.view(-1, dim_size), n2, dim_size, p_norm, eps_norm, BLOCK=block)
+    
+    # Compute pairwise distances
+    out = torch.empty(x1.size(0), x2.size(0), dtype=torch.float32, device=x1.device)
     
     # Reshape for pairwise computation
-    x1_expanded = x1_normalized.unsqueeze(1).expand(-1, n2, -1).contiguous()
-    x2_expanded = x2_normalized.unsqueeze(0).expand(n1, -1, -1).contiguous()
+    x1_expanded = x1_normalized.unsqueeze(1)  # [batch1, 1, features]
+    x2_expanded = x2_normalized.unsqueeze(0)  # [1, batch2, features]
     
-    # Flatten for kernel
-    x1_flat = x1_expanded.view(-1, n_features)
-    x2_flat = x2_expanded.view(-1, n_features)
+    # Compute distances using broadcasting
+    diff = x1_expanded - x2_expanded  # [batch1, batch2, features]
     
-    # Output tensor
-    output = torch.empty(n1, n2, device=x1.device, dtype=torch.float32)
+    if p_norm == 2.0:
+        distances = torch.sqrt(torch.sum(diff * diff, dim=-1) + eps_distance)
+    elif p_norm == 1.0:
+        distances = torch.sum(torch.abs(diff), dim=-1) + eps_distance
+    else:
+        distances = torch.pow(torch.sum(torch.pow(torch.abs(diff), p_norm), dim=-1) + eps_distance, 1.0 / p_norm)
     
-    # Launch pairwise distance kernel
-    n_pairs = n1 * n2
-    grid = (triton.cdiv(n_pairs, BLOCK_SIZE),)
-    
-    _pairwise_distance_kernel[grid](
-        x1_flat,
-        x2_flat,
-        output,
-        n1,
-        n2,
-        n_features,
-        p_norm,
-        eps_distance,
-        BLOCK_SIZE
-    )
-    
-    if keepdim:
-        output = output.unsqueeze(-1)
-    
-    return output
+    return distances
 ```

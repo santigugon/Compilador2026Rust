@@ -24,27 +24,20 @@ def _div_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, rounding_mode: tl.conste
 def div(input, other, *, rounding_mode=None, out=None):
     # Handle scalar other
     if not torch.is_tensor(other):
-        if rounding_mode is not None:
-            raise ValueError("rounding_mode is not supported with scalar other")
-        return torch.div(input, other, out=out)
+        other = torch.tensor(other, dtype=input.dtype, device=input.device)
     
-    # Ensure inputs have the same dtype for computation
-    if input.dtype != other.dtype:
-        # Promote to common dtype
-        common_dtype = torch.result_type(input, other)
-        input = input.to(common_dtype)
-        other = other.to(common_dtype)
+    # Ensure both tensors have the same device
+    if other.device != input.device:
+        other = other.to(input.device)
     
-    # Handle out parameter
-    if out is not None:
-        out = out
-    else:
-        out = torch.empty_like(input)
+    # Handle broadcasting
+    out_shape = torch.broadcast_tensors(input, other)[0].shape
+    out = torch.empty(out_shape, dtype=input.dtype, device=input.device)
     
     # Get total number of elements
     n = input.numel()
     
-    # Set block size
+    # Determine block size
     block = 256
     grid = (triton.cdiv(n, block),)
     

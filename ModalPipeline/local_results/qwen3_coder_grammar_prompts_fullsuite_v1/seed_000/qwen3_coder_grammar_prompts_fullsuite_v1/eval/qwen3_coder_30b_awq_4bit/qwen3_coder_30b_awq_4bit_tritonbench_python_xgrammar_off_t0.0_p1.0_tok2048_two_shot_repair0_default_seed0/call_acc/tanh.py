@@ -8,7 +8,6 @@ def _tanh_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    # Numerically stable tanh implementation
     y = 2.0 / (1.0 + tl.exp(-2.0 * x)) - 1.0
     tl.store(out_ptr + offsets, y, mask=mask)
 

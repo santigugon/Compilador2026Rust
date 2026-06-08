@@ -36,8 +36,9 @@ def _matrix_multiply_symmetric_kernel(
 
 @triton.jit
 def _matrix_multiply_symmetric_update_kernel(
-    C_ptr,
+    C_ptr, C_t_ptr,
     stride_c_row, stride_c_col,
+    stride_c_t_row, stride_c_t_col,
     n, p,
     alpha, beta,
     BLOCK_SIZE_M: tl.constexpr,
@@ -54,9 +55,9 @@ def _matrix_multiply_symmetric_update_kernel(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     
     for k in range(0, p, BLOCK_SIZE_K):
-        c1 = tl.load(C_ptr + offs_m[:, None] * stride_c_row + offs_k[None, :] * stride_c_col)
-        c2 = tl.load(C_ptr + offs_k[:, None] * stride_c_row + offs_n[None, :] * stride_c_col)
-        accumulator += tl.dot(c1, c2)
+        c = tl.load(C_ptr + offs_m[:, None] * stride_c_row + offs_k[None, :] * stride_c_col)
+        c_t = tl.load(C_t_ptr + offs_k[:, None] * stride_c_t_row + offs_n[None, :] * stride_c_t_col)
+        accumulator += tl.dot(c, c_t)
     
     c = tl.load(C_ptr + offs_m[:, None] * stride_c_row + offs_n[None, :] * stride_c_col)
     
@@ -65,20 +66,17 @@ def _matrix_multiply_symmetric_update_kernel(
     tl.store(C_ptr + offs_m[:, None] * stride_c_row + offs_n[None, :] * stride_c_col, result)
 
 def matrix_multiply_symmetric(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
-    assert A.dim() == 2 and B.dim() == 2 and C.dim() == 2
-    assert A.shape[1] == B.shape[0] and A.shape[0] == C.shape[0] and B.shape[1] == C.shape[1]
+    assert A.shape[1] == B.shape[0], "Matrix dimensions incompatible for multiplication"
+    assert A.shape[0] == C.shape[0] and B.shape[1] == C.shape[1], "Matrix dimensions incompatible for update"
     
     n, m = A.shape
     m2, p = B.shape
-    n2, p2 = C.shape
     
-    assert m == m2 and n == n2 and p == p2
-    
-    BLOCK_SIZE_M = 16
-    BLOCK_SIZE_N = 16
-    BLOCK_SIZE_K = 16
-    
-    grid = (triton.cdiv(n, BLOCK_SIZE_M), triton.cdiv(p, BLOCK_SIZE_N))
+    # First operation: C = alpha * torch.mm(A, B) + beta * C
+    grid = (
+        triton.cdiv(n, 16),
+        triton.cdiv(p, 16)
+    )
     
     _matrix_multiply_symmetric_kernel[grid](
         A, B, C,
@@ -87,21 +85,26 @@ def matrix_multiply_symmetric(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
         C.stride(0), C.stride(1),
         n, m, p,
         alpha, beta,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K
+        BLOCK_SIZE_M=16,
+        BLOCK_SIZE_N=16,
+        BLOCK_SIZE_K=16
     )
     
-    grid = (triton.cdiv(n, BLOCK_SIZE_M), triton.cdiv(n, BLOCK_SIZE_N))
+    # Second operation: C = alpha * torch.mm(C, C.T) + beta * C
+    grid2 = (
+        triton.cdiv(n, 16),
+        triton.cdiv(n, 16)
+    )
     
-    _matrix_multiply_symmetric_update_kernel[grid](
-        C,
+    _matrix_multiply_symmetric_update_kernel[grid2](
+        C, C,
+        C.stride(0), C.stride(1),
         C.stride(0), C.stride(1),
         n, p,
         alpha, beta,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K
+        BLOCK_SIZE_M=16,
+        BLOCK_SIZE_N=16,
+        BLOCK_SIZE_K=16
     )
     
     return C

@@ -1,0 +1,89 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _gelu_kernel(x_ptr, out_ptr, n: tl.constexpr, approximate: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # GELU approximation
+    if approximate == 'tanh':
+        # GELU with tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        x_cubed = x * x * x
+        tanh_arg = 0.7978845608 * (x + 0.044715 * x_cubed)  # sqrt(2/pi) ≈ 0.7978845608
+        gelu_x = 0.5 * x * (1.0 + tl.tanh(tanh_arg))
+    else:
+        # Standard GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
+        erf_arg = x / 1.4142135623730951  # sqrt(2)
+        gelu_x = 0.5 * x * (1.0 + tl.erf(erf_arg))
+    
+    tl.store(out_ptr + offsets, gelu_x, mask=mask)
+
+def gelu_std(input, dim=None, keepdim=False, correction=1, approximate='none', out=None):
+    # Apply GELU activation
+    input_flat = input.flatten()
+    n = input_flat.numel()
+    
+    # Allocate output tensor for GELU
+    gelu_out = torch.empty_like(input_flat)
+    
+    # Launch GELU kernel
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    approximate_val = 1 if approximate == 'tanh' else 0
+    _gelu_kernel[grid](input_flat, gelu_out, n, approximate_val, BLOCK=block)
+    
+    # Reshape to original shape
+    gelu_out = gelu_out.view(input.shape)
+    
+    # Compute standard deviation
+    if dim is None:
+        # Compute over all dimensions
+        std_tensor = torch.std(gelu_out, correction=correction)
+    else:
+        # Compute over specified dimensions
+        std_tensor = torch.std(gelu_out, dim=dim, keepdim=keepdim, correction=correction)
+    
+    # Return result
+    if out is not None:
+        out.copy_(std_tensor)
+        return out
+    else:
+        return std_tensor
+
+##################################################################################################################################################
+
+
+
+import torch
+import torch.nn.functional as F
+
+# def gelu_std(input, dim=None, keepdim=False, correction=1, approximate='none', out=None):
+#     gelu_result = F.gelu(input, approximate=approximate)
+#     return torch.std(gelu_result, dim=dim, keepdim=keepdim, correction=correction, out=out)
+
+def test_gelu_std():
+    results = {}
+    
+    # Test case 1: Default parameters
+    input1 = torch.randn(10, device='cuda')
+    results["test_case_1"] = gelu_std(input1)
+    
+    # Test case 2: With dim parameter
+    input2 = torch.randn(10, 20, device='cuda')
+    results["test_case_2"] = gelu_std(input2, dim=1)
+    
+    # Test case 3: With keepdim=True
+    input3 = torch.randn(10, 20, device='cuda')
+    results["test_case_3"] = gelu_std(input3, dim=1, keepdim=True)
+    
+    # Test case 4: With approximate='tanh'
+    input4 = torch.randn(10, device='cuda')
+    results["test_case_4"] = gelu_std(input4, approximate='tanh')
+    
+    return results
+
+test_results = test_gelu_std()

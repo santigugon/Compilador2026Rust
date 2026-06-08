@@ -22,7 +22,7 @@ def scaled_add_norm(y, x, alpha):
     grid = (triton.cdiv(n, block),)
     
     # Create a temporary tensor to store squared values
-    temp = torch.empty(n, dtype=torch.float32, device=y.device)
+    temp = torch.empty(n, device=y.device, dtype=torch.float32)
     
     _scaled_add_norm_kernel[grid](y, x, temp, n, alpha, BLOCK=block)
     

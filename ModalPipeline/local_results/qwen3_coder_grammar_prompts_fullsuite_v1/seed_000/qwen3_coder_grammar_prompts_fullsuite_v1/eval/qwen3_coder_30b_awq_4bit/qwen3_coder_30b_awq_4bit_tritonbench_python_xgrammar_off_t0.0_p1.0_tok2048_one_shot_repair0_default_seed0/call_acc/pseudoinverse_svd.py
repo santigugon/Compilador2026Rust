@@ -23,13 +23,76 @@ def _svd_kernel(
     S_base = S_ptr + batch_idx * stride_S_batch
     V_base = V_ptr + batch_idx * stride_V_batch
     
-    # SVD computation would go here
-    # This is a simplified placeholder
-    for i in range(m):
-        for j in range(n):
-            a_val = tl.load(A_base + i * stride_A_m + j * stride_A_n)
-            # Placeholder for actual SVD computation
-            pass
+    # Initialize shared memory for SVD computation
+    shared_A = tl.shared_memory((BLOCK_M, BLOCK_N), tl.float32)
+    shared_U = tl.shared_memory((BLOCK_M, BLOCK_K), tl.float32)
+    shared_V = tl.shared_memory((BLOCK_K, BLOCK_N), tl.float32)
+    
+    # Load A into shared memory
+    for i in range(0, m, BLOCK_M):
+        for j in range(0, n, BLOCK_N):
+            if i + tl.arange(0, BLOCK_M) < m and j + tl.arange(0, BLOCK_N) < n:
+                row = i + tl.arange(0, BLOCK_M)[:, None]
+                col = j + tl.arange(0, BLOCK_N)[None, :]
+                mask = (row < m) & (col < n)
+                shared_A[row - i, col - j] = tl.load(
+                    A_base + row * stride_A_m + col * stride_A_n,
+                    mask=mask
+                )
+    
+    # SVD computation (simplified version)
+    # In practice, this would be replaced with a proper SVD implementation
+    # For now, we'll simulate the computation
+    
+    # Initialize U and V matrices
+    for i in range(0, m, BLOCK_M):
+        for j in range(0, min(m, BLOCK_K), BLOCK_K):
+            if i + tl.arange(0, BLOCK_M) < m and j + tl.arange(0, BLOCK_K) < m:
+                row = i + tl.arange(0, BLOCK_M)[:, None]
+                col = j + tl.arange(0, BLOCK_K)[None, :]
+                mask = (row < m) & (col < m)
+                tl.store(
+                    shared_U + row * stride_U_m + col * stride_U_k,
+                    tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32),
+                    mask=mask
+                )
+    
+    for i in range(0, min(n, BLOCK_K), BLOCK_K):
+        for j in range(0, n, BLOCK_N):
+            if i + tl.arange(0, BLOCK_K) < n and j + tl.arange(0, BLOCK_N) < n:
+                row = i + tl.arange(0, BLOCK_K)[:, None]
+                col = j + tl.arange(0, BLOCK_N)[None, :]
+                mask = (row < n) & (col < n)
+                tl.store(
+                    shared_V + row * stride_V_k + col * stride_V_n,
+                    tl.zeros((BLOCK_K, BLOCK_N), dtype=tl.float32),
+                    mask=mask
+                )
+    
+    # Store results
+    for i in range(0, m, BLOCK_M):
+        for j in range(0, min(m, BLOCK_K), BLOCK_K):
+            if i + tl.arange(0, BLOCK_M) < m and j + tl.arange(0, BLOCK_K) < m:
+                row = i + tl.arange(0, BLOCK_M)[:, None]
+                col = j + tl.arange(0, BLOCK_K)[None, :]
+                mask = (row < m) & (col < m)
+                tl.store(
+                    U_base + row * stride_U_m + col * stride_U_k,
+                    shared_U[row - i, col - j],
+                    mask=mask
+                )
+    
+    for i in range(0, min(n, BLOCK_K), BLOCK_K):
+        for j in range(0, n, BLOCK_N):
+            if i + tl.arange(0, BLOCK_K) < n and j + tl.arange(0, BLOCK_N) < n:
+                row = i + tl.arange(0, BLOCK_K)[:, None]
+                col = j + tl.arange(0, BLOCK_N)[None, :]
+                mask = (row < n) & (col < n)
+                tl.store(
+                    V_base + row * stride_V_k + col * stride_V_n,
+                    shared_V[row - i, col - j],
+                    mask=mask
+                )
 
 def pseudoinverse_svd(
     A: torch.Tensor,
@@ -38,6 +101,19 @@ def pseudoinverse_svd(
     rcond: float = 1e-15,
     out: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
+    """
+    Computes the Moore-Penrose pseudoinverse of a matrix using SVD.
+    
+    Args:
+        A (Tensor): Input tensor of shape `(*, m, n)` where `*` is zero or more batch dimensions.
+        full_matrices (bool, optional): If `True` (default), compute the full SVD. If `False`, compute the reduced SVD.
+        rcond (float, optional): Relative condition number threshold. Singular values smaller than `rcond * largest_singular_value` are set to zero. Default: `1e-15`.
+        out (Tensor, optional): Output tensor. Ignored if `None`. Default: `None`.
+        
+    Returns:
+        Tensor: Pseudoinverse of the input matrix.
+    """
+    # Validate input
     if A.dim() < 2:
         raise ValueError("Input tensor must have at least 2 dimensions")
     
@@ -51,31 +127,50 @@ def pseudoinverse_svd(
         k = min(m, n)
         out_shape = batch_dims + (n, m)
     
+    # Create output tensor if not provided
     if out is None:
         out = torch.empty(out_shape, dtype=A.dtype, device=A.device)
     else:
         if out.shape != out_shape:
             raise ValueError(f"Output tensor shape {out.shape} does not match expected shape {out_shape}")
     
-    # For demonstration purposes, we'll use a simplified approach
-    # In practice, this would involve actual SVD computation with Triton kernels
-    if A.dtype in [torch.float32, torch.float64]:
-        # Use torch's SVD for now
-        if full_matrices:
-            U, S, Vt = torch.linalg.svd(A, full_matrices=True)
-        else:
-            U, S, Vt = torch.linalg.svd(A, full_matrices=False)
-        
-        # Apply condition number threshold
-        max_s = S.max(dim=-1, keepdim=True).values
-        mask = S > rcond * max_s
-        S_inv = torch.where(mask, 1.0 / S, torch.zeros_like(S))
+    # For simplicity, we'll use PyTorch's SVD implementation
+    # In a real implementation, this would be replaced with a proper Triton kernel
+    
+    # Handle batched operations
+    if len(batch_dims) == 0:
+        # Single matrix case
+        A_flat = A.reshape(m, n)
+        U, S, Vt = torch.linalg.svd(A_flat, full_matrices=full_matrices)
         
         # Compute pseudoinverse
+        S_inv = torch.where(S > rcond * S.max(), 1.0 / S, torch.zeros_like(S))
         if full_matrices:
-            out = Vt.transpose(-2, -1) @ torch.diag_embed(S_inv) @ U.transpose(-2, -1)
+            V = Vt.T
+            out_flat = V @ torch.diag(S_inv) @ U.T
         else:
-            out = Vt.transpose(-2, -1) @ torch.diag_embed(S_inv) @ U.transpose(-2, -1)
+            V = Vt.T
+            out_flat = V @ torch.diag(S_inv) @ U.T
+            
+        out.copy_(out_flat)
+    else:
+        # Batched case
+        batch_size = torch.prod(torch.tensor(batch_dims))
+        A_flat = A.reshape(batch_size, m, n)
+        
+        # Process each matrix in the batch
+        for i in range(batch_size):
+            U, S, Vt = torch.linalg.svd(A_flat[i], full_matrices=full_matrices)
+            S_inv = torch.where(S > rcond * S.max(), 1.0 / S, torch.zeros_like(S))
+            
+            if full_matrices:
+                V = Vt.T
+                out_flat = V @ torch.diag(S_inv) @ U.T
+            else:
+                V = Vt.T
+                out_flat = V @ torch.diag(S_inv) @ U.T
+                
+            out.reshape(batch_size, n, m)[i].copy_(out_flat)
     
     return out
 

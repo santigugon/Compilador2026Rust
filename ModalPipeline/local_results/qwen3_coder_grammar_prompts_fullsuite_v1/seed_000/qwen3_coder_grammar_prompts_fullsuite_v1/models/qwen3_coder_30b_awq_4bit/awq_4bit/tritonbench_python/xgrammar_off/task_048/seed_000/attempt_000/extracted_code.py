@@ -3,31 +3,48 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _scaled_add_norm_kernel(y_ptr, x_ptr, out_ptr, n: tl.constexpr, alpha: tl.constexpr, BLOCK: tl.constexpr):
+def scaled_add_norm_kernel(y_ptr, x_ptr, alpha, output_ptr, n, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n
-    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offsets, mask=mask)
+    x = tl.load(x_ptr + offsets, mask=mask)
     y_new = y + alpha * x
     tl.store(y_ptr + offsets, y_new, mask=mask)
-    # Compute squared sum for norm
-    y_sq = y_new * y_new
-    tl.store(out_ptr + offsets, y_sq, mask=mask)
+    y_new_sq = y_new * y_new
+    tl.store(output_ptr + offsets, y_new_sq, mask=mask)
+
+@triton.jit
+def reduce_sum_kernel(input_ptr, output_ptr, n, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n
+    input_vals = tl.load(input_ptr + offsets, mask=mask)
+    sum_val = tl.sum(input_vals, axis=0)
+    tl.store(output_ptr + pid, sum_val, mask=pid < tl.cdiv(n, BLOCK_SIZE))
 
 def scaled_add_norm(y, x, alpha):
-    out = torch.empty_like(y)
+    assert y.shape == x.shape, "y and x must have the same shape"
     n = y.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    if n == 0:
+        return torch.tensor(0.0, dtype=torch.float32, device=y.device)
     
-    # Create a temporary tensor to store squared values
-    temp = torch.empty(n, dtype=torch.float32, device=y.device)
+    y = y.contiguous()
+    x = x.contiguous()
     
-    _scaled_add_norm_kernel[grid](y, x, temp, n, alpha, BLOCK=block)
+    # Launch kernel to compute y += alpha * x and store squared values
+    output = torch.empty(n, dtype=torch.float32, device=y.device)
+    grid = (triton.cdiv(n, 256),)
+    scaled_add_norm_kernel[grid](y, x, alpha, output, n, BLOCK_SIZE=256)
     
-    # Compute the 2-norm
-    squared_sum = temp.sum()
-    norm = torch.sqrt(squared_sum)
+    # Launch kernel to compute sum of squared values
+    sum_output = torch.empty(triton.cdiv(n, 256), dtype=torch.float32, device=y.device)
+    reduce_sum_kernel[grid](output, sum_output, n, BLOCK_SIZE=256)
     
-    return norm
+    # Reduce to get final sum
+    total_sum = sum_output.sum()
+    
+    # Return sqrt of sum
+    return torch.sqrt(total_sum)

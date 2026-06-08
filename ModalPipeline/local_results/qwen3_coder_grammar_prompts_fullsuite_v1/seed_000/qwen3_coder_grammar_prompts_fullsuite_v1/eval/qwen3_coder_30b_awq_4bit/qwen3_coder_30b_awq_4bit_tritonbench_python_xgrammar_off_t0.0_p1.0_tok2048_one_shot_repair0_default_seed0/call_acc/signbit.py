@@ -14,15 +14,17 @@ def signbit_kernel(
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < num_elements
     input_vals = tl.load(input_ptr + offsets, mask=mask)
-    output_vals = tl.where(input_vals < 0, 1, 0)
+    output_vals = tl.where(input_vals < 0.0, 1, 0)
     tl.store(output_ptr + offsets, output_vals, mask=mask)
 
 def signbit(input, *, out=None):
     if out is None:
         out = torch.empty_like(input, dtype=torch.bool, device=input.device)
-    
-    if input.numel() == 0:
-        return out
+    else:
+        if out.dtype != torch.bool:
+            raise ValueError("Output tensor must have bool dtype")
+        if out.shape != input.shape:
+            raise ValueError("Output tensor must have the same shape as input")
     
     num_elements = input.numel()
     BLOCK_SIZE = 1024

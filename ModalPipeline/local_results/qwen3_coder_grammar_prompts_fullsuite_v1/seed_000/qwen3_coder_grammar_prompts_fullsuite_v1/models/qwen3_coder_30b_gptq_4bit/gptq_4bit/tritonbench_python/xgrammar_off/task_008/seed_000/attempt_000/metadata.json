@@ -1,5 +1,5 @@
 {
-  "run_id": "ab6b4aa0-0dce-40fd-9bbc-c0f3ca6ec975",
+  "run_id": "7e67779b-5892-4fa0-baec-9213ebc4cf09",
   "experiment_id": "qwen3_coder_grammar_prompts_fullsuite_v1",
   "model_name": "qwen3_coder_30b_gptq_4bit",
   "hf_model_id": "btbtyler09/Qwen3-Coder-30B-A3B-Instruct-gptq-4bit",
@@ -10,7 +10,7 @@
     "temperature": 0.0,
     "top_p": 1.0,
     "max_output_tokens": 2048,
-    "prompt_variant": "one_shot",
+    "prompt_variant": "two_shot",
     "repair_budget": 0,
     "runtime_limit": {
       "name": "default",

@@ -14,20 +14,17 @@ def _log_tanh_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     tanh_log_x = 2.0 / (1.0 + tl.exp(-2.0 * log_x)) - 1.0
     tl.store(out_ptr + offsets, tanh_log_x, mask=mask)
 
-def log_tanh(input, out=None) -> torch.Tensor:
-    # Validate input - all elements must be positive
-    if not torch.all(input > 0):
-        raise ValueError("All elements in input must be positive for log function")
-    
+def log_tanh(input, out=None):
     if out is None:
         out = torch.empty_like(input)
     else:
-        if out.shape != input.shape:
-            raise ValueError("Output tensor must have the same shape as input tensor")
+        assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
+        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input tensor"
     
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
+    
     _log_tanh_kernel[grid](input, out, n, BLOCK=block)
     return out
 

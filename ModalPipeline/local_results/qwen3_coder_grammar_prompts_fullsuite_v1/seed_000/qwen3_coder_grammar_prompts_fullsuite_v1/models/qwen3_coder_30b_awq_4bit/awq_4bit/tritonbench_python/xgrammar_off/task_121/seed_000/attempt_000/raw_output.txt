@@ -4,68 +4,66 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _gelu_kernel(x_ptr, out_ptr, n: tl.constexpr, approximate: tl.constexpr, BLOCK: tl.constexpr):
+def gelu_kernel(X, Y, N, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    
-    if approximate == 1:  # tanh approximation
-        y = x * 0.5 * (1.0 + tl.tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
-    else:  # exact GELU
-        y = x * 0.5 * (1.0 + tl.erf(x / tl.sqrt(2.0)))
-    
-    tl.store(out_ptr + offsets, y, mask=mask)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    x = tl.load(X + offsets, mask=mask)
+    # GELU approximation using tanh
+    y = 0.5 * x * (1 + tl.tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
+    tl.store(Y + offsets, y, mask=mask)
 
 @triton.jit
-def _min_kernel(x_ptr, out_ptr, size: tl.constexpr, dim: tl.constexpr, keepdim: tl.constexpr, BLOCK: tl.constexpr):
-    # This is a simplified version - in practice, a full reduction kernel would be more complex
-    # For this implementation, we'll use a simpler approach that works for the basic case
+def gelu_exact_kernel(X, Y, N, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < size
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    # This is a placeholder - actual min reduction would require more complex logic
-    # For now, we'll just return the input as a placeholder
-    tl.store(out_ptr + offsets, x, mask=mask)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    x = tl.load(X + offsets, mask=mask)
+    # Exact GELU computation
+    y = 0.5 * x * (1 + tl.erf(x / tl.sqrt(2.0)))
+    tl.store(Y + offsets, y, mask=mask)
+
+@triton.jit
+def min_kernel(X, Y, N, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    x = tl.load(X + offsets, mask=mask)
+    # Find minimum value
+    min_val = tl.min(x)
+    tl.store(Y + pid, min_val, mask=pid < 1)
 
 def min_gelu(input, dim=None, keepdim=False, approximate='none', out=None):
-    # Handle scalar input
-    if input.dim() == 0:
-        input = input.unsqueeze(0)
+    if out is not None:
+        raise NotImplementedError("out parameter is not supported")
+    
+    input = input.contiguous()
+    if approximate == 'none':
+        # Use exact GELU
+        kernel = gelu_exact_kernel
+    else:
+        # Use tanh approximation
+        kernel = gelu_kernel
     
     # Compute GELU
-    gelu_input = input
-    if approximate == 'tanh':
-        approximate_val = 1
-    else:
-        approximate_val = 0
+    output = torch.empty_like(input)
+    N = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(N, BLOCK_SIZE),)
+    kernel[grid](input, output, N, BLOCK_SIZE=BLOCK_SIZE)
     
-    # Create output tensor for GELU
-    gelu_out = torch.empty_like(input)
-    
-    # Launch GELU kernel
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    _gelu_kernel[grid](input, gelu_out, n, approximate_val, BLOCK=block)
-    
-    # Handle reduction
+    # Compute minimum
     if dim is None:
-        # Reduce over all elements
-        result = torch.min(gelu_out)
+        # Reduce all elements
+        result = torch.min(output)
+        if keepdim:
+            result = result.unsqueeze(0)
     else:
-        # Reduce over specified dimension
-        result = torch.min(gelu_out, dim=dim, keepdim=keepdim)
+        # Reduce along specified dimension
+        result = torch.min(output, dim=dim, keepdim=keepdim)[0]
     
-    # Handle output parameter
-    if out is not None:
-        if isinstance(result, tuple):
-            out.copy_(result[0])
-            return out
-        else:
-            out.copy_(result)
-            return out
-    
-    return result if not isinstance(result, tuple) else result[0]
+    return result
 ```

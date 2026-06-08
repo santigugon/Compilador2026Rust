@@ -13,38 +13,50 @@ def _mv_dot_kernel(A_ptr, x_ptr, y_ptr, out_ptr, n: tl.constexpr, m: tl.constexp
     # Initialize accumulator for the dot product
     dot_product = 0.0
     
-    # Process m elements of x for this row of A
-    for i in range(0, m, BLOCK_SIZE):
-        # Load x elements with masking
-        x_offsets = i + tl.arange(0, BLOCK_SIZE)
+    # Process each column of A for this row
+    for col in range(0, m, BLOCK_SIZE):
+        # Load x values with masking
+        x_offsets = col + tl.arange(0, BLOCK_SIZE)
         x_mask = x_offsets < m
         x_vals = tl.load(x_ptr + x_offsets, mask=x_mask, other=0.0)
         
-        # Load A[row, :] elements with masking
+        # Load A[row, col] values with masking
         A_offsets = row * m + x_offsets
         A_mask = x_offsets < m
         A_vals = tl.load(A_ptr + A_offsets, mask=A_mask, other=0.0)
         
-        # Compute dot product of A[row, :] and x
+        # Compute dot product of A[row, :] with x
         dot_product += tl.sum(A_vals * x_vals)
     
-    # Compute y[row] = alpha * dot_product + beta * y[row]
+    # Compute y[row] = alpha * mv(A, x)[row] + beta * y[row]
     y_val = tl.load(y_ptr + row)
     new_y_val = alpha * dot_product + beta * y_val
     tl.store(y_ptr + row, new_y_val)
     
-    # Store the final dot product in out_ptr
-    if pid == 0:
-        # Only the first thread block computes and stores the final result
-        tl.store(out_ptr, new_y_val * tl.load(x_ptr + row))
+    # Compute final dot product of updated y with x
+    final_dot = 0.0
+    for col in range(0, m, BLOCK_SIZE):
+        x_offsets = col + tl.arange(0, BLOCK_SIZE)
+        x_mask = x_offsets < m
+        x_vals = tl.load(x_ptr + x_offsets, mask=x_mask, other=0.0)
+        
+        # Load y[row] value (already updated)
+        y_offsets = row
+        y_val = tl.load(y_ptr + y_offsets)
+        
+        # Compute dot product of updated y with x
+        final_dot += y_val * x_vals
+    
+    # Store the final result
+    tl.store(out_ptr, final_dot, mask=True)
 
 def matrix_vector_dot(A: torch.Tensor, x: torch.Tensor, y: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
-    # Validate input dimensions
+    # Validate input shapes
     assert A.dim() == 2, "A must be a 2D tensor"
     assert x.dim() == 1, "x must be a 1D tensor"
     assert y.dim() == 1, "y must be a 1D tensor"
-    assert A.size(1) == x.size(0), "A's number of columns must match x's size"
-    assert A.size(0) == y.size(0), "A's number of rows must match y's size"
+    assert A.size(1) == x.size(0), "A's column count must match x's length"
+    assert A.size(0) == y.size(0), "A's row count must match y's length"
     
     n, m = A.shape
     out = torch.empty(1, dtype=torch.float32, device=A.device)
@@ -54,10 +66,10 @@ def matrix_vector_dot(A: torch.Tensor, x: torch.Tensor, y: torch.Tensor, alpha: 
     # but ensures correctness
     
     # Compute y = alpha * mv(A, x) + beta * y
-    y_new = alpha * torch.mv(A, x) + beta * y
+    y_updated = alpha * torch.mv(A, x) + beta * y
     
-    # Compute dot product of y_new and x
-    result = torch.dot(y_new, x)
+    # Compute dot product of updated y with x
+    result = torch.dot(y_updated, x)
     
     return result
 

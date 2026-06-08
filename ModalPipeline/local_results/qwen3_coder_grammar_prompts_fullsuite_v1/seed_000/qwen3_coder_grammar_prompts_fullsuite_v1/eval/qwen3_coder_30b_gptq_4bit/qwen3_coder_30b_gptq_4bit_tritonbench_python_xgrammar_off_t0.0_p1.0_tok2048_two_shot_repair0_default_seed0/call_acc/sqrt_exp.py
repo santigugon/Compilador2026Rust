@@ -14,9 +14,6 @@ def _sqrt_exp_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
 def sqrt_exp(input, out=None):
     if out is None:
         out = torch.empty_like(input)
-    else:
-        assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
-    
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)

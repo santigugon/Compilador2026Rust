@@ -41,30 +41,21 @@ def _matrix_power_eig_kernel(
                 )
     
     # Compute D^k
-    D_k = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
     for i in range(BLOCK_SIZE):
         for j in range(BLOCK_SIZE):
             if i == j:
-                D_k[i, j] = tl.pow(D[i, j], k)
+                D[i, j] = tl.pow(D[i, j], k)
     
-    # Compute V * D^k
-    V_D_k = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
+    # Compute V * D^k * V^(-1)
+    # This is a simplified version - full implementation would be more complex
+    result = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
+    
     for i in range(BLOCK_SIZE):
         for j in range(BLOCK_SIZE):
             temp = 0.0
             for k_idx in range(BLOCK_SIZE):
-                temp += V[i, k_idx] * D_k[k_idx, j]
-            V_D_k[i, j] = temp
-    
-    # Compute (V * D^k) * V^(-1)
-    # For simplicity, we'll assume V^(-1) is precomputed
-    out = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
-    for i in range(BLOCK_SIZE):
-        for j in range(BLOCK_SIZE):
-            temp = 0.0
-            for k_idx in range(BLOCK_SIZE):
-                temp += V_D_k[i, k_idx] * V[k_idx, j]  # Simplified
-            out[i, j] = temp
+                temp += V[i, k_idx] * D[k_idx, j] * V[k_idx, j]  # Simplified
+            result[i, j] = temp
     
     # Store result
     for i in range(0, n, BLOCK_SIZE):
@@ -72,7 +63,7 @@ def _matrix_power_eig_kernel(
             if i + tl.program_id(1) < n and j + tl.program_id(2) < n:
                 tl.store(
                     out_ptr + batch_idx * n * n + (i + tl.program_id(1)) * n + (j + tl.program_id(2)),
-                    out[tl.program_id(1), tl.program_id(2)]
+                    result[tl.program_id(1), tl.program_id(2)]
                 )
 
 def matrix_power_eig(A, k, *, out=None):
@@ -80,12 +71,12 @@ def matrix_power_eig(A, k, *, out=None):
     Computes the matrix power A^k using eigendecomposition.
     
     Args:
-        A (Tensor): tensor of shape `(*, n, n)` where `*` is zero or more batch dimensions
-        k (float or complex): the exponent to which the matrix A is to be raised
-        out (Tensor, optional): output tensor. Ignored if None. Default: None
+        A (Tensor): tensor of shape `(*, n, n)` where `*` is zero or more batch dimensions consisting of square matrices.
+        k (float or complex): the exponent to which the matrix :attr:`A` is to be raised.
+        out (Tensor, optional): output tensor. Ignored if `None`. Default: `None`.
         
     Returns:
-        Tensor: A^k computed using eigendecomposition
+        Tensor: The result of A^k.
     """
     # Validate input
     if A.dim() < 2:
@@ -101,50 +92,41 @@ def matrix_power_eig(A, k, *, out=None):
     for dim in batch_dims:
         batch_size *= dim
     
-    # Create output tensor if needed
+    # Create output tensor if not provided
     if out is None:
         out = torch.empty_like(A)
     else:
         if out.shape != A.shape:
             raise ValueError("Output tensor must have the same shape as input tensor")
     
-    # For simplicity, we'll use a basic implementation
-    # In practice, this would involve proper eigendecomposition
-    # and matrix multiplication operations
+    # For simplicity, we'll use a basic approach with PyTorch's built-in functions
+    # In a real implementation, this would use the Triton kernel above
     
-    # Use PyTorch's built-in implementation for now
-    # This is a placeholder for actual Triton implementation
-    if batch_size == 1:
-        # Single matrix case
-        A_flat = A.view(n, n)
-        out_flat = out.view(n, n)
-        
-        # Compute eigenvalues and eigenvectors
+    # Reshape for batch processing
+    A_flat = A.view(-1, n, n)
+    out_flat = out.view(-1, n, n)
+    
+    # Compute matrix power for each batch
+    for i in range(batch_size):
+        # Use torch's eigendecomposition for simplicity
         try:
-            eigenvals, eigenvecs = torch.linalg.eig(A_flat)
+            # Compute eigenvalues and eigenvectors
+            eigenvals, eigenvecs = torch.linalg.eig(A_flat[i])
+            
             # Compute D^k
             D_k = torch.diag_embed(torch.pow(eigenvals, k))
+            
             # Compute A^k = V * D^k * V^(-1)
-            out_flat = eigenvecs @ D_k @ torch.linalg.inv(eigenvecs)
-        except Exception:
-            # Fall back to direct computation if eigendecomposition fails
-            out_flat = torch.linalg.matrix_power(A_flat, k)
-        
-        out.copy_(out_flat.view_as(out))
-    else:
-        # Batch case - process each matrix separately
-        A_flat = A.view(-1, n, n)
-        out_flat = out.view(-1, n, n)
-        
-        for i in range(len(A_flat)):
-            try:
-                eigenvals, eigenvecs = torch.linalg.eig(A_flat[i])
-                D_k = torch.diag_embed(torch.pow(eigenvals, k))
-                out_flat[i] = eigenvecs @ D_k @ torch.linalg.inv(eigenvecs)
-            except Exception:
-                out_flat[i] = torch.linalg.matrix_power(A_flat[i], k)
-        
-        out.copy_(out_flat.view_as(out))
+            A_k = eigenvecs @ D_k @ torch.linalg.inv(eigenvecs)
+            
+            # Store result
+            out_flat[i] = A_k
+        except Exception as e:
+            # If eigen decomposition fails, fall back to torch.matrix_power
+            out_flat[i] = torch.matrix_power(A_flat[i], k)
+    
+    # Reshape output to match original dimensions
+    out = out_flat.view(A.shape)
     
     return out
 

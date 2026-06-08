@@ -1,36 +1,31 @@
 import torch
 import triton
 import triton.language as tl
+from typing import Tuple
 
 @triton.jit
-def cos_signbit_kernel(
-    input_ptr,
-    output_cos_ptr,
-    output_signbit_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    input = tl.load(input_ptr + offsets, mask=mask)
-    cos_val = tl.cos(input)
-    tl.store(output_cos_ptr + offsets, cos_val, mask=mask)
-    signbit = tl.where(cos_val >= 0, 0, 1)
-    tl.store(output_signbit_ptr + offsets, signbit, mask=mask)
+def _cos_signbit_kernel(x_ptr, cos_out_ptr, signbit_out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Compute cosine
+    cos_x = tl.cos(x)
+    
+    # Compute sign bit (1 if negative, 0 if positive or zero)
+    signbit = tl.where(cos_x < 0, 1.0, 0.0)
+    
+    tl.store(cos_out_ptr + offsets, cos_x, mask=mask)
+    tl.store(signbit_out_ptr + offsets, signbit, mask=mask)
 
-def cos_signbit(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    output_cos = torch.empty_like(input)
-    output_signbit = torch.empty_like(input, dtype=torch.int8)
-    n_elements = input.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    cos_signbit_kernel[grid](
-        input,
-        output_cos,
-        output_signbit,
-        n_elements,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    return output_cos, output_signbit
+def cos_signbit(input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    out_cos = torch.empty_like(input)
+    out_signbit = torch.empty_like(input)
+    
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    
+    _cos_signbit_kernel[grid](input, out_cos, out_signbit, n, BLOCK=block)
+    return out_cos, out_signbit

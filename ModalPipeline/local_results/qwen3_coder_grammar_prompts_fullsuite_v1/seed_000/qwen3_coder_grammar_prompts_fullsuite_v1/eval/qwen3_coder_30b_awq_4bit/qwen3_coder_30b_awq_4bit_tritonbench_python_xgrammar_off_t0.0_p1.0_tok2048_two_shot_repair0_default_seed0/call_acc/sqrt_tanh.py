@@ -9,6 +9,7 @@ def _sqrt_tanh_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     sqrt_x = tl.sqrt(x)
+    # tanh of sqrt_x: 2.0 / (1.0 + tl.exp(-2.0 * sqrt_x)) - 1.0
     tanh_sqrt_x = 2.0 / (1.0 + tl.exp(-2.0 * sqrt_x)) - 1.0
     tl.store(out_ptr + offsets, tanh_sqrt_x, mask=mask)
 

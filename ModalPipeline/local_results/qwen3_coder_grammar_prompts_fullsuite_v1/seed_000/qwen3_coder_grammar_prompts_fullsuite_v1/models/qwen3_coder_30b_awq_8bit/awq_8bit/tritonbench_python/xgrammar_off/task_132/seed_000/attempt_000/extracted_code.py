@@ -3,50 +3,49 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def mul_sub_kernel(
-    input_ptr, other_mul_ptr, other_sub_ptr, output_ptr,
-    input_size, other_mul_size, other_sub_size,
-    alpha,
-    BLOCK_SIZE: tl.constexpr
-):
+def _mul_sub_kernel(x_ptr, y_ptr, z_ptr, out_ptr, n: tl.constexpr, alpha: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < input_size
-    
-    input_vals = tl.load(input_ptr + offsets, mask=mask)
-    other_mul_vals = tl.load(other_mul_ptr + offsets, mask=mask)
-    other_sub_vals = tl.load(other_sub_ptr + offsets, mask=mask)
-    
-    result = input_vals * other_mul_vals - alpha * other_sub_vals
-    tl.store(output_ptr + offsets, result, mask=mask)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+    z = tl.load(z_ptr + offsets, mask=mask, other=0.0)
+    result = x * y - alpha * z
+    tl.store(out_ptr + offsets, result, mask=mask)
 
 def mul_sub(input, other_mul, other_sub, alpha=1, out=None):
+    # Handle scalar inputs
+    if not torch.is_tensor(other_mul):
+        other_mul = torch.tensor(other_mul, dtype=input.dtype, device=input.device)
+    if not torch.is_tensor(other_sub):
+        other_sub = torch.tensor(other_sub, dtype=input.dtype, device=input.device)
+    
+    # Handle broadcasting
+    # Create output tensor with appropriate shape
     if out is None:
         out = torch.empty_like(input)
+    else:
+        if out.shape != input.shape:
+            raise ValueError("Output tensor shape must match input tensor shape")
     
-    input_size = input.numel()
-    other_mul_size = other_mul.numel() if isinstance(other_mul, torch.Tensor) else 1
-    other_sub_size = other_sub.numel() if isinstance(other_sub, torch.Tensor) else 1
+    # Flatten tensors for kernel execution
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
     
-    if other_mul_size == 1:
-        other_mul = other_mul.expand(input.shape)
-    if other_sub_size == 1:
-        other_sub = other_sub.expand(input.shape)
+    # Ensure all tensors are on the same device and have correct dtype
+    input = input.contiguous()
+    other_mul = other_mul.contiguous()
+    other_sub = other_sub.contiguous()
     
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(input_size, BLOCK_SIZE),)
+    # Expand other tensors to match input shape if needed
+    if other_mul.shape != input.shape:
+        other_mul = other_mul.expand_as(input)
+    if other_sub.shape != input.shape:
+        other_sub = other_sub.expand_as(input)
     
-    mul_sub_kernel[grid](
-        input.data_ptr(),
-        other_mul.data_ptr(),
-        other_sub.data_ptr(),
-        out.data_ptr(),
-        input_size,
-        other_mul_size,
-        other_sub_size,
-        alpha,
-        BLOCK_SIZE=BLOCK_SIZE
+    _mul_sub_kernel[grid](
+        input, other_mul, other_sub, out, n, alpha, BLOCK=block
     )
     
     return out

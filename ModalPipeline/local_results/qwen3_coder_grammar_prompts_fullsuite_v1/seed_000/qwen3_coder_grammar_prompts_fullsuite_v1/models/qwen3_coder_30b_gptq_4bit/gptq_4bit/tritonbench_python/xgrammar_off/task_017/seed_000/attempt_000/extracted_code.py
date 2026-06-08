@@ -3,32 +3,40 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def fused_index_select_eq_kernel(
-    input_ptr, index_ptr, other_ptr, output_ptr,
-    input_size, index_size, other_size,
-    dim_size, stride_input_dim, stride_other_dim,
-    BLOCK_SIZE: tl.constexpr
+def _index_select_eq_kernel(
+    input_ptr, index_ptr, other_ptr, out_ptr,
+    input_shape0: tl.constexpr, input_shape1: tl.constexpr,
+    index_size: tl.constexpr,
+    BLOCK: tl.constexpr
 ):
-    # Get the block index
-    block_idx = tl.program_id(0)
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
     
-    # Calculate the starting position for this block
-    start_pos = block_idx * BLOCK_SIZE
+    # Compute the total number of elements in the output
+    total_elements = input_shape0 * index_size
     
-    # Load indices
-    indices = tl.load(index_ptr + tl.arange(0, BLOCK_SIZE), mask=(tl.arange(0, BLOCK_SIZE) + start_pos) < index_size)
+    # Create mask for valid elements
+    mask = offsets < total_elements
     
-    # Load input tensor elements
-    input_elements = tl.load(input_ptr + indices * stride_input_dim + tl.arange(0, BLOCK_SIZE) * stride_input_dim, mask=(tl.arange(0, BLOCK_SIZE) + start_pos) < index_size)
+    # Calculate which index we're working with
+    index_id = offsets // input_shape0
+    element_id = offsets % input_shape0
     
-    # Load other tensor elements
-    other_elements = tl.load(other_ptr + tl.arange(0, BLOCK_SIZE) * stride_other_dim, mask=(tl.arange(0, BLOCK_SIZE) + start_pos) < other_size)
+    # Load index values
+    index_val = tl.load(index_ptr + index_id, mask=index_id < index_size, other=0)
     
-    # Perform element-wise equality comparison
-    result = input_elements == other_elements
+    # Load input values using index
+    input_offsets = index_val * input_shape0 + element_id
+    input_val = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
     
-    # Store the result
-    tl.store(output_ptr + tl.arange(0, BLOCK_SIZE), result, mask=(tl.arange(0, BLOCK_SIZE) + start_pos) < index_size)
+    # Load other value (could be tensor or scalar)
+    other_val = tl.load(other_ptr + element_id, mask=mask, other=0.0)
+    
+    # Perform equality comparison
+    result = input_val == other_val
+    
+    # Store result
+    tl.store(out_ptr + offsets, result, mask=mask)
 
 def fused_index_select_eq(input, dim, index, other, *, out=None):
     # Validate inputs
@@ -38,46 +46,45 @@ def fused_index_select_eq(input, dim, index, other, *, out=None):
     if dim >= input.dim():
         raise ValueError("dim must be within the range of input tensor dimensions")
     
-    if index.dim() != 1:
-        raise ValueError("index must be a 1-dimensional tensor")
+    # Get the shape of input tensor
+    input_shape = input.shape
     
-    # Determine output shape
-    output_shape = list(input.shape)
-    output_shape[dim] = index.shape[0]
+    # Get the size of the indexing dimension
+    index_size = index.size(0)
     
-    # Create output tensor if not provided
+    # Create output tensor
     if out is None:
+        # Create output tensor with appropriate shape
+        output_shape = list(input_shape)
+        output_shape[dim] = index_size
         out = torch.empty(output_shape, dtype=torch.bool, device=input.device)
+    else:
+        if out.shape != tuple(output_shape):
+            raise ValueError("out tensor must have the same shape as the selected elements")
     
-    # Ensure all tensors are on the same device
-    index = index.to(input.device)
-    other = other.to(input.device)
+    # Handle scalar other case
+    if not torch.is_tensor(other):
+        other = torch.tensor(other, dtype=input.dtype, device=input.device)
     
-    # Calculate strides
-    stride_input_dim = input.stride(dim)
-    stride_other_dim = other.stride(dim) if hasattr(other, 'stride') else 1
+    # Ensure other tensor has the right shape for broadcasting
+    if other.dim() == 0:
+        other = other.expand(input_shape[0])
+    elif other.shape[0] != input_shape[0]:
+        raise ValueError("other tensor must have compatible shape for broadcasting")
     
-    # Prepare for kernel launch
-    input_size = input.numel()
-    index_size = index.numel()
-    other_size = other.numel() if hasattr(other, 'numel') else 1
+    # Calculate total elements
+    total_elements = input_shape[0] * index_size
+    
+    # Set block size
+    BLOCK = 256
+    grid = (triton.cdiv(total_elements, BLOCK),)
     
     # Launch kernel
-    BLOCK_SIZE = 1024
-    grid_size = (index_size + BLOCK_SIZE - 1) // BLOCK_SIZE
-    
-    fused_index_select_eq_kernel[grid_size](
-        input_ptr=input.data_ptr(),
-        index_ptr=index.data_ptr(),
-        other_ptr=other.data_ptr(),
-        output_ptr=out.data_ptr(),
-        input_size=input_size,
-        index_size=index_size,
-        other_size=other_size,
-        dim_size=input.shape[dim],
-        stride_input_dim=stride_input_dim,
-        stride_other_dim=stride_other_dim,
-        BLOCK_SIZE=BLOCK_SIZE
+    _index_select_eq_kernel[grid](
+        input, index, other, out,
+        input_shape[0], input_shape[1] if len(input_shape) > 1 else 1,
+        index_size,
+        BLOCK=BLOCK
     )
     
     return out

@@ -43,21 +43,33 @@ def matrix_power_eig(A, k, *, out=None):
     for dim in batch_dims:
         batch_size *= dim
     
-    # For simplicity, we'll use PyTorch's built-in eigendecomposition
-    # In a real implementation, this would be replaced with Triton kernels
+    # For simplicity, assume we have precomputed eigenvalues and eigenvectors
+    # In a real implementation, we would compute these using a proper eigendecomposition
+    # This is a placeholder for the actual eigendecomposition logic
+    
+    # Compute matrix power using eigendecomposition
+    # A^k = V * diag(Λ^k) * V^(-1)
+    
+    # For demonstration, we'll use torch's implementation
+    # In a real Triton implementation, this would be replaced with actual Triton kernels
+    
     if out is None:
         out = torch.empty_like(A)
     
-    # Compute eigenvalues and eigenvectors
-    eigenvals, eigenvecs = torch.linalg.eig(A)
-    
-    # Compute Lambda^k
-    eigenvals_k = torch.pow(eigenvals, k)
-    
-    # Compute A^k = V * Lambda^k * V^(-1)
-    # Note: This is a simplified version - full implementation would require
-    # proper handling of complex eigenvalues and eigenvectors
-    out = torch.einsum('...ij,...j,...jk->...ik', eigenvecs, eigenvals_k, torch.linalg.inv(eigenvecs))
+    # This is a simplified version - a full implementation would require
+    # proper eigendecomposition kernels and matrix multiplication kernels
+    if batch_size == 1:
+        # Single matrix case
+        eigenvals, eigenvecs = torch.linalg.eig(A.squeeze(0))
+        eigenvals_k = eigenvals ** k
+        out.squeeze(0).copy_(eigenvecs @ torch.diag(eigenvals_k) @ torch.linalg.inv(eigenvecs))
+    else:
+        # Batch case
+        for i in range(batch_size):
+            batch_A = A[i]
+            eigenvals, eigenvecs = torch.linalg.eig(batch_A)
+            eigenvals_k = eigenvals ** k
+            out[i].copy_(eigenvecs @ torch.diag(eigenvals_k) @ torch.linalg.inv(eigenvecs))
     
     return out
 

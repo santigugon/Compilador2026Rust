@@ -15,7 +15,6 @@ def _logit_kernel(x_ptr, out_ptr, n: tl.constexpr, eps: tl.constexpr, BLOCK: tl.
     
     # Compute logit: log(x / (1 - x))
     y = tl.log(x / (1.0 - x))
-    
     tl.store(out_ptr + offsets, y, mask=mask)
 
 def logit(input, eps=None, *, out=None):
@@ -29,10 +28,10 @@ def logit(input, eps=None, *, out=None):
     if out is None:
         out = torch.empty_like(input)
     else:
-        assert out.shape == input.shape, "Output tensor must have the same shape as input"
-        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input"
+        if out.shape != input.shape:
+            raise ValueError("out tensor must have the same shape as input")
     
-    # Handle special case where eps is None and input is outside [0, 1]
+    # Handle special case when eps is None and input is out of bounds
     if eps is None:
         # Check for invalid values that would produce NaN
         if (input < 0).any() or (input > 1).any():

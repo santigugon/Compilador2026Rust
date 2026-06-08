@@ -4,64 +4,88 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def softmax_kernel(
-    input_ptr,
-    output_ptr,
-    n_cols,
-    n_rows,
-    BLOCK_SIZE: tl.constexpr,
-    dtype: tl.constexpr,
-):
-    row_idx = tl.program_id(0)
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    input_ptrs = input_ptr + row_idx * n_cols + col_offsets
-    output_ptrs = output_ptr + row_idx * n_cols + col_offsets
+def _softmax_kernel(x_ptr, out_ptr, stride_x, stride_out, dim_size: tl.constexpr, BLOCK: tl.constexpr):
+    # Get the program ID for the dimension we're processing
+    pid = tl.program_id(0)
+    
+    # Calculate the starting offset for this block
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    
+    # Create mask for valid elements
+    mask = offsets < dim_size
     
     # Load input data
-    mask = col_offsets < n_cols
-    input_vals = tl.load(input_ptrs, mask=mask, other=-float('inf'))
+    x = tl.load(x_ptr + offsets * stride_x, mask=mask, other=-float('inf'))
     
-    # Apply softmax
-    max_val = tl.max(input_vals, axis=0)
-    exp_vals = tl.exp(input_vals - max_val)
-    sum_exp = tl.sum(exp_vals, axis=0)
-    softmax_vals = exp_vals / sum_exp
+    # Subtract max for numerical stability
+    x_max = tl.max(x, axis=0)
+    x = x - x_max
+    
+    # Compute exp
+    x_exp = tl.exp(x)
+    
+    # Compute sum
+    x_sum = tl.sum(x_exp, axis=0)
+    
+    # Compute softmax
+    softmax = x_exp / x_sum
     
     # Store result
-    tl.store(output_ptrs, softmax_vals, mask=mask)
+    tl.store(out_ptr + offsets * stride_out, softmax, mask=mask)
 
 def softmax(input, dim, dtype=None):
+    # Handle dtype casting if specified
     if dtype is not None:
         input = input.to(dtype)
     
-    # Ensure input is contiguous
-    input = input.contiguous()
+    # Create output tensor with same shape and dtype
+    out = torch.empty_like(input)
     
-    # Get input shape and determine dimensions
-    shape = input.shape
-    n_rows = 1
-    n_cols = shape[dim]
+    # Get the size of the specified dimension
+    dim_size = input.shape[dim]
     
-    # Calculate number of rows (product of all dimensions except the one we're softmaxing over)
-    for i, s in enumerate(shape):
-        if i != dim:
-            n_rows *= s
+    # Get the stride for the specified dimension
+    stride = input.stride(dim)
     
-    # Create output tensor
-    output = torch.empty_like(input)
+    # For small dimensions, use a simple approach
+    if dim_size <= 1024:
+        block = 256
+        grid = (triton.cdiv(dim_size, block),)
+        
+        # Create a temporary tensor for the computation
+        temp_input = input.contiguous()
+        temp_out = out.contiguous()
+        
+        _softmax_kernel[grid](
+            temp_input,
+            temp_out,
+            stride,
+            temp_out.stride(dim),
+            dim_size,
+            BLOCK=block
+        )
+    else:
+        # For larger dimensions, we need to handle it differently
+        # This is a simplified approach that works for most cases
+        # For a more robust implementation, we'd need to handle
+        # multi-dimensional cases more carefully
+        
+        # Reshape to handle the softmax along the specified dimension
+        # We'll compute softmax along the last dimension for simplicity
+        # and then reshape back
+        input_flat = input.view(-1, dim_size)
+        out_flat = out.view(-1, dim_size)
+        
+        for i in range(input_flat.shape[0]):
+            # Compute softmax for each slice
+            slice_input = input_flat[i]
+            slice_out = out_flat[i]
+            
+            # Get max for numerical stability
+            max_val = slice_input.max()
+            exp_vals = (slice_input - max_val).exp()
+            sum_vals = exp_vals.sum()
+            slice_out.copy_(exp_vals / sum_vals)
     
-    # Launch kernel
-    BLOCK_SIZE = triton.next_power_of_2(n_cols)
-    grid = (n_rows,)
-    
-    softmax_kernel[grid](
-        input_ptr=input.data_ptr(),
-        output_ptr=output.data_ptr(),
-        n_cols=n_cols,
-        n_rows=n_rows,
-        BLOCK_SIZE=BLOCK_SIZE,
-        dtype=input.dtype
-    )
-    
-    return output
+    return out
 ```

@@ -1,178 +1,96 @@
 import torch
 import triton
 import triton.language as tl
-import math
+from typing import Optional
 
 @triton.jit
-def _det_kernel(A_ptr, out_ptr, batch_size: tl.constexpr, n: tl.constexpr, stride_batch: tl.constexpr, stride_row: tl.constexpr, stride_col: tl.constexpr, BLOCK: tl.constexpr):
+def det_kernel(A_ptr, out_ptr, n, batch_size, stride_a, stride_out, BLOCK_SIZE: tl.constexpr):
     batch_idx = tl.program_id(0)
-    if batch_idx >= batch_size:
-        return
+    if batch_size > 0:
+        A_ptr = A_ptr + batch_idx * stride_a
+        out_ptr = out_ptr + batch_idx * stride_out
     
-    # Load matrix A for this batch
-    A_block_ptr = tl.make_block_ptr(
-        base=A_ptr + batch_idx * stride_batch,
-        shape=(n, n),
-        strides=(stride_row, stride_col),
-        block_shape=(BLOCK, BLOCK),
-        order=(0, 1)
-    )
+    # Initialize determinant to 1
+    det = tl.full([1], 1.0, dtype=tl.float64)
     
-    # Copy matrix to shared memory for in-place operations
-    A_shared = tl.shared_ptr(
-        tl.zeros((BLOCK, BLOCK), dtype=tl.float32),
-        shape=(BLOCK, BLOCK),
-        strides=(BLOCK, 1)
-    )
+    # Copy input matrix to local memory
+    A_local = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float64)
+    for i in range(BLOCK_SIZE):
+        for j in range(BLOCK_SIZE):
+            A_local[i, j] = tl.load(A_ptr + i * stride_a + j)
     
-    # Load A into shared memory
-    A = tl.load(A_block_ptr, boundary_check=(0, 1))
-    
-    # Perform LU decomposition with partial pivoting
-    # For simplicity, we'll use a basic approach for small matrices
-    # In practice, this would be more complex
-    
-    # Initialize determinant
-    det = 1.0
-    
-    # Simple approach for small matrices - use cofactor expansion
-    # This is a simplified version for demonstration
-    if n == 1:
-        det = A[0, 0]
-    elif n == 2:
-        det = A[0, 0] * A[1, 1] - A[0, 1] * A[1, 0]
-    elif n == 3:
-        det = (A[0, 0] * (A[1, 1] * A[2, 2] - A[1, 2] * A[2, 1]) -
-               A[0, 1] * (A[1, 0] * A[2, 2] - A[1, 2] * A[2, 0]) +
-               A[0, 2] * (A[1, 0] * A[2, 1] - A[1, 1] * A[2, 0]))
-    else:
-        # For larger matrices, we'll use a more general approach
-        # This is a placeholder - a full implementation would be more complex
-        det = 0.0
+    # Compute determinant using LU decomposition
+    for k in range(BLOCK_SIZE):
+        # Find pivot
+        max_val = tl.abs(A_local[k, k])
+        pivot_row = k
+        for i in range(k + 1, BLOCK_SIZE):
+            if tl.abs(A_local[i, k]) > max_val:
+                max_val = tl.abs(A_local[i, k])
+                pivot_row = i
+        
+        # Swap rows if needed
+        if pivot_row != k:
+            for j in range(BLOCK_SIZE):
+                temp = A_local[k, j]
+                A_local[k, j] = A_local[pivot_row, j]
+                A_local[pivot_row, j] = temp
+            det = -det
+        
+        # Check for zero pivot
+        if A_local[k, k] == 0.0:
+            det = 0.0
+            break
+        
+        # Update determinant
+        det = det * A_local[k, k]
+        
+        # Perform elimination
+        for i in range(k + 1, BLOCK_SIZE):
+            factor = A_local[i, k] / A_local[k, k]
+            for j in range(k + 1, BLOCK_SIZE):
+                A_local[i, j] = A_local[i, j] - factor * A_local[k, j]
     
     # Store result
-    tl.store(out_ptr + batch_idx, det)
-
-@triton.jit
-def _det_kernel_general(A_ptr, out_ptr, batch_size: tl.constexpr, n: tl.constexpr, stride_batch: tl.constexpr, stride_row: tl.constexpr, stride_col: tl.constexpr, BLOCK: tl.constexpr):
-    batch_idx = tl.program_id(0)
-    if batch_idx >= batch_size:
-        return
-    
-    # For simplicity, we'll use a basic approach for small matrices
-    # In practice, this would involve more complex LU decomposition
-    
-    # Load matrix A for this batch
-    A_block_ptr = tl.make_block_ptr(
-        base=A_ptr + batch_idx * stride_batch,
-        shape=(n, n),
-        strides=(stride_row, stride_col),
-        block_shape=(BLOCK, BLOCK),
-        order=(0, 1)
-    )
-    
-    # Load A into shared memory
-    A = tl.load(A_block_ptr, boundary_check=(0, 1))
-    
-    # Simple determinant calculation for small matrices
-    det = 0.0
-    
-    if n == 1:
-        det = A[0, 0]
-    elif n == 2:
-        det = A[0, 0] * A[1, 1] - A[0, 1] * A[1, 0]
-    elif n == 3:
-        det = (A[0, 0] * (A[1, 1] * A[2, 2] - A[1, 2] * A[2, 1]) -
-               A[0, 1] * (A[1, 0] * A[2, 2] - A[1, 2] * A[2, 0]) +
-               A[0, 2] * (A[1, 0] * A[2, 1] - A[1, 1] * A[2, 0]))
-    else:
-        # For larger matrices, we'll use a more general approach
-        # This is a placeholder - a full implementation would be more complex
-        # For now, we'll just return 0 for larger matrices
-        det = 0.0
-    
-    # Store result
-    tl.store(out_ptr + batch_idx, det)
-
-def _det_kernel_simple(A_ptr, out_ptr, batch_size: tl.constexpr, n: tl.constexpr, stride_batch: tl.constexpr, stride_row: tl.constexpr, stride_col: tl.constexpr, BLOCK: tl.constexpr):
-    batch_idx = tl.program_id(0)
-    if batch_idx >= batch_size:
-        return
-    
-    # Load matrix A for this batch
-    A_block_ptr = tl.make_block_ptr(
-        base=A_ptr + batch_idx * stride_batch,
-        shape=(n, n),
-        strides=(stride_row, stride_col),
-        block_shape=(BLOCK, BLOCK),
-        order=(0, 1)
-    )
-    
-    # Load A into shared memory
-    A = tl.load(A_block_ptr, boundary_check=(0, 1))
-    
-    # Simple determinant calculation for small matrices
-    det = 0.0
-    
-    if n == 1:
-        det = A[0, 0]
-    elif n == 2:
-        det = A[0, 0] * A[1, 1] - A[0, 1] * A[1, 0]
-    elif n == 3:
-        det = (A[0, 0] * (A[1, 1] * A[2, 2] - A[1, 2] * A[2, 1]) -
-               A[0, 1] * (A[1, 0] * A[2, 2] - A[1, 2] * A[2, 0]) +
-               A[0, 2] * (A[1, 0] * A[2, 1] - A[1, 1] * A[2, 0]))
-    else:
-        # For larger matrices, we'll use torch's implementation
-        det = 0.0
-    
-    # Store result
-    tl.store(out_ptr + batch_idx, det)
+    tl.store(out_ptr, det)
 
 def linalg_det(A, *, out=None):
-    # Handle scalar case
     if A.dim() < 2:
-        raise ValueError("Input must be at least 2D")
+        raise ValueError("Input tensor must have at least 2 dimensions")
     
-    # Get batch dimensions and matrix size
-    *batch_dims, n, m = A.shape
-    if n != m:
-        raise ValueError("Input must be square matrices")
+    batch_dims = A.shape[:-2]
+    n = A.shape[-1]
     
-    # Handle batch dimensions
+    if A.shape[-2] != n:
+        raise ValueError("Input tensor must be square matrices")
+    
     batch_size = 1
     for dim in batch_dims:
         batch_size *= dim
     
-    # Create output tensor
     if out is None:
-        out = torch.empty(batch_dims, dtype=A.dtype, device=A.device)
-    else:
-        if out.shape != batch_dims or out.dtype != A.dtype or out.device != A.device:
-            raise ValueError("Output tensor has incorrect shape, dtype, or device")
+        out = torch.empty(batch_dims, dtype=torch.float64, device=A.device)
     
-    # For small matrices, we can compute determinants directly
-    if n <= 3:
-        # Use a simple approach for small matrices
-        if batch_size == 1:
-            # Single matrix case
-            if n == 1:
-                det_val = A[0, 0]
-            elif n == 2:
-                det_val = A[0, 0] * A[1, 1] - A[0, 1] * A[1, 0]
-            elif n == 3:
-                det_val = (A[0, 0] * (A[1, 1] * A[2, 2] - A[1, 2] * A[2, 1]) -
-                          A[0, 1] * (A[1, 0] * A[2, 2] - A[1, 2] * A[2, 0]) +
-                          A[0, 2] * (A[1, 0] * A[2, 1] - A[1, 1] * A[2, 0]))
-            out.fill_(det_val)
-        else:
-            # Batch case
-            for i in range(batch_size):
-                batch_idx = i
-                if n == 1:
-                    det_val = A[batch_idx, 0, 0]
-                elif n == 2:
-                    det_val = A[batch_idx, 0, 0] * A[batch_idx, 1, 1] - A[batch_idx, 0, 1] * A[batch_idx, 1, 0]
-                elif n == 3:
-                    det_val = (A[batch_idx, 0, 0] * (A[batch_idx, 1, 1] * A[batch_idx, 2, 2] - A[batch_idx, 1, 2] * A[batch_idx, 2, 1]) -
-                              A[
+    if batch_size == 0:
+        batch_size = 1
+    
+    # Launch kernel
+    grid = (batch_size,)
+    BLOCK_SIZE = 32
+    
+    # Ensure A is contiguous and has the right dtype
+    A_contiguous = A.contiguous().to(torch.float64)
+    out_contiguous = out.contiguous()
+    
+    # Launch kernel
+    det_kernel[grid](
+        A_contiguous,
+        out_contiguous,
+        n,
+        batch_size,
+        A_contiguous.stride(-2),
+        out_contiguous.stride(0) if out_contiguous.dim() > 0 else 1,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return out

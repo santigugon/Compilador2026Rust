@@ -4,68 +4,62 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _norm_kernel(x_ptr, out_ptr, n, dim_size, stride, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    # For simplicity, we compute L2 norm for the entire tensor
-    # In practice, this would need to be more sophisticated for specific dimensions
-    norm = tl.sqrt(tl.sum(x * x, axis=0) + 1e-12)
-    tl.store(out_ptr + offsets, norm, mask=mask)
-
-@triton.jit
-def _cosine_similarity_kernel(x1_ptr, x2_ptr, out_ptr, n, dim_size, stride, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x1 = tl.load(x1_ptr + offsets, mask=mask, other=0.0)
-    x2 = tl.load(x2_ptr + offsets, mask=mask, other=0.0)
+def _normalize_and_compute_similarity_kernel(
+    x1_ptr, x2_ptr, output_ptr,
+    x1_size, x2_size, dim_size,
+    dim, p_norm, eps_norm, eps_similarity,
+    BLOCK_SIZE: tl.constexpr
+):
+    # Get the block index
+    block_idx = tl.program_id(0)
     
-    # Compute dot product
-    dot_product = tl.sum(x1 * x2, axis=0)
+    # Calculate the starting index for this block
+    start_idx = block_idx * BLOCK_SIZE
     
-    # Compute norms
-    norm_x1 = tl.sqrt(tl.sum(x1 * x1, axis=0) + 1e-12)
-    norm_x2 = tl.sqrt(tl.sum(x2 * x2, axis=0) + 1e-12)
+    # Load x1 and x2 data
+    x1_block = tl.load(x1_ptr + start_idx, mask=start_idx < x1_size)
+    x2_block = tl.load(x2_ptr + start_idx, mask=start_idx < x2_size)
+    
+    # Compute L_p norm
+    norm_x1 = tl.sum(tl.abs(x1_block) ** p_norm, axis=0) ** (1.0 / p_norm)
+    norm_x2 = tl.sum(tl.abs(x2_block) ** p_norm, axis=0) ** (1.0 / p_norm)
+    
+    # Normalize vectors
+    x1_normalized = x1_block / (norm_x1 + eps_norm)
+    x2_normalized = x2_block / (norm_x2 + eps_norm)
     
     # Compute cosine similarity
-    similarity = dot_product / (norm_x1 * norm_x2 + 1e-8)
-    tl.store(out_ptr + offsets, similarity, mask=mask)
+    dot_product = tl.sum(x1_normalized * x2_normalized, axis=0)
+    similarity = dot_product / (norm_x1 * norm_x2 + eps_similarity)
+    
+    # Store result
+    tl.store(output_ptr + block_idx, similarity)
 
 def normalized_cosine_similarity(x1: torch.Tensor, x2: torch.Tensor, dim: int = 1, eps_similarity: float = 1e-8, p_norm: float = 2, eps_norm: float = 1e-12) -> torch.Tensor:
-    # Normalize the tensors along the specified dimension
-    # For simplicity, we'll compute the L2 norm for the entire tensor
-    # In a more complete implementation, we would properly handle the dimension
-    # For now, we'll compute the full cosine similarity
+    # Ensure inputs are on the same device and are contiguous
+    x1 = x1.contiguous()
+    x2 = x2.contiguous()
+    
+    # Get the size of the specified dimension
+    dim_size = x1.size(dim)
+    
+    # Compute the total number of elements
+    total_elements = x1.numel()
     
     # Create output tensor
-    out = torch.empty_like(x1)
+    output = torch.empty((), dtype=torch.float32, device=x1.device)
     
-    # Flatten tensors for processing
-    x1_flat = x1.flatten()
-    x2_flat = x2.flatten()
-    out_flat = out.flatten()
+    # Define block size
+    BLOCK_SIZE = 1024
     
-    # Compute cosine similarity
-    n = x1_flat.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    # Launch kernel
+    grid = (total_elements + BLOCK_SIZE - 1) // BLOCK_SIZE
+    _normalize_and_compute_similarity_kernel[grid](
+        x1, x2, output,
+        x1.numel(), x2.numel(), dim_size,
+        dim, p_norm, eps_norm, eps_similarity,
+        BLOCK_SIZE
+    )
     
-    # For this simplified implementation, we'll use PyTorch's built-in functions
-    # since the full Triton implementation would be quite complex for this operation
-    # and the performance gain might not be significant
-    
-    # Normalize tensors
-    x1_norm = x1 / (torch.norm(x1, p=p_norm, dim=dim, keepdim=True) + eps_norm)
-    x2_norm = x2 / (torch.norm(x2, p=p_norm, dim=dim, keepdim=True) + eps_norm)
-    
-    # Compute cosine similarity
-    similarity = torch.sum(x1_norm * x2_norm, dim=dim)
-    
-    # Apply epsilon to similarity
-    similarity = similarity / (torch.norm(x1_norm, p=p_norm, dim=dim, keepdim=True) * 
-                              torch.norm(x2_norm, p=p_norm, dim=dim, keepdim=True) + eps_similarity)
-    
-    return similarity
+    return output
 ```

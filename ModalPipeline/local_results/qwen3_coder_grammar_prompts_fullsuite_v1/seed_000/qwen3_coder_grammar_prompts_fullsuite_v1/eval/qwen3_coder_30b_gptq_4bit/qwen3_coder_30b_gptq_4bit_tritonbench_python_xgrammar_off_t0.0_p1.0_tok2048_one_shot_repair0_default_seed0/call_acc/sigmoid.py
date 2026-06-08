@@ -22,7 +22,6 @@ def sigmoid(input, *, out=None):
         out = torch.empty_like(input)
     else:
         assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
-        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input tensor"
     
     n_elements = input.numel()
     BLOCK_SIZE = 1024

@@ -3,115 +3,84 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _max_kernel(x_ptr, out_ptr, indices_ptr, n_rows, n_cols, dim_size: tl.constexpr, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    if pid >= n_rows:
+def max_kernel(
+    input_ptr,
+    output_ptr,
+    indices_ptr,
+    input_row_stride,
+    output_row_stride,
+    n_rows,
+    n_cols,
+    BLOCK_SIZE: tl.constexpr,
+    keepdim: tl.constexpr
+):
+    row_idx = tl.program_id(0)
+    if row_idx >= n_rows:
         return
     
-    # Load the row data
-    row_offsets = pid * n_cols
-    row_ptr = x_ptr + row_offsets
+    input_row = input_ptr + row_idx * input_row_stride
+    output_row = output_ptr + row_idx * output_row_stride
+    indices_row = indices_ptr + row_idx * output_row_stride
     
-    # Initialize max and index
-    max_val = tl.full([], -float('inf'), dtype=tl.float32)
-    max_idx = tl.full([], 0, dtype=tl.int32)
+    max_val = tl.full([1], -float('inf'), dtype=tl.float32)
+    max_idx = tl.full([1], 0, dtype=tl.int32)
     
-    # Iterate through the dimension
-    for i in range(0, dim_size, BLOCK_SIZE):
-        # Calculate offsets
-        offsets = i + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < dim_size
+    for col_start in range(0, n_cols, BLOCK_SIZE):
+        col_offset = tl.arange(0, BLOCK_SIZE) + col_start
+        mask = col_offset < n_cols
         
-        # Load values
-        values = tl.load(row_ptr + offsets, mask=mask, other=-float('inf'))
+        vals = tl.load(input_row + col_offset, mask=mask, other=-float('inf'))
+        current_max = tl.max(vals)
+        current_max_idx = tl.argmin(vals, axis=0)
         
-        # Find max in this block
-        block_max = tl.max(values)
-        block_max_idx = tl.arg_max(values)
-        
-        # Update global max
-        if block_max > max_val:
-            max_val = block_max
-            max_idx = block_max_idx + i
+        if current_max > max_val:
+            max_val = current_max
+            max_idx = current_max_idx
     
-    # Store results
-    tl.store(out_ptr + pid, max_val)
-    tl.store(indices_ptr + pid, max_idx)
+    tl.store(output_row, max_val)
+    tl.store(indices_row, max_idx)
 
 def max(input, dim, keepdim=False, *, out=None):
-    # Handle negative dimension
+    if out is not None:
+        raise NotImplementedError("out parameter is not supported")
+    
     if dim < 0:
         dim = input.dim() + dim
     
-    # Validate dimension
-    if dim < 0 or dim >= input.dim():
-        raise ValueError(f"Dimension {dim} is out of range for input with {input.dim()} dimensions")
+    if dim >= input.dim():
+        raise ValueError("dim out of range")
     
-    # Get output shape
-    input_shape = input.shape
-    output_shape = list(input_shape)
+    input = input.contiguous()
+    shape = input.shape
+    n_rows = 1
+    n_cols = shape[dim]
     
+    for i in range(len(shape)):
+        if i != dim:
+            n_rows *= shape[i]
+    
+    output_shape = list(shape)
     if keepdim:
         output_shape[dim] = 1
     else:
         output_shape.pop(dim)
     
-    # Create output tensors
-    if out is not None:
-        max_values = out[0]
-        max_indices = out[1]
-    else:
-        max_values = torch.empty(output_shape, dtype=input.dtype, device=input.device)
-        max_indices = torch.empty(output_shape, dtype=torch.long, device=input.device)
+    output = torch.empty(output_shape, dtype=torch.float32, device=input.device)
+    indices = torch.empty(output_shape, dtype=torch.int64, device=input.device)
     
-    # Get dimensions
-    n_rows = 1
-    n_cols = 1
-    dim_size = input_shape[dim]
+    BLOCK_SIZE = 1024
+    grid = (n_rows, 1, 1)
     
-    # Calculate total elements
-    for i in range(input.dim()):
-        if i == dim:
-            n_cols *= input_shape[i]
-        else:
-            n_rows *= input_shape[i]
+    max_kernel[grid](
+        input,
+        output,
+        indices,
+        input.stride(0) if input.dim() > 1 else 1,
+        output.stride(0) if output.dim() > 1 else 1,
+        n_rows,
+        n_cols,
+        BLOCK_SIZE,
+        keepdim
+    )
     
-    # Handle special case where we're reducing all dimensions
-    if input.dim() == 1:
-        # For 1D tensor, just find max and argmax
-        max_val = input.max()
-        max_idx = input.argmax()
-        
-        if out is not None:
-            out[0].copy_(max_val)
-            out[1].copy_(max_idx)
-        else:
-            return (max_val, max_idx)
-    
-    # For multi-dimensional case, use Triton kernel
-    if n_rows > 0:
-        block_size = 256
-        grid_size = triton.cdiv(n_rows, block_size)
-        
-        # Create a temporary contiguous tensor for kernel
-        if input.is_contiguous():
-            x_ptr = input.data_ptr()
-        else:
-            input = input.contiguous()
-            x_ptr = input.data_ptr()
-        
-        # Launch kernel
-        _max_kernel[grid_size](
-            x_ptr,
-            max_values.data_ptr(),
-            max_indices.data_ptr(),
-            n_rows,
-            n_cols,
-            dim_size,
-            BLOCK_SIZE=block_size
-        )
-    
-    if out is not None:
-        return out
-    else:
-        return (max_values, max_indices)
+    return (output, indices)

@@ -8,9 +8,7 @@ def _log1p_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    # Compute log(1 + x) using the safe implementation
-    # For small values, we use the series expansion or direct log
-    # Here we use the standard log1p implementation which is numerically stable
+    # Compute log(1 + x) more accurately for small values
     y = tl.log1p(x)
     tl.store(out_ptr + offsets, y, mask=mask)
 

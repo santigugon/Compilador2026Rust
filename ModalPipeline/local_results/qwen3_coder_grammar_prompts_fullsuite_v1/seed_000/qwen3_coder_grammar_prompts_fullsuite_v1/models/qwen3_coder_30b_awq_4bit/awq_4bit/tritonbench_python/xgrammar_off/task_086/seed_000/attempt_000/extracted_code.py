@@ -3,27 +3,28 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _log_tanh_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+def log_tanh_kernel(X, Y, N, BLOCK_SIZE: int = 1024):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    # Compute natural logarithm
-    log_x = tl.log(x)
-    # Apply hyperbolic tangent
-    tanh_log_x = 2.0 / (1.0 + tl.exp(-2.0 * log_x)) - 1.0
-    tl.store(out_ptr + offsets, tanh_log_x, mask=mask)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    x = tl.load(X + offsets, mask=mask)
+    y = tl.tanh(tl.log(x))
+    tl.store(Y + offsets, y, mask=mask)
 
-def log_tanh(input, out=None):
+def log_tanh(input, out=None) -> torch.Tensor:
     if out is None:
-        out = torch.empty_like(input)
-    else:
-        assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
-        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input tensor"
+        out = torch.empty_like(input, dtype=torch.float32, device=input.device)
     
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    assert input.dtype == torch.float32, "Input must be float32"
+    assert input.device == out.device, "Input and output must be on the same device"
+    assert input.is_contiguous(), "Input tensor must be contiguous"
+    assert out.is_contiguous(), "Output tensor must be contiguous"
     
-    _log_tanh_kernel[grid](input, out, n, BLOCK=block)
+    N = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(N, BLOCK_SIZE),)
+    
+    log_tanh_kernel[grid](input, out, N, BLOCK_SIZE=BLOCK_SIZE)
+    
     return out

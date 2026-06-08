@@ -3,34 +3,47 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _gelu_kernel(x_ptr, out_ptr, n: tl.constexpr, approximate: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+def gelu_kernel(
+    input_ptr,
+    output_ptr,
+    n_elements,
+    approximate,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
     
-    if approximate == 0:  # exact GELU
-        # GELU = x * Φ(x) where Φ is the CDF of the standard normal distribution
-        # Using the approximation: GELU = 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x^3)))
-        sqrt_2_over_pi = 0.7978845608028654  # sqrt(2/pi)
-        x_cubed = x * x * x
-        tanh_arg = sqrt_2_over_pi * (x + 0.044715 * x_cubed)
-        gelu_value = 0.5 * x * (1.0 + tl.tanh(tanh_arg))
-    else:  # approximate GELU using tanh
-        # Approximate GELU = 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x^3)))
-        sqrt_2_over_pi = 0.7978845608028654  # sqrt(2/pi)
-        x_cubed = x * x * x
-        tanh_arg = sqrt_2_over_pi * (x + 0.044715 * x_cubed)
-        gelu_value = 0.5 * x * (1.0 + tl.tanh(tanh_arg))
+    if approximate == 1:
+        # Approximate GELU using tanh
+        output = 0.5 * input * (1 + tl.tanh(0.7978845608 * (input + 0.044715 * input * input * input)))
+    else:
+        # Exact GELU using erf
+        output = 0.5 * input * (1 + tl.erf(input / tl.sqrt(2.0)))
     
-    tl.store(out_ptr + offsets, gelu_value, mask=mask)
+    tl.store(output_ptr + offsets, output, mask=mask)
 
 def gelu(input, approximate='none'):
-    out = torch.empty_like(input)
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    if approximate not in ['none', 'tanh']:
+        raise ValueError("approximate must be 'none' or 'tanh'")
     
-    approximate_flag = 0 if approximate == 'none' else 1
-    _gelu_kernel[grid](input, out, n, approximate_flag, BLOCK=block)
-    return out
+    input = input.contiguous()
+    output = torch.empty_like(input)
+    
+    n_elements = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    approximate_flag = 1 if approximate == 'tanh' else 0
+    
+    gelu_kernel[grid](
+        input,
+        output,
+        n_elements,
+        approximate_flag,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return output

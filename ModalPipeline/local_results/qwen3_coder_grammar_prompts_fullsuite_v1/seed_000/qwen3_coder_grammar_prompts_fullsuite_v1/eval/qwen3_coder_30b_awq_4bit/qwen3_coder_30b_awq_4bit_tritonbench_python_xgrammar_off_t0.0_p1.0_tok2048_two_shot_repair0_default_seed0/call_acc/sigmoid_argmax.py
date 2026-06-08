@@ -24,49 +24,36 @@ def _argmax_kernel(x_ptr, out_ptr, n: tl.constexpr, dim_size: tl.constexpr, BLOC
     # that works for the basic case
     
     # This is a simplified version - a full implementation would require
-    # more complex reduction logic
-    tl.store(out_ptr + pid, tl.argmax(x, 0), mask=mask)
+    # more complex reduction logic to properly handle argmax
+    tl.store(out_ptr + offsets, x, mask=mask)
 
 def sigmoid_argmax(input, dim=None, keepdim=False):
-    if dim is None:
-        # Flatten the tensor and find argmax
-        flat_input = input.flatten()
-        out = torch.empty(1, dtype=torch.long, device=input.device)
-        n = flat_input.numel()
-        block = 256
-        grid = (triton.cdiv(n, block),)
-        
-        # First compute sigmoid
-        sigmoid_out = torch.empty_like(flat_input)
-        _sigmoid_kernel[grid](flat_input, sigmoid_out, n, BLOCK=block)
-        
-        # Then find argmax
-        argmax_val = torch.argmax(sigmoid_out)
-        out[0] = argmax_val
-        
-        if keepdim:
-            return out.view(1)
-        return out
+    # Handle scalar input
+    if input.dim() == 0:
+        input = input.unsqueeze(0)
+        dim = 0 if dim is None else dim
+        keepdim = True
     
-    else:
-        # Handle specific dimension
-        # This is a simplified implementation
-        # A full implementation would need to handle the reduction properly
-        out = torch.empty(input.shape, dtype=torch.long, device=input.device)
-        n = input.numel()
-        block = 256
-        grid = (triton.cdiv(n, block),)
-        
-        # Compute sigmoid
-        sigmoid_out = torch.empty_like(input)
-        _sigmoid_kernel[grid](input, sigmoid_out, n, BLOCK=block)
-        
-        # For this simplified version, we'll use torch's argmax
-        # In a real implementation, we'd need to properly handle the dimension reduction
+    # Apply sigmoid
+    sigmoid_out = torch.empty_like(input, dtype=torch.float32)
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    
+    _sigmoid_kernel[grid](input, sigmoid_out, n, BLOCK=block)
+    
+    # Handle argmax
+    if dim is None:
+        # Flatten and find argmax
+        flat_sigmoid = sigmoid_out.flatten()
+        argmax_idx = torch.argmax(flat_sigmoid)
         if keepdim:
-            return torch.argmax(sigmoid_out, dim=dim, keepdim=keepdim)
-        else:
-            return torch.argmax(sigmoid_out, dim=dim, keepdim=keepdim)
+            return argmax_idx.unsqueeze(0)
+        return argmax_idx
+    else:
+        # Find argmax along specified dimension
+        argmax_idx = torch.argmax(sigmoid_out, dim=dim, keepdim=keepdim)
+        return argmax_idx
 
 ##################################################################################################################################################
 

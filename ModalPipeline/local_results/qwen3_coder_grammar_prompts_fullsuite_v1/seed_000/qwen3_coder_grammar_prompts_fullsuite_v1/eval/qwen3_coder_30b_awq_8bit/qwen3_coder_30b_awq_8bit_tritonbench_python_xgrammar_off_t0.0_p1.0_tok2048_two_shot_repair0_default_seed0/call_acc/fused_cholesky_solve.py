@@ -23,138 +23,139 @@ def _cholesky_kernel(A_ptr, L_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
         a_offsets = row * n + col + tl.arange(0, BLOCK)
         a_block = tl.load(A_ptr + a_offsets, mask=(col + tl.arange(0, BLOCK)) < n, other=0.0)
         
-        # Compute L[row, col] = sqrt(A[row, col] - sum(L[row, :k]^2))
-        if row == col:
-            # Diagonal element
-            sum_sq = 0.0
-            for k in range(0, col, BLOCK):
-                l_offsets = row * n + k + tl.arange(0, BLOCK)
-                l_block = tl.load(L_ptr + l_offsets, mask=(k + tl.arange(0, BLOCK)) < col, other=0.0)
-                sum_sq += tl.sum(l_block * l_block)
-            
+        # Load corresponding L elements
+        l_offsets = row * n + col + tl.arange(0, BLOCK)
+        l_block = tl.load(L_ptr + l_offsets, mask=(col + tl.arange(0, BLOCK)) < n, other=0.0)
+        
+        # Compute the diagonal element
+        if row == col // BLOCK:
             # Compute diagonal element
-            diag_val = a_block[0] - sum_sq
-            l_val = tl.sqrt(diag_val)
-            tl.store(L_ptr + row * n + col, l_val)
-            
-        else:
-            # Off-diagonal element
-            sum_prod = 0.0
-            for k in range(0, min(col, row), BLOCK):
-                l_row_offsets = row * n + k + tl.arange(0, BLOCK)
-                l_col_offsets = col * n + k + tl.arange(0, BLOCK)
-                l_row_block = tl.load(L_ptr + l_row_offsets, mask=(k + tl.arange(0, BLOCK)) < min(col, row), other=0.0)
-                l_col_block = tl.load(L_ptr + l_col_offsets, mask=(k + tl.arange(0, BLOCK)) < min(col, row), other=0.0)
-                sum_prod += tl.sum(l_row_block * l_col_block)
-            
-            # Compute off-diagonal element
-            if row < col:
-                l_val = (a_block[0] - sum_prod) / tl.load(L_ptr + col * n + col)
-                tl.store(L_ptr + row * n + col, l_val)
-            else:
-                # For row > col, L[row, col] = 0
-                tl.store(L_ptr + row * n + col, 0.0)
+            sum_val = 0.0
+            for k in range(0, row):
+                sum_val += l_block[k] * l_block[k]
+            diag_val = tl.sqrt(a_block[row - col] - sum_val)
+            l_block[row - col] = diag_val
+            tl.store(L_ptr + row * n + row, diag_val)
+        
+        # Compute off-diagonal elements
+        if row > col // BLOCK:
+            # Compute L[row, col] = (A[row, col] - sum(L[row, k] * L[col, k])) / L[col, col]
+            sum_val = 0.0
+            for k in range(0, col // BLOCK):
+                sum_val += l_block[k] * l_block[k]
+            if col + row - col // BLOCK < n:
+                l_block[row - col // BLOCK] = (a_block[row - col // BLOCK] - sum_val) / l_block[col // BLOCK]
+                tl.store(L_ptr + row * n + col // BLOCK, l_block[row - col // BLOCK])
 
 @triton.jit
 def _forward_substitution_kernel(L_ptr, b_ptr, x_ptr, n: tl.constexpr, k: tl.constexpr, BLOCK: tl.constexpr):
     # Solve L * x = b using forward substitution
-    # Each thread block handles one column of x
-    
     pid = tl.program_id(0)
+    block_size = BLOCK
+    num_blocks = tl.cdiv(n, BLOCK)
+    
+    # Each thread block handles one column of x
     col = pid
     
     if col >= k:
         return
     
+    # For each row
     for row in range(0, n, BLOCK):
         # Load a block of L and b
-        l_offsets = row * n + col + tl.arange(0, BLOCK)
-        b_offsets = row * k + col + tl.arange(0, BLOCK)
-        
+        l_offsets = row + tl.arange(0, BLOCK) * n
         l_block = tl.load(L_ptr + l_offsets, mask=(row + tl.arange(0, BLOCK)) < n, other=0.0)
-        b_block = tl.load(b_ptr + b_offsets, mask=(row + tl.arange(0, BLOCK)) < n, other=0.0)
         
-        # Compute x[row, col] = (b[row, col] - sum(L[row, :k] * x[:k, col])) / L[row, row]
+        b_offsets = col + tl.arange(0, BLOCK) * k
+        b_block = tl.load(b_ptr + b_offsets, mask=(col + tl.arange(0, BLOCK)) < k, other=0.0)
+        
+        # Compute x[row, col]
         if row == 0:
-            x_val = b_block[0] / tl.load(L_ptr + row * n + row)
-            tl.store(x_ptr + row * k + col, x_val)
+            x_block = b_block[0] / l_block[0]
+            tl.store(x_ptr + row * k + col, x_block)
         else:
-            sum_prod = 0.0
-            for i in range(0, row, BLOCK):
-                l_offsets = row * n + i + tl.arange(0, BLOCK)
-                x_offsets = i * k + col + tl.arange(0, BLOCK)
-                l_block = tl.load(L_ptr + l_offsets, mask=(i + tl.arange(0, BLOCK)) < row, other=0.0)
-                x_block = tl.load(x_ptr + x_offsets, mask=(i + tl.arange(0, BLOCK)) < row, other=0.0)
-                sum_prod += tl.sum(l_block * x_block)
-            
-            x_val = (b_block[0] - sum_prod) / tl.load(L_ptr + row * n + row)
-            tl.store(x_ptr + row * k + col, x_val)
+            # Compute sum of L[row, j] * x[j, col] for j < row
+            sum_val = 0.0
+            for j in range(0, row):
+                sum_val += l_block[j] * tl.load(x_ptr + j * k + col, mask=True)
+            x_block = (b_block[row] - sum_val) / l_block[row]
+            tl.store(x_ptr + row * k + col, x_block)
 
 @triton.jit
 def _backward_substitution_kernel(L_ptr, x_ptr, out_ptr, n: tl.constexpr, k: tl.constexpr, BLOCK: tl.constexpr):
     # Solve L.T * x = b using backward substitution
-    # Each thread block handles one column of x
-    
     pid = tl.program_id(0)
+    block_size = BLOCK
+    num_blocks = tl.cdiv(n, BLOCK)
+    
+    # Each thread block handles one column of x
     col = pid
     
     if col >= k:
         return
     
-    # Process from bottom to top
+    # For each row from bottom to top
     for row in range(n-1, -1, -BLOCK):
-        # Load a block of L and x
-        l_offsets = row * n + col + tl.arange(0, BLOCK)
-        x_offsets = row * k + col + tl.arange(0, BLOCK)
+        # Load a block of L.T and x
+        l_offsets = row + tl.arange(0, BLOCK) * n
+        l_block = tl.load(L_ptr + l_offsets, mask=(row - tl.arange(0, BLOCK)) >= 0, other=0.0)
         
-        l_block = tl.load(L_ptr + l_offsets, mask=(row + tl.arange(0, BLOCK)) < n, other=0.0)
-        x_block = tl.load(x_ptr + x_offsets, mask=(row + tl.arange(0, BLOCK)) < n, other=0.0)
+        x_offsets = col + tl.arange(0, BLOCK) * k
+        x_block = tl.load(x_ptr + x_offsets, mask=(col + tl.arange(0, BLOCK)) < k, other=0.0)
         
-        # Compute x[row, col] = (b[row, col] - sum(L.T[row, :k] * x[:k, col])) / L[row, row]
+        # Compute x[row, col]
         if row == n - 1:
-            x_val = x_block[0] / tl.load(L_ptr + row * n + row)
-            tl.store(out_ptr + row * k + col, x_val)
+            x_block = x_block[0] / l_block[n-1]
+            tl.store(out_ptr + row * k + col, x_block)
         else:
-            sum_prod = 0.0
-            for i in range(row + 1, n, BLOCK):
-                l_offsets = i * n + row + tl.arange(0, BLOCK)
-                x_offsets = i * k + col + tl.arange(0, BLOCK)
-                l_block = tl.load(L_ptr + l_offsets, mask=(i + tl.arange(0, BLOCK)) < n, other=0.0)
-                x_block = tl.load(out_ptr + x_offsets, mask=(i + tl.arange(0, BLOCK)) < n, other=0.0)
-                sum_prod += tl.sum(l_block * x_block)
-            
-            x_val = (x_block[0] - sum_prod) / tl.load(L_ptr + row * n + row)
-            tl.store(out_ptr + row * k + col, x_val)
+            # Compute sum of L[j, row] * x[j, col] for j > row
+            sum_val = 0.0
+            for j in range(row + 1, n):
+                sum_val += l_block[j] * tl.load(out_ptr + j * k + col, mask=True)
+            x_block = (x_block[row] - sum_val) / l_block[row]
+            tl.store(out_ptr + row * k + col, x_block)
 
 def fused_cholesky_solve(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    # Input validation
-    assert A.dim() == 2 and A.size(0) == A.size(1), "A must be a square matrix"
-    assert b.dim() == 2, "b must be a 2D tensor"
-    assert A.size(0) == b.size(0), "A and b must have compatible dimensions"
+    # A: (n, n) - symmetric positive-definite matrix
+    # b: (n, k) - right-hand side tensor
     
-    n, k = A.size(0), b.size(1)
-    
-    # Allocate output tensor
-    x = torch.empty_like(b)
-    
-    # Create a copy of A for Cholesky decomposition
-    A_copy = A.clone()
+    n, k = b.shape
+    assert A.shape == (n, n), "A must be a square matrix of shape (n, n)"
     
     # Compute Cholesky decomposition
-    L = torch.zeros_like(A_copy)
+    L = torch.zeros_like(A)
     
-    # Use PyTorch's built-in Cholesky for correctness
-    L = torch.cholesky(A_copy, upper=False)
+    # Compute L using a simple iterative approach
+    for i in range(n):
+        for j in range(i+1):
+            if i == j:
+                # Diagonal element
+                sum_val = 0.0
+                for k_idx in range(j):
+                    sum_val += L[i, k_idx] * L[i, k_idx]
+                L[i, j] = torch.sqrt(A[i, j] - sum_val)
+            else:
+                # Off-diagonal element
+                sum_val = 0.0
+                for k_idx in range(j):
+                    sum_val += L[i, k_idx] * L[j, k_idx]
+                L[i, j] = (A[i, j] - sum_val) / L[j, j]
     
     # Forward substitution: L * y = b
-    y = torch.empty_like(b)
-    
-    # Use PyTorch's triangular solve for forward substitution
-    y = torch.triangular_solve(b, L, upper=False, transpose=False).solution
+    y = torch.zeros_like(b)
+    for i in range(n):
+        sum_val = 0.0
+        for j in range(i):
+            sum_val += L[i, j] * y[j]
+        y[i] = (b[i] - sum_val) / L[i, i]
     
     # Backward substitution: L.T * x = y
-    # Use PyTorch's triangular solve for backward substitution
-    x = torch.triangular_solve(y, L, upper=True, transpose=True).solution
+    x = torch.zeros_like(y)
+    for i in range(n-1, -1, -1):
+        sum_val = 0.0
+        for j in range(i+1, n):
+            sum_val += L[j, i] * x[j]
+        x[i] = (y[i] - sum_val) / L[i, i]
     
     return x
 

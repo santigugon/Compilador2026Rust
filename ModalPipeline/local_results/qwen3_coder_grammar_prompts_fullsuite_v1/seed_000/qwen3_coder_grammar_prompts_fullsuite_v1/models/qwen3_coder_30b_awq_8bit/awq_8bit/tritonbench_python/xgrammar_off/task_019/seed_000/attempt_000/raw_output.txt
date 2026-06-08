@@ -11,7 +11,7 @@ def _lu_solve_kernel(A_ptr, b_ptr, x_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
         pivot_val = tl.load(A_ptr + k * n + k)
         pivot_idx = k
         
-        # Find maximum element in column k
+        # Search for maximum element in column
         for i in range(k + 1, n):
             val = tl.load(A_ptr + i * n + k)
             if tl.abs(val) > tl.abs(pivot_val):
@@ -50,12 +50,11 @@ def fused_lu_solve(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     # Validate inputs
     assert A.dim() == 2 and A.shape[0] == A.shape[1], "A must be a square matrix"
     assert b.dim() == 1 and b.shape[0] == A.shape[0], "b must be a vector with same size as A"
-    assert A.dtype == torch.float32 and b.dtype == torch.float32, "Only float32 supported"
     
     n = A.shape[0]
     x = torch.empty_like(b)
     
-    # Create a copy of A and b for the computation
+    # Create a copy of A and b to avoid modifying the original tensors
     A_copy = A.clone()
     b_copy = b.clone()
     

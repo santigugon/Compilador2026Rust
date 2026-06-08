@@ -10,19 +10,19 @@ def _trunc_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     # Truncation for floating point: truncate towards zero
     # For negative numbers, we need to be careful about the floor vs trunc behavior
-    # We can use the sign and abs to handle this properly
-    sign = tl.where(x >= 0, 1.0, -1.0)
-    abs_x = tl.abs(x)
-    truncated_abs = tl.floor(abs_x)
-    truncated = sign * truncated_abs
-    tl.store(out_ptr + offsets, truncated, mask=mask)
+    # We can use the sign and floor to implement truncation
+    x_sign = tl.where(x >= 0, 1.0, -1.0)
+    x_abs = tl.abs(x)
+    x_floor = tl.floor(x_abs)
+    x_trunc = tl.where(x >= 0, x_floor, -x_floor)
+    tl.store(out_ptr + offsets, x_trunc, mask=mask)
 
 def trunc(input, *, out=None):
     if out is None:
         out = torch.empty_like(input)
     else:
-        assert out.shape == input.shape, "Output tensor must have the same shape as input"
-        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input"
+        if out.shape != input.shape:
+            raise ValueError("Output tensor must have the same shape as input tensor")
     
     n = input.numel()
     block = 256
@@ -36,6 +36,7 @@ def trunc(input, *, out=None):
             out.copy_(input)
             return out
     
+    # For floating point inputs, use the Triton kernel
     _trunc_kernel[grid](input, out, n, BLOCK=block)
     return out
 

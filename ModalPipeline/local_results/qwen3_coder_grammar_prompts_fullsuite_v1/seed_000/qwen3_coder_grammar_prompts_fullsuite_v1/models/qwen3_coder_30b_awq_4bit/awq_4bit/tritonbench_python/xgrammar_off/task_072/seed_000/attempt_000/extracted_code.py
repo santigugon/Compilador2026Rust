@@ -3,180 +3,164 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _conv2d_kernel(
+def relu_batch_norm_conv2d_kernel(
     input_ptr, weight_ptr, bias_ptr, output_ptr,
-    batch_size, in_channels, out_channels, iH, iW, oH, oW,
-    kH, kW, stride_h, stride_w, padding_h, padding_w,
-    groups, channels_per_group,
-    BLOCK_SIZE: tl.constexpr
+    running_mean_ptr, running_var_ptr, bn_weight_ptr, bn_bias_ptr,
+    input_shape, weight_shape, output_shape,
+    stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w,
+    groups, training, momentum, eps, inplace,
+    BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C, BLOCK_SIZE_K
 ):
+    # Get thread indices
     batch_idx = tl.program_id(0)
-    out_ch_idx = tl.program_id(1)
+    out_h_idx = tl.program_id(1)
+    out_w_idx = tl.program_id(2)
+    out_c_idx = tl.program_id(3)
+    
+    # Load input dimensions
+    batch_size, in_channels, iH, iW = input_shape
+    out_channels, _, kH, kW = weight_shape
     
     # Calculate output dimensions
-    output_h = oH
-    output_w = oW
+    out_h = (iH + 2 * padding_h - (dilation_h * (kH - 1) + 1)) // stride_h + 1
+    out_w = (iW + 2 * padding_w - (dilation_w * (kW - 1) + 1)) // stride_w + 1
     
-    # Load bias if available
+    # Initialize output accumulator
+    acc = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C), dtype=tl.float32)
+    
+    # Loop over kernel
+    for kh in range(kH):
+        for kw in range(kW):
+            # Calculate input indices
+            ih = out_h_idx * stride_h + kh * dilation_h - padding_h
+            iw = out_w_idx * stride_w + kw * dilation_w - padding_w
+            
+            # Check bounds
+            if ih >= 0 and ih < iH and iw >= 0 and iw < iW:
+                # Load input and weight
+                input_chunk = tl.load(input_ptr + batch_idx * in_channels * iH * iW + 
+                                    (out_c_idx // (out_channels // groups)) * iH * iW + 
+                                    ih * iW + iw)
+                weight_chunk = tl.load(weight_ptr + out_c_idx * kH * kW + 
+                                    kh * kW + kw)
+                acc += input_chunk * weight_chunk
+    
+    # Add bias if present
     if bias_ptr is not None:
-        bias_val = tl.load(bias_ptr + out_ch_idx)
-    else:
-        bias_val = 0.0
+        bias_val = tl.load(bias_ptr + out_c_idx)
+        acc += bias_val
     
-    # Loop over output spatial dimensions
-    for oh in range(output_h):
-        for ow in range(output_w):
-            # Initialize accumulator
-            acc = 0.0
-            
-            # Loop over groups and input channels
-            for g in range(groups):
-                for ic in range(channels_per_group):
-                    # Calculate input indices
-                    ih_start = oh * stride_h - padding_h
-                    iw_start = ow * stride_w - padding_w
-                    
-                    # Loop over kernel
-                    for kh in range(kH):
-                        for kw in range(kW):
-                            ih = ih_start + kh
-                            iw = iw_start + kw
-                            
-                            # Check bounds
-                            if ih >= 0 and ih < iH and iw >= 0 and iw < iW:
-                                input_idx = batch_idx * (in_channels * iH * iW) + \
-                                           (g * channels_per_group + ic) * (iH * iW) + \
-                                           ih * iW + iw
-                                weight_idx = out_ch_idx * (groups * channels_per_group * kH * kW) + \
-                                            (g * channels_per_group + ic) * (kH * kW) + \
-                                            kh * kW + kw
-                                
-                                input_val = tl.load(input_ptr + input_idx)
-                                weight_val = tl.load(weight_ptr + weight_idx)
-                                acc += input_val * weight_val
-            
-            # Add bias and store result
-            output_idx = batch_idx * (out_channels * oH * oW) + \
-                        out_ch_idx * (oH * oW) + \
-                        oh * oW + ow
-            tl.store(output_ptr + output_idx, acc + bias_val)
-
-@triton.jit
-def _batch_norm_kernel(
-    input_ptr, output_ptr, running_mean_ptr, running_var_ptr,
-    bn_weight_ptr, bn_bias_ptr,
-    batch_size, channels, height, width,
-    training, momentum, eps, 
-    BLOCK_SIZE: tl.constexpr
-):
-    batch_idx = tl.program_id(0)
-    channel_idx = tl.program_id(1)
-    
-    # Calculate total elements per batch
-    total_elements = height * width
-    
-    # Load batch statistics
-    if running_mean_ptr is not None:
-        mean_val = tl.load(running_mean_ptr + channel_idx)
-    else:
-        mean_val = 0.0
-        
-    if running_var_ptr is not None:
-        var_val = tl.load(running_var_ptr + channel_idx)
-    else:
-        var_val = 0.0
-    
-    # Load BN parameters
-    if bn_weight_ptr is not None:
-        weight_val = tl.load(bn_weight_ptr + channel_idx)
-    else:
-        weight_val = 1.0
-        
-    if bn_bias_ptr is not None:
-        bias_val = tl.load(bn_bias_ptr + channel_idx)
-    else:
-        bias_val = 0.0
-    
-    # Compute batch normalization
-    for i in range(total_elements):
-        input_idx = batch_idx * (channels * height * width) + \
-                   channel_idx * (height * width) + i
-        input_val = tl.load(input_ptr + input_idx)
+    # Batch normalization
+    if training and running_mean_ptr is not None:
+        # Load running statistics
+        mean = tl.load(running_mean_ptr + out_c_idx)
+        var = tl.load(running_var_ptr + out_c_idx)
+        gamma = tl.load(bn_weight_ptr + out_c_idx) if bn_weight_ptr is not None else 1.0
+        beta = tl.load(bn_bias_ptr + out_c_idx) if bn_bias_ptr is not None else 0.0
         
         # Normalize
-        if training:
-            # For simplicity, we'll compute mean and variance on the fly
-            # In practice, this would be more complex
-            normalized_val = (input_val - mean_val) / (tl.sqrt(var_val + eps))
-        else:
-            normalized_val = (input_val - mean_val) / (tl.sqrt(var_val + eps))
+        normalized = (acc - mean) / tl.sqrt(var + eps)
+        acc = gamma * normalized + beta
         
-        # Scale and shift
-        output_val = normalized_val * weight_val + bias_val
+        # Update running statistics
+        new_mean = (1 - momentum) * mean + momentum * tl.sum(acc) / (out_h * out_w)
+        new_var = (1 - momentum) * var + momentum * tl.sum((acc - mean) ** 2) / (out_h * out_w)
         
-        # Store result
-        tl.store(output_ptr + input_idx, output_val)
-
-@triton.jit
-def _relu_kernel(input_ptr, output_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(input_ptr + offsets, mask=mask, other=0.0)
-    y = tl.maximum(x, 0.0)
-    tl.store(output_ptr + offsets, y, mask=mask)
+        tl.store(running_mean_ptr + out_c_idx, new_mean)
+        tl.store(running_var_ptr + out_c_idx, new_var)
+    elif running_mean_ptr is not None:
+        # Load running statistics
+        mean = tl.load(running_mean_ptr + out_c_idx)
+        var = tl.load(running_var_ptr + out_c_idx)
+        gamma = tl.load(bn_weight_ptr + out_c_idx) if bn_weight_ptr is not None else 1.0
+        beta = tl.load(bn_bias_ptr + out_c_idx) if bn_bias_ptr is not None else 0.0
+        
+        # Normalize
+        normalized = (acc - mean) / tl.sqrt(var + eps)
+        acc = gamma * normalized + beta
+    
+    # Apply ReLU
+    if inplace:
+        acc = tl.where(acc > 0, acc, 0.0)
+    else:
+        acc = tl.where(acc > 0, acc, 0.0)
+    
+    # Store output
+    tl.store(output_ptr + batch_idx * out_channels * out_h * out_w + 
+             out_c_idx * out_h * out_w + out_h_idx * out_w + out_w_idx, acc)
 
 def relu_batch_norm_conv2d(
-    input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1,
-    running_mean=None, running_var=None, bn_weight=None, bn_bias=None,
+    input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, 
+    running_mean=None, running_var=None, bn_weight=None, bn_bias=None, 
     training=False, momentum=0.1, eps=1e-5, inplace=False
 ):
-    # Handle scalar inputs
-    if not isinstance(stride, tuple):
-        stride = (stride, stride)
-    if not isinstance(padding, tuple):
-        padding = (padding, padding)
-    if not isinstance(dilation, tuple):
-        dilation = (dilation, dilation)
+    # Ensure inputs are contiguous
+    input = input.contiguous()
+    weight = weight.contiguous()
     
-    # Get dimensions
+    # Get input dimensions
     batch_size, in_channels, iH, iW = input.shape
     out_channels, _, kH, kW = weight.shape
     
     # Calculate output dimensions
-    oH = (iH + 2 * padding[0] - (dilation[0] * (kH - 1) + 1)) // stride[0] + 1
-    oW = (iW + 2 * padding[1] - (dilation[1] * (kW - 1) + 1)) // stride[1] + 1
+    if isinstance(padding, int):
+        padding_h, padding_w = padding, padding
+    else:
+        padding_h, padding_w = padding
+    
+    if isinstance(stride, int):
+        stride_h, stride_w = stride, stride
+    else:
+        stride_h, stride_w = stride
+    
+    if isinstance(dilation, int):
+        dilation_h, dilation_w = dilation, dilation
+    else:
+        dilation_h, dilation_w = dilation
+    
+    out_h = (iH + 2 * padding_h - (dilation_h * (kH - 1) + 1)) // stride_h + 1
+    out_w = (iW + 2 * padding_w - (dilation_w * (kW - 1) + 1)) // stride_w + 1
     
     # Create output tensor
-    out = torch.empty(batch_size, out_channels, oH, oW, device=input.device, dtype=input.dtype)
+    output = torch.empty(batch_size, out_channels, out_h, out_w, device=input.device, dtype=input.dtype)
     
-    # Handle groups
-    channels_per_group = in_channels // groups
+    # Prepare kernel launch parameters
+    BLOCK_SIZE_H = 16
+    BLOCK_SIZE_W = 16
+    BLOCK_SIZE_C = 16
+    BLOCK_SIZE_K = 16
     
-    # First, perform convolution
-    # For simplicity, we'll use PyTorch's conv2d for the convolution part
-    # since it's complex to implement in Triton
-    conv_out = torch.nn.functional.conv2d(
-        input, weight, bias, stride, padding, dilation, groups
+    # Launch kernel
+    grid = (
+        batch_size,
+        out_h,
+        out_w,
+        out_channels
     )
     
-    # Then perform batch normalization
-    if training:
-        # For training mode, we compute batch statistics
-        # This is a simplified version - in practice, you'd compute
-        # mean and variance across batch and spatial dimensions
-        batch_norm_out = torch.nn.functional.batch_norm(
-            conv_out, running_mean, running_var, bn_weight, bn_bias, training, momentum, eps
-        )
-    else:
-        # For inference mode, use running statistics
-        batch_norm_out = torch.nn.functional.batch_norm(
-            conv_out, running_mean, running_var, bn_weight, bn_bias, training, momentum, eps
-        )
+    # Create kernel with appropriate parameters
+    kernel = relu_batch_norm_conv2d_kernel
     
-    # Finally, apply ReLU
-    if inplace:
-        batch_norm_out = torch.nn.functional.relu_(batch_norm_out)
-        return batch_norm_out
-    else:
-        return torch.nn.functional.relu(batch_norm_out)
+    # Prepare pointers
+    input_ptr = input.data_ptr()
+    weight_ptr = weight.data_ptr()
+    output_ptr = output.data_ptr()
+    
+    # Handle optional parameters
+    bias_ptr = bias.data_ptr() if bias is not None else None
+    running_mean_ptr = running_mean.data_ptr() if running_mean is not None else None
+    running_var_ptr = running_var.data_ptr() if running_var is not None else None
+    bn_weight_ptr = bn_weight.data_ptr() if bn_weight is not None else None
+    bn_bias_ptr = bn_bias.data_ptr() if bn_bias is not None else None
+    
+    # Launch kernel
+    kernel[grid](
+        input_ptr, weight_ptr, bias_ptr, output_ptr,
+        running_mean_ptr, running_var_ptr, bn_weight_ptr, bn_bias_ptr,
+        input.shape, weight.shape, output.shape,
+        stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w,
+        groups, training, momentum, eps, inplace,
+        BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C, BLOCK_SIZE_K
+    )
+    
+    return output

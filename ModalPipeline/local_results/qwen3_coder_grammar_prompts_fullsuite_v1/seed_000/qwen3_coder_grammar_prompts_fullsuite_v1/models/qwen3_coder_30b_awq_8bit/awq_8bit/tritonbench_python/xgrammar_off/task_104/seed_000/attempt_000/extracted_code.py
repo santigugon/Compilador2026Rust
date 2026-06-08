@@ -1,36 +1,29 @@
 import torch
 import triton
 import triton.language as tl
+from typing import Tuple
 
 @triton.jit
-def rad2deg_sqrt_kernel(
-    input_ptr,
-    output_deg_ptr,
-    output_sqrt_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    input = tl.load(input_ptr + offsets, mask=mask)
-    output_deg = input * 180.0 / 3.141592653589793
-    output_sqrt = tl.sqrt(input)
-    tl.store(output_deg_ptr + offsets, output_deg, mask=mask)
-    tl.store(output_sqrt_ptr + offsets, output_sqrt, mask=mask)
+def _rad2deg_sqrt_kernel(x_ptr, deg_ptr, sqrt_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Convert radians to degrees: degrees = radians * (180 / pi)
+    deg = x * (180.0 / 3.141592653589793)
+    
+    # Calculate square root
+    sqrt = tl.sqrt(x)
+    
+    tl.store(deg_ptr + offsets, deg, mask=mask)
+    tl.store(sqrt_ptr + offsets, sqrt, mask=mask)
 
-def rad2deg_sqrt(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    output_deg = torch.empty_like(input)
-    output_sqrt = torch.empty_like(input)
-    n_elements = input.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    rad2deg_sqrt_kernel[grid](
-        input,
-        output_deg,
-        output_sqrt,
-        n_elements,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    return (output_deg, output_sqrt)
+def rad2deg_sqrt(input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    out_deg = torch.empty_like(input)
+    out_sqrt = torch.empty_like(input)
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _rad2deg_sqrt_kernel[grid](input, out_deg, out_sqrt, n, BLOCK=block)
+    return (out_deg, out_sqrt)

@@ -17,13 +17,11 @@ def exp(input, *, out=None):
         out = torch.empty_like(input)
     
     n_elements = input.numel()
-    grid = (triton.cdiv(n_elements, 1024),)
-    exp_kernel[grid](
-        input,
-        out,
-        n_elements,
-        BLOCK_SIZE=1024
-    )
+    block_size = 1024
+    num_blocks = (n_elements + block_size - 1) // block_size
+    
+    exp_kernel[(num_blocks,)](input, out, n_elements, BLOCK_SIZE=block_size)
+    
     return out
 
 ##################################################################################################################################################

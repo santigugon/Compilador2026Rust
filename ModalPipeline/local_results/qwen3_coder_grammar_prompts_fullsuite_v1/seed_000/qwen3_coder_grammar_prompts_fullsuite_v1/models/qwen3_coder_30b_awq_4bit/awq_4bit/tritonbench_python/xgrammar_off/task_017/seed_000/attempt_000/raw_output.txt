@@ -4,98 +4,161 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _index_select_eq_kernel(
+def fused_index_select_eq_kernel(
     input_ptr, 
     index_ptr, 
     other_ptr, 
-    out_ptr,
+    output_ptr,
     input_shape, 
     index_shape, 
     other_shape,
-    dim_size: tl.constexpr,
-    index_size: tl.constexpr,
-    other_size: tl.constexpr,
-    BLOCK: tl.constexpr
+    dim,
+    numel,
+    BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    block_start = pid * BLOCK_SIZE
+    block_end = min(block_start + BLOCK_SIZE, numel)
     
-    # Compute the total number of elements in the output
-    total_elements = index_size
+    # Compute the output shape
+    output_shape = []
+    for i in range(len(input_shape)):
+        if i == dim:
+            output_shape.append(index_shape[0])
+        else:
+            output_shape.append(input_shape[i])
     
-    # Load index values
-    index_offsets = offsets % index_size
-    index_vals = tl.load(index_ptr + index_offsets, mask=index_offsets < index_size)
+    # Compute the strides for input tensor
+    input_strides = [1]
+    for i in range(len(input_shape) - 1, 0, -1):
+        input_strides = [input_strides[0] * input_shape[i]] + input_strides
     
-    # For simplicity, we'll handle the indexing in the kernel
-    # This is a simplified version - in practice, you'd need to handle
-    # the multi-dimensional indexing properly
+    # Compute the strides for output tensor
+    output_strides = [1]
+    for i in range(len(output_shape) - 1, 0, -1):
+        output_strides = [output_strides[0] * output_shape[i]] + output_strides
     
-    # Load input values based on indices
-    # This is a simplified approach - in a real implementation,
-    # you'd need to properly handle the multi-dimensional indexing
+    # Compute the strides for index tensor
+    index_strides = [1]
+    for i in range(len(index_shape) - 1, 0, -1):
+        index_strides = [index_strides[0] * index_shape[i]] + index_strides
     
-    # For now, we'll assume a simple case where we're comparing
-    # the selected elements with the other tensor
-    mask = offsets < total_elements
+    # Compute the strides for other tensor
+    other_strides = [1]
+    for i in range(len(other_shape) - 1, 0, -1):
+        other_strides = [other_strides[0] * other_shape[i]] + other_strides
     
-    # Load other values
-    other_vals = tl.load(other_ptr + offsets, mask=mask, other=0.0)
-    
-    # Load input values (simplified - in practice, you'd need proper indexing)
-    input_vals = tl.load(input_ptr + offsets, mask=mask, other=0.0)
-    
-    # Perform element-wise equality comparison
-    eq_result = input_vals == other_vals
-    
-    # Store result
-    tl.store(out_ptr + offsets, eq_result, mask=mask)
+    for i in range(block_start, block_end):
+        # Convert linear index to multi-dimensional index
+        temp_idx = i
+        output_indices = []
+        for j in range(len(output_shape) - 1, -1, -1):
+            if j == dim:
+                output_indices = [temp_idx % output_shape[j]] + output_indices
+                temp_idx //= output_shape[j]
+            else:
+                output_indices = [temp_idx % output_shape[j]] + output_indices
+                temp_idx //= output_shape[j]
+        
+        # Compute the index in the input tensor
+        input_indices = []
+        for j in range(len(input_shape)):
+            if j == dim:
+                input_indices.append(output_indices[j])
+            else:
+                input_indices.append(output_indices[j])
+        
+        # Compute the index in the other tensor
+        other_indices = []
+        for j in range(len(other_shape)):
+            if j == dim:
+                other_indices.append(output_indices[j])
+            else:
+                other_indices.append(output_indices[j])
+        
+        # Compute the linear indices
+        input_linear_idx = 0
+        for j in range(len(input_indices)):
+            input_linear_idx += input_indices[j] * input_strides[j]
+        
+        other_linear_idx = 0
+        for j in range(len(other_indices)):
+            other_linear_idx += other_indices[j] * other_strides[j]
+        
+        # Load values
+        input_val = tl.load(input_ptr + input_linear_idx)
+        other_val = tl.load(other_ptr + other_linear_idx)
+        
+        # Perform comparison
+        result = input_val == other_val
+        
+        # Store result
+        tl.store(output_ptr + i, result)
 
 def fused_index_select_eq(input, dim, index, other, *, out=None):
     # Validate inputs
-    if not torch.is_tensor(index):
-        raise TypeError("index must be a tensor")
+    if dim < 0:
+        dim += input.dim()
+    if dim >= input.dim():
+        raise ValueError("dim out of range")
     
-    if not torch.is_tensor(other):
-        # Convert scalar to tensor
+    # Handle scalar other
+    if not isinstance(other, torch.Tensor):
         other = torch.tensor(other, dtype=input.dtype, device=input.device)
     
-    # Handle negative dimension
-    if dim < 0:
-        dim = input.dim() + dim
+    # Ensure index is long tensor
+    if index.dtype != torch.long:
+        index = index.long()
     
-    # Get the shape of the output
+    # Compute output shape
     output_shape = list(input.shape)
     output_shape[dim] = index.shape[0]
     
-    # Create output tensor
+    # Create output tensor if not provided
     if out is None:
         out = torch.empty(output_shape, dtype=torch.bool, device=input.device)
     else:
         if out.shape != tuple(output_shape):
-            raise ValueError("out tensor must have the same shape as the output")
+            raise ValueError("out tensor has incorrect shape")
     
-    # Handle scalar other case
-    if other.dim() == 0:
-        other = other.expand(out.shape)
+    # Prepare input tensors for kernel
+    input = input.contiguous()
+    other = other.contiguous()
     
-    # For simplicity, we'll use PyTorch's native implementation
-    # since the fused operation requires complex indexing logic
-    # that's better handled by PyTorch's optimized operations
+    # Compute total number of elements in output
+    numel = 1
+    for dim_size in output_shape:
+        numel *= dim_size
     
-    # Select elements using index
-    selected = torch.index_select(input, dim, index)
+    # Launch kernel
+    if numel > 0:
+        BLOCK_SIZE = 1024
+        grid_size = (numel + BLOCK_SIZE - 1) // BLOCK_SIZE
+        
+        # Prepare kernel arguments
+        input_ptr = input.data_ptr()
+        index_ptr = index.data_ptr()
+        other_ptr = other.data_ptr()
+        output_ptr = out.data_ptr()
+        
+        # Get shapes
+        input_shape = list(input.shape)
+        index_shape = list(index.shape)
+        other_shape = list(other.shape)
+        
+        # Launch kernel
+        fused_index_select_eq_kernel[grid_size](
+            input_ptr, 
+            index_ptr, 
+            other_ptr, 
+            output_ptr,
+            input_shape, 
+            index_shape, 
+            other_shape,
+            dim,
+            numel,
+            BLOCK_SIZE
+        )
     
-    # Perform element-wise equality comparison
-    if torch.is_tensor(other):
-        result = selected == other
-    else:
-        result = selected == other
-    
-    # Copy result to output if provided
-    if out is not None:
-        out.copy_(result)
-        return out
-    
-    return result
+    return out
 ```

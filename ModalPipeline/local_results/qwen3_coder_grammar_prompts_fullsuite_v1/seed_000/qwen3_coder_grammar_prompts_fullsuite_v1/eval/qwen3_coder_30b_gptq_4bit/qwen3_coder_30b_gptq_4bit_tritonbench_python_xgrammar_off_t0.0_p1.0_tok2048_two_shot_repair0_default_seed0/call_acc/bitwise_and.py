@@ -13,29 +13,29 @@ def _bitwise_and_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.conste
     tl.store(out_ptr + offsets, result, mask=mask)
 
 def bitwise_and(input, other, *, out=None):
-    # Handle scalar other case
-    if not torch.is_tensor(other):
-        other = torch.tensor(other, dtype=input.dtype, device=input.device)
+    # Ensure inputs are of compatible types
+    if not (torch.is_tensor(input) and torch.is_tensor(other)):
+        raise TypeError("Both input and other must be tensors")
     
-    # Ensure both tensors have the same dtype and device
-    if other.dtype != input.dtype:
-        other = other.to(dtype=input.dtype, device=input.device)
+    # Check if the tensors have compatible shapes for broadcasting
+    if input.shape != other.shape:
+        # Broadcasting is supported by PyTorch
+        pass
     
-    # Handle out parameter
-    if out is None:
-        out = torch.empty_like(input)
+    # Determine output tensor
+    if out is not None:
+        out = out
     else:
-        if out.dtype != input.dtype:
-            raise ValueError("Output tensor must have the same dtype as input tensor")
-        if out.device != input.device:
-            raise ValueError("Output tensor must be on the same device as input tensor")
+        out = torch.empty_like(input)
     
     # Get total number of elements
     n = input.numel()
     
-    # Launch kernel
+    # Set block size and grid size
     block = 256
     grid = (triton.cdiv(n, block),)
+    
+    # Launch kernel
     _bitwise_and_kernel[grid](input, other, out, n, BLOCK=block)
     
     return out

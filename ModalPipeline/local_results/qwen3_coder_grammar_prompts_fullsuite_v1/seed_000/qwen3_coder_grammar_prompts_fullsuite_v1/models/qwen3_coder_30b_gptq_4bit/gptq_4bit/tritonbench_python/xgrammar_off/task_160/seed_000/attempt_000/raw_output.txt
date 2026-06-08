@@ -4,19 +4,14 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def ones_like_kernel(
-    input_ptr,
-    output_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    input_vals = tl.load(input_ptr + offsets, mask=mask)
-    tl.store(output_ptr + offsets, 1.0, mask=mask)
+def _ones_like_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    tl.store(out_ptr + offsets, 1.0, mask=mask)
 
 def ones_like(input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format):
+    # Handle dtype, layout, and device parameters
     if dtype is None:
         dtype = input.dtype
     if device is None:
@@ -24,21 +19,14 @@ def ones_like(input, *, dtype=None, layout=None, device=None, requires_grad=Fals
     if layout is None:
         layout = input.layout
     
-    output = torch.empty_like(input, dtype=dtype, layout=layout, device=device, requires_grad=requires_grad)
+    # Create output tensor with same shape as input
+    out = torch.empty_like(input, dtype=dtype, layout=layout, device=device, requires_grad=requires_grad)
     
-    if input.numel() == 0:
-        return output
+    # Fill with ones using Triton kernel
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _ones_like_kernel[grid](input, out, n, BLOCK=block)
     
-    n_elements = output.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    ones_like_kernel[grid](
-        input_ptr=input.data_ptr(),
-        output_ptr=output.data_ptr(),
-        n_elements=n_elements,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    
-    return output
+    return out
 ```

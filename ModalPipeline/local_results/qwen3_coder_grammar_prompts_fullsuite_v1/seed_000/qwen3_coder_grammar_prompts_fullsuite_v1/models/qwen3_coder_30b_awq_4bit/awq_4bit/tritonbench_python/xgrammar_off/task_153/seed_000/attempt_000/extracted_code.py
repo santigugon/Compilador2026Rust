@@ -3,232 +3,89 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _adaptive_avg_pool2d_kernel(
-    input_ptr, 
-    output_ptr, 
-    input_strides_0, 
-    input_strides_1, 
-    input_strides_2, 
-    input_strides_3,
-    output_strides_0, 
-    output_strides_1, 
-    output_strides_2, 
-    output_strides_3,
-    input_H, 
-    input_W, 
-    output_H, 
-    output_W,
-    N, 
-    C,
-    BLOCK_SIZE: tl.constexpr
+def adaptive_avg_pool2d_kernel(
+    input_ptr, output_ptr, 
+    H_in, W_in, H_out, W_out, 
+    N, C,
+    stride_h, stride_w,
+    BLOCK_SIZE_H=16, BLOCK_SIZE_W=16
 ):
-    # Get the program ID
-    pid = tl.program_id(0)
+    # Get the block indices
+    block_idx = tl.program_id(0)
+    block_idy = tl.program_id(1)
     
-    # Each program handles one output element
-    output_idx = pid
+    # Calculate the output indices
+    out_h = block_idx
+    out_w = block_idy
     
-    # Calculate which output element this program handles
-    output_h = output_idx // output_W
-    output_w = output_idx % output_W
-    
-    # Calculate the input region for this output element
-    h_start = (output_h * input_H) // output_H
-    h_end = ((output_h + 1) * input_H + output_H - 1) // output_H
-    w_start = (output_w * input_W) // output_W
-    w_end = ((output_w + 1) * input_W + output_W - 1) // output_W
+    # Calculate the input region boundaries
+    in_h_start = (out_h * H_in) // H_out
+    in_h_end = ((out_h + 1) * H_in + H_out - 1) // H_out
+    in_w_start = (out_w * W_in) // W_out
+    in_w_end = ((out_w + 1) * W_in + W_out - 1) // W_out
     
     # Calculate the number of elements in the region
-    h_region = h_end - h_start
-    w_region = w_end - w_start
+    region_h = in_h_end - in_h_start
+    region_w = in_w_end - in_w_start
     
-    # Initialize sum
-    sum_val = 0.0
+    # Initialize accumulator
+    acc = tl.zeros((1,), dtype=tl.float32)
     
-    # Accumulate the sum of elements in the region
-    for h in range(h_start, h_end):
-        for w in range(w_start, w_end):
-            # Calculate input index
-            input_idx = h * input_strides_2 + w * input_strides_3
-            # Load input value
-            input_val = tl.load(input_ptr + input_idx)
-            sum_val += input_val
+    # Loop over the region
+    for h in range(in_h_start, in_h_end):
+        for w in range(in_w_start, in_w_end):
+            # Calculate the input index
+            input_idx = h * W_in + w
+            # Accumulate the value
+            acc += tl.load(input_ptr + input_idx)
     
-    # Calculate average
-    avg_val = sum_val / (h_region * w_region)
-    
-    # Store the result
-    output_idx = output_h * output_strides_2 + output_w * output_strides_3
-    tl.store(output_ptr + output_idx, avg_val)
-
-def adaptive_avg_pool2d(input, output_size):
-    # Handle the case where output_size is a single integer
-    if isinstance(output_size, int):
-        output_H = output_size
-        output_W = output_size
-    elif isinstance(output_size, tuple) and len(output_size) == 2:
-        output_H, output_W = output_size
-    else:
-        raise ValueError("output_size must be an int or a tuple of two ints")
-    
-    # Handle input shape
-    if input.dim() == 4:
-        N, C, H_in, W_in = input.shape
-        input = input.view(N, C, H_in, W_in)
-    elif input.dim() == 3:
-        C, H_in, W_in = input.shape
-        N = 1
-        input = input.view(1, C, H_in, W_in)
-    else:
-        raise ValueError("Input must be 3D or 4D")
-    
-    # If output size is None, set it to input size
-    if output_H is None:
-        output_H = H_in
-    if output_W is None:
-        output_W = W_in
-    
-    # Create output tensor
-    output = torch.empty(N, C, output_H, output_W, device=input.device, dtype=input.dtype)
-    
-    # Calculate total number of output elements
-    total_output_elements = N * C * output_H * output_W
-    
-    # Launch kernel
-    block_size = 256
-    grid_size = triton.cdiv(total_output_elements, block_size)
-    
-    # Create a kernel that handles the adaptive pooling
-    # We'll use a simpler approach with a single kernel that handles all elements
-    # This is a simplified version - in practice, you'd want to optimize this further
-    
-    # For simplicity, we'll use a different approach - compute the kernel parameters
-    # and launch a kernel that processes each output element
-    
-    # Create a kernel that processes each output element
-    def _adaptive_avg_pool2d_kernel_simple(input_ptr, output_ptr, input_strides, output_strides, 
-                                          input_H, input_W, output_H, output_W, N, C):
-        # This is a simplified version - in practice, you'd want to compute
-        # the exact region for each output element and sum over it
-        pass
-    
-    # For now, we'll fall back to PyTorch's implementation for correctness
-    # In a real implementation, you'd want to write a proper Triton kernel
-    # that handles the adaptive pooling correctly
-    
-    # For now, let's just compute the result using PyTorch's implementation
-    # This is a placeholder - a real implementation would be more complex
-    if N == 1:
-        # For single batch case
-        return torch.nn.functional.adaptive_avg_pool2d(input, (output_H, output_W)).squeeze(0)
-    else:
-        # For batch case
-        return torch.nn.functional.adaptive_avg_pool2d(input, (output_H, output_W))
-
-# Let's rewrite this with a proper Triton kernel approach
-@triton.jit
-def _adaptive_avg_pool2d_kernel_v2(
-    input_ptr, 
-    output_ptr, 
-    input_strides_0, 
-    input_strides_1, 
-    input_strides_2, 
-    input_strides_3,
-    output_strides_0, 
-    output_strides_1, 
-    output_strides_2, 
-    output_strides_3,
-    input_H, 
-    input_W, 
-    output_H, 
-    output_W,
-    N, 
-    C,
-    BLOCK_SIZE: tl.constexpr
-):
-    # Get the program ID
-    pid = tl.program_id(0)
-    
-    # Calculate which output element this program handles
-    # Each program handles one output element
-    output_h = (pid // output_W) % output_H
-    output_w = pid % output_W
-    
-    # Calculate the input region for this output element
-    h_start = (output_h * input_H) // output_H
-    h_end = ((output_h + 1) * input_H + output_H - 1) // output_H
-    w_start = (output_w * input_W) // output_W
-    w_end = ((output_w + 1) * input_W + output_W - 1) // output_W
-    
-    # Calculate the number of elements in the region
-    h_region = h_end - h_start
-    w_region = w_end - w_start
-    
-    # Initialize sum
-    sum_val = 0.0
-    
-    # Accumulate the sum of elements in the region
-    for h in range(h_start, h_end):
-        for w in range(w_start, w_end):
-            # Calculate input index
-            input_idx = h * input_strides_2 + w * input_strides_3
-            # Load input value
-            input_val = tl.load(input_ptr + input_idx)
-            sum_val += input_val
-    
-    # Calculate average
-    avg_val = sum_val / (h_region * w_region)
+    # Calculate the average
+    avg = acc / (region_h * region_w)
     
     # Store the result
-    output_idx = output_h * output_strides_2 + output_w * output_strides_3
-    tl.store(output_ptr + output_idx, avg_val)
+    output_idx = out_h * W_out + out_w
+    tl.store(output_ptr + output_idx, avg)
 
-def adaptive_avg_pool2d(input, output_size):
-    # Handle the case where output_size is a single integer
-    if isinstance(output_size, int):
-        output_H = output_size
-        output_W = output_size
-    elif isinstance(output_size, tuple) and len(output_size) == 2:
-        output_H, output_W = output_size
-    else:
-        raise ValueError("output_size must be an int or a tuple of two ints")
+def adaptive_avg_pool2d(output_size):
+    def wrapper(input_tensor):
+        # Determine input shape
+        if input_tensor.dim() == 4:
+            N, C, H_in, W_in = input_tensor.shape
+        elif input_tensor.dim() == 3:
+            C, H_in, W_in = input_tensor.shape
+            N = 1
+        else:
+            raise ValueError("Input tensor must be 3D or 4D")
+        
+        # Handle output_size
+        if isinstance(output_size, int):
+            H_out, W_out = output_size, output_size
+        elif isinstance(output_size, tuple) and len(output_size) == 2:
+            H_out, W_out = output_size
+        else:
+            raise ValueError("output_size must be an int or a tuple of two ints")
+        
+        # Create output tensor
+        if N == 1:
+            output_shape = (C, H_out, W_out)
+        else:
+            output_shape = (N, C, H_out, W_out)
+        output = torch.empty(output_shape, device=input_tensor.device, dtype=input_tensor.dtype)
+        
+        # Launch kernel
+        grid = (H_out, W_out)
+        stride_h = H_in / H_out
+        stride_w = W_in / W_out
+        
+        # Launch kernel
+        adaptive_avg_pool2d_kernel[grid](
+            input_tensor,
+            output,
+            H_in, W_in, H_out, W_out,
+            N, C,
+            stride_h, stride_w
+        )
+        
+        return output
     
-    # Handle input shape
-    if input.dim() == 4:
-        N, C, H_in, W_in = input.shape
-    elif input.dim() == 3:
-        C, H_in, W_in = input.shape
-        N = 1
-    else:
-        raise ValueError("Input must be 3D or 4D")
-    
-    # If output size is None, set it to input size
-    if output_H is None:
-        output_H = H_in
-    if output_W is None:
-        output_W = W_in
-    
-    # Create output tensor
-    output = torch.empty(N, C, output_H, output_W, device=input.device, dtype=input.dtype)
-    
-    # Calculate total number of output elements
-    total_output_elements = N * C * output_H * output_W
-    
-    # Launch kernel
-    block_size = 256
-    grid_size = triton.cdiv(total_output_elements, block_size)
-    
-    # For a proper implementation, we would need to pass the strides correctly
-    # But for now, let's use a simpler approach that works with PyTorch's implementation
-    # This is a simplified version that should work for most cases
-    
-    # For now, we'll use PyTorch's implementation to ensure correctness
-    # A proper Triton implementation would be more complex
-    if N == 1:
-        return torch.nn.functional.adaptive_avg_pool2d(input, (output_H, output_W)).squeeze(0)
-    else:
-        return torch.nn.functional.adaptive_avg_pool2d(input, (output_H, output_W))
-
-# Let's create a proper implementation
-def adaptive_avg_pool2d(input, output_size):
-    # Handle the case where output
+    return wrapper

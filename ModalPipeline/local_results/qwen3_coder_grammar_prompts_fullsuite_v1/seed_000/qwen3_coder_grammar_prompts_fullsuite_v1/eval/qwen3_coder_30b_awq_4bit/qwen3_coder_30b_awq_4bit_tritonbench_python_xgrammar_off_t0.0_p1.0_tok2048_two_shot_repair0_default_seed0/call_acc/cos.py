@@ -12,7 +12,13 @@ def _cos_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(out_ptr + offsets, y, mask=mask)
 
 def cos(input, *, out=None):
-    out = torch.empty_like(input) if out is None else out
+    if out is None:
+        out = torch.empty_like(input)
+    else:
+        assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
+        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input tensor"
+        assert out.device == input.device, "Output tensor must be on the same device as input tensor"
+    
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)

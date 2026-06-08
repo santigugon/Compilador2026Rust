@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def sgd_kernel(
+def _sgd_kernel(
     param_ptr, 
     grad_ptr, 
     momentum_ptr, 
@@ -14,88 +14,108 @@ def sgd_kernel(
     dampening, 
     nesterov, 
     maximize, 
-    num_params
+    n: tl.constexpr, 
+    BLOCK: tl.constexpr
 ):
     pid = tl.program_id(0)
-    if pid >= num_params:
-        return
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
     
-    param = tl.load(param_ptr + pid)
-    grad = tl.load(grad_ptr + pid)
+    param = tl.load(param_ptr + offsets, mask=mask, other=0.0)
+    grad = tl.load(grad_ptr + offsets, mask=mask, other=0.0)
     
+    # Apply weight decay
     if weight_decay != 0:
-        grad = grad + weight_decay * param
+        param = param - weight_decay * param
     
+    # Update momentum
     if momentum_factor != 0:
-        momentum_val = tl.load(momentum_ptr + pid)
-        momentum_val = momentum_factor * momentum_val + (1 - dampening) * grad
-        tl.store(momentum_ptr + pid, momentum_val)
-        
+        momentum = tl.load(momentum_ptr + offsets, mask=mask, other=0.0)
+        momentum = momentum * momentum_factor + grad * (1 - dampening)
+        tl.store(momentum_ptr + offsets, momentum, mask=mask)
         if nesterov:
-            grad = grad + momentum_factor * momentum_val
+            grad = grad + momentum_factor * momentum
         else:
-            grad = momentum_val
+            grad = momentum
     
+    # Apply learning rate
+    step = lr * grad
+    
+    # Update parameter
     if maximize:
-        param = param - lr * grad
+        param = param + step
     else:
-        param = param + lr * grad
+        param = param - step
     
-    tl.store(param_ptr + pid, param)
+    # Store updated parameter
+    tl.store(param_ptr + offsets, param, mask=mask)
 
 def SGD(params, lr=1e-3, momentum=0, weight_decay=0, dampening=0, nesterov=False, maximize=False, foreach=None, differentiable=False, fused=None):
-    if foreach is not None or differentiable or fused is not None:
-        raise NotImplementedError("Only basic SGD is implemented in Triton")
+    # Handle scalar learning rate
+    if not torch.is_tensor(lr):
+        lr = torch.tensor(lr)
     
-    if len(params) == 0:
-        return
+    # Handle scalar momentum
+    if not torch.is_tensor(momentum):
+        momentum = torch.tensor(momentum)
     
-    # Flatten all parameters into a single tensor
-    param_tensors = []
-    grad_tensors = []
-    momentum_tensors = []
+    # Handle scalar weight decay
+    if not torch.is_tensor(weight_decay):
+        weight_decay = torch.tensor(weight_decay)
     
+    # Handle scalar dampening
+    if not torch.is_tensor(dampening):
+        dampening = torch.tensor(dampening)
+    
+    # Handle scalar nesterov
+    if not torch.is_tensor(nesterov):
+        nesterov = torch.tensor(nesterov)
+    
+    # Handle scalar maximize
+    if not torch.is_tensor(maximize):
+        maximize = torch.tensor(maximize)
+    
+    # For simplicity, we'll process each parameter separately
+    # In a real implementation, we would use foreach or fused operations
     for param in params:
-        param_tensors.append(param)
-        if param.grad is not None:
-            grad_tensors.append(param.grad)
-        else:
-            grad_tensors.append(torch.zeros_like(param))
+        if param.grad is None:
+            continue
+            
+        # Create output tensor
+        out = torch.empty_like(param)
         
+        # Copy parameter to output
+        out.copy_(param)
+        
+        # Initialize momentum tensor if needed
+        momentum_tensor = None
         if momentum != 0:
-            momentum_tensors.append(torch.zeros_like(param))
+            momentum_tensor = torch.zeros_like(param)
+        
+        # Get parameter size
+        n = param.numel()
+        
+        # Set block size
+        block = 256
+        grid = (triton.cdiv(n, block),)
+        
+        # Launch kernel
+        _sgd_kernel[grid](
+            out, 
+            param.grad, 
+            momentum_tensor, 
+            None,  # state_ptr (not used in this implementation)
+            lr, 
+            momentum, 
+            weight_decay, 
+            dampening, 
+            nesterov, 
+            maximize, 
+            n, 
+            BLOCK=block
+        )
+        
+        # Update parameter
+        param.copy_(out)
     
-    # Flatten all tensors
-    flat_params = torch.cat([p.flatten() for p in param_tensors])
-    flat_grads = torch.cat([g.flatten() for g in grad_tensors])
-    
-    # Initialize momentum if needed
-    if momentum != 0:
-        flat_momentums = torch.cat([m.flatten() for m in momentum_tensors])
-    else:
-        flat_momentums = torch.zeros_like(flat_params)
-    
-    # Launch kernel
-    num_params = flat_params.shape[0]
-    grid = (triton.cdiv(num_params, 1024),)
-    
-    sgd_kernel[grid](
-        flat_params,
-        flat_grads,
-        flat_momentums,
-        torch.zeros_like(flat_params),  # state_ptr (not used in this implementation)
-        lr,
-        momentum,
-        weight_decay,
-        dampening,
-        nesterov,
-        maximize,
-        num_params
-    )
-    
-    # Copy back to original parameters
-    param_idx = 0
-    for i, param in enumerate(params):
-        param_flat_size = param.numel()
-        param.data = flat_params[param_idx:param_idx + param_flat_size].view_as(param)
-        param_idx += param_flat_size
+    return params

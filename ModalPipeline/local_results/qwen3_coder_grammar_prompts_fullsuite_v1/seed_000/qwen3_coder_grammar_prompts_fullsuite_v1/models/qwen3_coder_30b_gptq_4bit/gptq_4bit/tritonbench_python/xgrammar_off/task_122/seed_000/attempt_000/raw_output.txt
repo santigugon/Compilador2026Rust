@@ -4,60 +4,37 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def pow_kernel(
-    x_ptr, 
-    exp_ptr, 
-    out_ptr, 
-    n_elements, 
-    BLOCK_SIZE: tl.constexpr,
-    IS_SCALAR_EXP: tl.constexpr
-):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    
-    x = tl.load(x_ptr + offsets, mask=mask)
-    
-    if IS_SCALAR_EXP:
-        exp = tl.load(exp_ptr)
-        result = tl.power(x, exp)
-    else:
-        exp = tl.load(exp_ptr + offsets, mask=mask)
-        result = tl.power(x, exp)
-    
+def _pow_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+    result = tl.power(x, y)
     tl.store(out_ptr + offsets, result, mask=mask)
 
 def pow(input, exponent, *, out=None):
-    if out is None:
-        out = torch.empty_like(input)
+    # Handle scalar exponent case
+    if not torch.is_tensor(exponent):
+        # Convert scalar to tensor with same shape as input
+        exponent = torch.tensor(exponent, dtype=input.dtype, device=input.device)
     
-    if isinstance(exponent, (int, float)):
-        is_scalar_exp = True
-        exp_tensor = torch.tensor(exponent, dtype=torch.float32, device=input.device)
-    else:
-        is_scalar_exp = False
-        exp_tensor = exponent
+    # Ensure exponent has the same number of elements as input
+    if exponent.numel() != input.numel():
+        # If exponent is a scalar tensor, broadcast it
+        if exponent.numel() == 1:
+            exponent = exponent.expand_as(input)
+        else:
+            raise ValueError("exponent tensor must have the same number of elements as input tensor or be a scalar")
     
-    if not is_scalar_exp and input.shape != exp_tensor.shape:
-        # Handle broadcasting
-        try:
-            torch.broadcast_tensors(input, exp_tensor)
-        except RuntimeError:
-            raise ValueError("Input and exponent tensors are not broadcastable")
+    # Handle broadcasting
+    out_shape = torch.broadcast_tensors(input, exponent)[0].shape
+    out = torch.empty(out_shape, dtype=input.dtype, device=input.device)
     
-    n_elements = input.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
     
-    pow_kernel[grid](
-        input, 
-        exp_tensor, 
-        out, 
-        n_elements, 
-        BLOCK_SIZE, 
-        is_scalar_exp
-    )
-    
+    _pow_kernel[grid](input, exponent, out, n, BLOCK=block)
     return out
 ```

@@ -3,82 +3,68 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _fused_hardshrink_dropout_kernel(
+def fused_hardshrink_dropout_kernel(
     input_ptr, 
     output_ptr, 
-    n: tl.constexpr, 
-    p: tl.constexpr, 
-    training: tl.constexpr, 
-    inplace: tl.constexpr,
-    lambd: tl.constexpr,
-    BLOCK: tl.constexpr
+    n_elements, 
+    p, 
+    lambd, 
+    training, 
+    inplace,
+    BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input_ptrs = input_ptr + offsets
+    output_ptrs = output_ptr + offsets
     
-    # Load input
-    x = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+    input_vals = tl.load(input_ptrs, mask=mask)
     
-    # Apply dropout if training
     if training:
-        # Generate random mask
-        # Note: In practice, we'd use a proper random number generator
-        # For simplicity, we'll use a deterministic approach
-        # In a real implementation, we'd use tl.random or similar
-        # Here we'll simulate with a simple hash-like approach
-        rand_val = tl.load(input_ptr + offsets, mask=mask, other=0.0) * 0.123456789
-        rand_val = (rand_val * 1103515245 + 12345) & 0x7fffffff
-        dropout_mask = (rand_val / 0x7fffffff) > p
-        
-        # Apply dropout
-        if inplace:
-            x = tl.where(dropout_mask, 0.0, x)
-        else:
-            x = tl.where(dropout_mask, 0.0, x)
+        # Generate random numbers for dropout
+        rand_vals = tl.random.random([BLOCK_SIZE], seed=pid)
+        dropout_mask = rand_vals > p
+        input_vals = tl.where(dropout_mask, input_vals, tl.zeros_like(input_vals))
     
     # Apply hard shrinkage
-    # Hard shrinkage: if |x| <= lambd, then x = 0; else x = x
-    shrink_mask = tl.abs(x) <= lambd
-    y = tl.where(shrink_mask, 0.0, x)
+    # Hard shrinkage: f(x) = x if |x| > lambd, else 0
+    shrinkage_mask = tl.abs(input_vals) > lambd
+    output_vals = tl.where(shrinkage_mask, input_vals, tl.zeros_like(input_vals))
     
-    # Store result
-    tl.store(output_ptr + offsets, y, mask=mask)
+    if inplace:
+        tl.store(output_ptrs, output_vals, mask=mask)
+    else:
+        tl.store(output_ptrs, output_vals, mask=mask)
 
 def fused_hardshrink_dropout(input: torch.Tensor, p: float = 0.5, training: bool = True, inplace: bool = False, lambd: float = 0.5) -> torch.Tensor:
-    # Handle scalar inputs
-    if not torch.is_tensor(input):
-        input = torch.tensor(input)
-    
-    # Create output tensor
     if inplace:
-        out = input
+        output = input
     else:
-        out = torch.empty_like(input)
+        output = torch.empty_like(input)
     
-    # Get number of elements
-    n = input.numel()
+    if input.numel() == 0:
+        return output
     
-    # Set block size
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    
-    # Handle scalar p and lambd
-    if not isinstance(p, float):
-        p = float(p)
-    if not isinstance(lambd, float):
-        lambd = float(lambd)
+    # Ensure input is contiguous
+    input = input.contiguous()
+    output = output.contiguous()
     
     # Launch kernel
-    _fused_hardshrink_dropout_kernel[grid](
-        input, 
-        out, 
-        n, 
-        p, 
-        training, 
-        inplace, 
-        lambd, 
-        BLOCK=block
+    n_elements = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    fused_hardshrink_dropout_kernel[grid](
+        input_ptr=input.data_ptr(),
+        output_ptr=output.data_ptr(),
+        n_elements=n_elements,
+        p=p,
+        lambd=lambd,
+        training=training,
+        inplace=inplace,
+        BLOCK_SIZE=BLOCK_SIZE
     )
     
-    return out
+    return output

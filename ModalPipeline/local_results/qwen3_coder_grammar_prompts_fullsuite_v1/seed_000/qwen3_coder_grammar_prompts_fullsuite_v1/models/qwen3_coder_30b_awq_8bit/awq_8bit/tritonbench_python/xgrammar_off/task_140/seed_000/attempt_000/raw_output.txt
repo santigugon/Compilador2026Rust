@@ -4,82 +4,50 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def tril_mm_and_scale_kernel(
-    A_ptr, B_ptr, out_ptr,
-    n, p,
-    alpha, beta,
-    stride_a_row, stride_a_col,
-    stride_b_row, stride_b_col,
-    stride_out_row, stride_out_col,
-    BLOCK_SIZE: tl.constexpr
-):
+def _tril_mm_and_scale_kernel(A_ptr, B_ptr, out_ptr, n: tl.constexpr, p: tl.constexpr, alpha: tl.constexpr, beta: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    num_blocks = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
-    if pid >= num_blocks * num_blocks:
-        return
+    pid2 = tl.program_id(1)
     
-    block_row = pid // num_blocks
-    block_col = pid % num_blocks
+    # Compute row and column indices
+    row = pid * BLOCK + tl.arange(0, BLOCK)
+    col = pid2 * BLOCK + tl.arange(0, BLOCK)
     
-    acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
+    # Create masks for valid indices
+    row_mask = row < n
+    col_mask = col < p
+    mask = row_mask[:, None] & col_mask[None, :]
     
-    for k in range(0, n, BLOCK_SIZE):
-        a_block = tl.load(
-            A_ptr + block_row * BLOCK_SIZE * stride_a_row + 
-            k * stride_a_col,
-            mask=(block_row * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None] < n) &
-                  (k + tl.arange(0, BLOCK_SIZE)[None, :] < n),
-            other=0.0
-        )
-        
-        b_block = tl.load(
-            B_ptr + k * stride_b_row + 
-            block_col * BLOCK_SIZE * stride_b_col,
-            mask=(k + tl.arange(0, BLOCK_SIZE)[:, None] < n) &
-                  (block_col * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :] < p),
-            other=0.0
-        )
-        
-        # Apply lower triangular mask to A
-        mask = tl.arange(0, BLOCK_SIZE)[:, None] >= tl.arange(0, BLOCK_SIZE)[None, :]
-        a_block = tl.where(mask, a_block, 0.0)
-        
-        acc += tl.dot(a_block, b_block)
+    # Load B values
+    B_vals = tl.load(B_ptr + col, mask=col_mask, other=0.0)
     
-    # Scale by alpha
-    acc *= alpha
+    # Compute partial dot products
+    result = tl.zeros((BLOCK, BLOCK), dtype=tl.float32)
+    for k in range(n):
+        # Load A value with triangular mask
+        a_val = tl.load(A_ptr + k * n + row, mask=row_mask, other=0.0)
+        # Apply triangular mask: only keep elements where row >= k
+        a_val = tl.where(row >= k, a_val, 0.0)
+        # Broadcast and multiply
+        a_broadcast = a_val[:, None]
+        b_broadcast = B_vals[None, :]
+        result += a_broadcast * b_broadcast
     
-    # Scale by beta and store result
-    out_block = acc * beta
+    # Scale by alpha and beta
+    result = result * alpha * beta
     
-    tl.store(
-        out_ptr + block_row * BLOCK_SIZE * stride_out_row + 
-        block_col * BLOCK_SIZE * stride_out_col,
-        out_block,
-        mask=(block_row * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None] < n) &
-              (block_col * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :] < p)
-    )
+    # Store result
+    tl.store(out_ptr + row[:, None] * p + col, result, mask=mask)
 
 def tril_mm_and_scale(A: torch.Tensor, B: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
-    assert A.dim() == 2 and B.dim() == 2
-    assert A.shape[0] == A.shape[1] and A.shape[1] == B.shape[0]
-    
-    n, p = A.shape[0], B.shape[1]
+    n, p = B.shape
     out = torch.empty(n, p, dtype=torch.float32, device=A.device)
     
-    BLOCK_SIZE = 16
-    num_blocks = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
-    grid = (num_blocks * num_blocks,)
+    # Use a reasonable block size
+    BLOCK = 16
+    grid = (triton.cdiv(n, BLOCK), triton.cdiv(p, BLOCK))
     
-    tril_mm_and_scale_kernel[grid](
-        A, B, out,
-        n, p,
-        alpha, beta,
-        A.stride(0), A.stride(1),
-        B.stride(0), B.stride(1),
-        out.stride(0), out.stride(1),
-        BLOCK_SIZE
-    )
+    # Launch kernel
+    _tril_mm_and_scale_kernel[grid](A, B, out, n, p, alpha, beta, BLOCK=BLOCK)
     
     return out
 ```

@@ -3,36 +3,60 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _pow_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, is_scalar: tl.constexpr, BLOCK: tl.constexpr):
+def pow_kernel(
+    x_ptr, 
+    exp_ptr, 
+    output_ptr, 
+    n_elements, 
+    BLOCK_SIZE: tl.constexpr,
+    is_scalar: tl.constexpr
+):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    x = tl.load(x_ptr + offsets, mask=mask)
     
     if is_scalar:
-        y = tl.load(y_ptr, mask=mask, other=0.0)
-        result = tl.power(x, y)
+        exponent = tl.load(exp_ptr)
+        result = tl.power(x, exponent)
     else:
-        y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
-        result = tl.power(x, y)
+        exp = tl.load(exp_ptr + offsets, mask=mask)
+        result = tl.power(x, exp)
     
-    tl.store(out_ptr + offsets, result, mask=mask)
+    tl.store(output_ptr + offsets, result, mask=mask)
 
 def pow(input, exponent, *, out=None):
     if out is None:
         out = torch.empty_like(input)
     
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    
-    # Check if exponent is a scalar
-    if not torch.is_tensor(exponent):
-        # Handle scalar exponent case
-        y_scalar = torch.tensor(exponent, dtype=torch.float32, device=input.device)
-        _pow_kernel[grid](input, y_scalar, out, n, True, BLOCK=block)
+    if isinstance(exponent, (int, float)):
+        is_scalar = True
+        exp_tensor = torch.tensor(exponent, dtype=torch.float32, device=input.device)
     else:
-        # Handle tensor exponent case
-        _pow_kernel[grid](input, exponent, out, n, False, BLOCK=block)
+        is_scalar = False
+        exp_tensor = exponent
+    
+    if not is_scalar and input.shape != exp_tensor.shape:
+        # Handle broadcasting
+        try:
+            torch.broadcast_tensors(input, exp_tensor)
+        except RuntimeError:
+            raise ValueError("Input and exponent tensors are not broadcastable")
+    
+    n_elements = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    # Launch kernel
+    pow_kernel[grid](
+        input.data_ptr(),
+        exp_tensor.data_ptr(),
+        out.data_ptr(),
+        n_elements,
+        BLOCK_SIZE,
+        is_scalar
+    )
     
     return out

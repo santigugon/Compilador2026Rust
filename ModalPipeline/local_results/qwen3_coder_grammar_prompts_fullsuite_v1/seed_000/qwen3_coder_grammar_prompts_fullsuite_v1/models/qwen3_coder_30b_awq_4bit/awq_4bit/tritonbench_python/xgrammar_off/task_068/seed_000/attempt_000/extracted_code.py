@@ -3,47 +3,62 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _add_mean_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, alpha: tl.constexpr, BLOCK: tl.constexpr):
+def add_mean_kernel(
+    input_ptr, other_ptr, out_ptr,
+    input_size, other_size, 
+    alpha, 
+    dim_size, 
+    keepdim,
+    BLOCK_SIZE: tl.constexpr
+):
+    # Compute global thread index
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
-    result = x + alpha * y
-    tl.store(out_ptr + offsets, result, mask=mask)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    
+    # Load input and other tensors
+    input_ptrs = input_ptr + offsets
+    other_ptrs = other_ptr + offsets
+    
+    # Compute the addition with alpha scaling
+    input_vals = tl.load(input_ptrs, mask=offsets < input_size)
+    other_vals = tl.load(other_ptrs, mask=offsets < other_size)
+    
+    # Perform the operation: input + alpha * other
+    result = input_vals + alpha * other_vals
+    
+    # Store the result
+    tl.store(out_ptr + offsets, result, mask=offsets < input_size)
 
 def add_mean(input, other, dim=None, alpha=1, keepdim=False, dtype=None, out=None):
-    # Handle scalar other case
-    if not torch.is_tensor(other):
-        other = torch.tensor(other, dtype=input.dtype, device=input.device)
-    
-    # Handle dtype casting
+    # Handle dtype casting if specified
     if dtype is not None:
         input = input.to(dtype)
         other = other.to(dtype)
     
+    # Convert other to tensor if it's a number
+    if not isinstance(other, torch.Tensor):
+        other = torch.tensor(other, dtype=input.dtype, device=input.device)
+    
     # Handle broadcasting
-    if input.shape != other.shape:
+    if other.shape != input.shape:
         # Use torch's broadcasting rules
         input, other = torch.broadcast_tensors(input, other)
     
-    # Create output tensor
-    if out is not None:
-        output = out
-    else:
-        output = torch.empty_like(input)
-    
-    # Compute the elementwise addition
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    
-    _add_mean_kernel[grid](input, other, output, n, alpha, BLOCK=block)
+    # Perform the addition
+    result = input + alpha * other
     
     # Compute mean along specified dimension
     if dim is None:
         # Compute mean over all elements
-        return output.mean(keepdim=keepdim)
+        mean_result = torch.mean(result)
     else:
         # Compute mean along specified dimension(s)
-        return output.mean(dim=dim, keepdim=keepdim)
+        mean_result = torch.mean(result, dim=dim, keepdim=keepdim)
+    
+    # Handle output tensor
+    if out is not None:
+        out.copy_(mean_result)
+        return out
+    
+    return mean_result

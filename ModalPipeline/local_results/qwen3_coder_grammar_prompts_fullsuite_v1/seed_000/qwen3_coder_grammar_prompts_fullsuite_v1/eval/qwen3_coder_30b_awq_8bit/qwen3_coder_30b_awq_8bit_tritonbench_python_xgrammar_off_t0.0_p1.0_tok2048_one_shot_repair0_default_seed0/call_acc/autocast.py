@@ -23,12 +23,10 @@ def _autocast_kernel(
             input = tl.load(input_ptr + offsets, mask=mask).to(tl.bfloat16)
         else:
             input = tl.load(input_ptr + offsets, mask=mask)
-        output = input
+        tl.store(output_ptr + offsets, input, mask=mask)
     else:
         input = tl.load(input_ptr + offsets, mask=mask)
-        output = input
-    
-    tl.store(output_ptr + offsets, output, mask=mask)
+        tl.store(output_ptr + offsets, input, mask=mask)
 
 class AutocastContextManager:
     def __init__(self, device_type, enabled=True, dtype=None, cache_enabled=True):
@@ -40,27 +38,45 @@ class AutocastContextManager:
         
     def __enter__(self):
         if self.enabled and self.dtype is not None:
-            self._original_dtype = torch.get_autocast_gpu_dtype()
-            torch.set_autocast_gpu_dtype(self.dtype)
+            if self.dtype == torch.float16:
+                self._original_dtype = torch.get_autocast_gpu_dtype()
+                torch.set_autocast_gpu_dtype(torch.float16)
+            elif self.dtype == torch.bfloat16:
+                self._original_dtype = torch.get_autocast_gpu_dtype()
+                torch.set_autocast_gpu_dtype(torch.bfloat16)
         return self
         
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.enabled and self.dtype is not None:
+        if self.enabled and self.dtype is not None and self._original_dtype is not None:
             torch.set_autocast_gpu_dtype(self._original_dtype)
             
-    def apply_mixed_precision(self, input_tensor):
+    def _apply_triton_autocast(self, input_tensor):
         if not self.enabled:
             return input_tensor
             
+        output_tensor = torch.empty_like(input_tensor)
+        n_elements = input_tensor.numel()
+        
         if self.dtype is None:
-            return input_tensor
-            
-        if self.dtype == torch.float16:
-            return input_tensor.half()
+            dtype = tl.float32
+        elif self.dtype == torch.float16:
+            dtype = tl.float16
         elif self.dtype == torch.bfloat16:
-            return input_tensor.bfloat16()
+            dtype = tl.bfloat16
         else:
-            return input_tensor
+            dtype = tl.float32
+            
+        grid = (triton.cdiv(n_elements, 1024),)
+        
+        _autocast_kernel[grid](
+            input_tensor.data_ptr(),
+            output_tensor.data_ptr(),
+            n_elements,
+            dtype,
+            self.enabled
+        )
+        
+        return output_tensor
 
 def autocast(device_type, enabled=True, dtype=None, cache_enabled=True):
     return AutocastContextManager(device_type, enabled, dtype, cache_enabled)

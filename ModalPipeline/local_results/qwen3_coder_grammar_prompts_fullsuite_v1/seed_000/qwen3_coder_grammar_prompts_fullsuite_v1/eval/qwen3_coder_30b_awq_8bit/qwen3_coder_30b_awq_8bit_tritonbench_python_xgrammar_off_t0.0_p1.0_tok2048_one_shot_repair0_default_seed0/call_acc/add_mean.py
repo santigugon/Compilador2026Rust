@@ -11,38 +11,16 @@ def add_mean_kernel(
 ):
     pid = tl.program_id(0)
     offset = pid * BLOCK_SIZE
+    mask = offset + tl.arange(0, BLOCK_SIZE) < output_size
+    
     input_offsets = offset + tl.arange(0, BLOCK_SIZE)
     other_offsets = offset + tl.arange(0, BLOCK_SIZE)
-    output_offsets = offset + tl.arange(0, BLOCK_SIZE)
     
-    input_mask = input_offsets < input_size
-    other_mask = other_offsets < other_size
-    output_mask = output_offsets < output_size
-    
-    input_vals = tl.load(input_ptr + input_offsets, mask=input_mask)
-    other_vals = tl.load(other_ptr + other_offsets, mask=other_mask)
+    input_vals = tl.load(input_ptr + input_offsets, mask=mask)
+    other_vals = tl.load(other_ptr + other_offsets, mask=mask)
     
     result = input_vals + alpha * other_vals
-    tl.store(output_ptr + output_offsets, result, mask=output_mask)
-
-@triton.jit
-def mean_kernel(
-    input_ptr, output_ptr,
-    input_size, output_size,
-    dim_size, keepdim,
-    BLOCK_SIZE: tl.constexpr
-):
-    pid = tl.program_id(0)
-    offset = pid * BLOCK_SIZE
-    input_offsets = offset + tl.arange(0, BLOCK_SIZE)
-    output_offsets = offset + tl.arange(0, BLOCK_SIZE)
-    
-    input_mask = input_offsets < input_size
-    output_mask = output_offsets < output_size
-    
-    input_vals = tl.load(input_ptr + input_offsets, mask=input_mask)
-    mean_val = tl.sum(input_vals) / dim_size
-    tl.store(output_ptr + output_offsets, mean_val, mask=output_mask)
+    tl.store(output_ptr + input_offsets, result, mask=mask)
 
 def add_mean(input, other, dim=None, alpha=1, keepdim=False, dtype=None, out=None):
     if dtype is not None:
@@ -51,7 +29,7 @@ def add_mean(input, other, dim=None, alpha=1, keepdim=False, dtype=None, out=Non
             other = other.to(dtype)
     
     if isinstance(other, (int, float, complex)):
-        other = torch.tensor(other, dtype=input.dtype, device=input.device)
+        other = torch.tensor(other, device=input.device, dtype=input.dtype)
     
     # Broadcasting
     input_shape = input.shape
@@ -71,26 +49,44 @@ def add_mean(input, other, dim=None, alpha=1, keepdim=False, dtype=None, out=Non
     if out is not None:
         output = out
     else:
-        output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+        output = torch.empty(output_shape, device=input.device, dtype=input.dtype)
     
     # Handle scalar case
     if input.numel() == 1:
         result = input + alpha * other
         if dim is None:
-            output.fill_(result.mean())
+            output = result.sum()
         else:
-            output.fill_(result)
+            output = result.mean(dim=dim, keepdim=keepdim)
         return output
     
-    # For simplicity, we'll use PyTorch's native implementation for now
-    # since Triton implementation would require more complex handling of
-    # broadcasting, dimension reduction, and type promotion
+    # For multi-element tensors, use Triton kernel
     if dim is None:
-        result = input + alpha * other
-        return result.mean()
+        # Compute total elements
+        total_elements = input.numel()
+        BLOCK_SIZE = 1024
+        num_blocks = (total_elements + BLOCK_SIZE - 1) // BLOCK_SIZE
+        
+        # Flatten tensors for kernel
+        input_flat = input.flatten()
+        other_flat = other.flatten()
+        output_flat = output.flatten()
+        
+        add_mean_kernel[(num_blocks,)](
+            input_flat, other_flat, output_flat,
+            total_elements, total_elements, total_elements,
+            alpha, 1, False, BLOCK_SIZE
+        )
+        
+        # Compute mean
+        output = output_flat.mean()
     else:
+        # For specific dimensions, we need to handle reduction properly
+        # This is a simplified version - full implementation would be more complex
         result = input + alpha * other
-        return torch.mean(result, dim=dim, keepdim=keepdim)
+        output = result.mean(dim=dim, keepdim=keepdim)
+    
+    return output
 
 ##################################################################################################################################################
 

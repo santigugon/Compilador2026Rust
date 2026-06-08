@@ -3,79 +3,89 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def combined_activation_kernel(
-    input_ptr, weight1_ptr, weight2_ptr, bias_ptr, output_ptr,
-    input_row_stride, weight1_row_stride, weight2_row_stride, bias_row_stride,
-    output_row_stride,
-    N, D_in, D_out,
-    BLOCK_SIZE_M=32,
-    BLOCK_SIZE_N=32,
-    BLOCK_SIZE_K=32
+def _combined_activation_kernel(
+    input_ptr, weight1_ptr, weight2_ptr, bias_ptr, out_ptr,
+    n_batch: tl.constexpr, n_in: tl.constexpr, n_out: tl.constexpr,
+    BLOCK: tl.constexpr
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(0)
+    batch_id = pid // n_out
+    out_id = pid % n_out
     
-    # Compute output for this block
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    
-    for k in range(0, D_in, BLOCK_SIZE_K):
-        # Load input and weight1
-        input_block = tl.load(input_ptr + pid_m * input_row_stride + k * N, mask=(k + tl.arange(0, BLOCK_SIZE_K) < D_in))
-        weight1_block = tl.load(weight1_ptr + k * weight1_row_stride + pid_n * D_in, mask=(k + tl.arange(0, BLOCK_SIZE_K) < D_in))
+    # Compute matrix multiplication for this batch and output
+    acc = 0.0
+    for i in range(0, n_in, BLOCK):
+        # Load input and weight1 blocks
+        input_offsets = batch_id * n_in + i + tl.arange(0, BLOCK)
+        weight1_offsets = i + out_id * n_in + tl.arange(0, BLOCK)
         
-        # Matrix multiplication
-        accumulator += tl.dot(input_block, weight1_block)
+        mask = (input_offsets < (batch_id + 1) * n_in) & (weight1_offsets < n_in * n_out)
+        
+        input_vals = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
+        weight1_vals = tl.load(weight1_ptr + weight1_offsets, mask=mask, other=0.0)
+        
+        acc += tl.sum(input_vals * weight1_vals)
     
+    # Compute activation functions
     # Apply sigmoid and tanh
-    output = tl.sigmoid(accumulator) * tl.tanh(accumulator)
+    activation = 2.0 / (1.0 + tl.exp(-2.0 * acc)) - 1.0  # tanh
+    activation = 1.0 / (1.0 + tl.exp(-activation))  # sigmoid
     
-    # Load weight2 and bias
-    weight2_block = tl.load(weight2_ptr + pid_n * weight2_row_stride, mask=(tl.arange(0, BLOCK_SIZE_N) < D_out))
-    bias_block = tl.load(bias_ptr + pid_n * bias_row_stride, mask=(tl.arange(0, BLOCK_SIZE_N) < D_out))
+    # Element-wise multiplication with weight2
+    # weight2 is broadcastable to output shape, so we compute it per batch
+    weight2_val = tl.load(weight2_ptr + out_id, mask=out_id < n_out, other=0.0)
+    activation = activation * weight2_val
     
-    # Element-wise multiplication and addition
-    output = output * weight2_block + bias_block
+    # Add bias
+    bias_val = tl.load(bias_ptr + out_id, mask=out_id < n_out, other=0.0)
+    activation = activation + bias_val
     
     # Store result
-    tl.store(output_ptr + pid_m * output_row_stride + pid_n, output)
+    out_offsets = batch_id * n_out + out_id
+    tl.store(out_ptr + out_offsets, activation, mask=out_id < n_out)
 
 def combined_activation(input, weight1, weight2, bias, *, out=None):
     # Validate dimensions
-    assert input.shape[-1] == weight1.shape[-2], "Input and weight1 dimensions incompatible"
-    assert weight2.shape[-1] == weight1.shape[-1], "Weight2 and weight1 dimensions incompatible"
-    assert bias.shape[-1] == weight1.shape[-1], "Bias and weight1 dimensions incompatible"
-    
-    # Flatten batch dimensions
     batch_shape = input.shape[:-2]
-    N, D_in = input.shape[-2], weight1.shape[-2]
-    D_out = weight1.shape[-1]
+    n_in = input.shape[-1]
+    n_out = weight1.shape[-1]
     
-    # Reshape inputs for computation
-    input_reshaped = input.view(-1, N, D_in)
-    batch_size = input_reshaped.shape[0]
+    # Check compatibility
+    assert weight1.shape[-2] == n_in, "Weight1 dimension mismatch"
+    assert weight2.shape[-1] == n_out, "Weight2 dimension mismatch"
+    assert bias.shape[-1] == n_out, "Bias dimension mismatch"
+    
+    # Compute output shape
+    output_shape = batch_shape + (n_out,)
     
     # Create output tensor
     if out is None:
-        out = torch.empty(batch_size, N, D_out, dtype=input.dtype, device=input.device)
+        out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
     else:
-        assert out.shape == (batch_size, N, D_out), "Output tensor shape mismatch"
+        assert out.shape == output_shape, "Output tensor shape mismatch"
+    
+    # Handle batch dimensions
+    batch_size = 1
+    for dim in batch_shape:
+        batch_size *= dim
     
     # Launch kernel
-    grid = (triton.cdiv(N, 32), triton.cdiv(D_out, 32))
+    block = 32
+    grid = (batch_size * n_out,)
     
-    # Compute strides
-    input_row_stride = input_reshaped.stride(-2)
-    weight1_row_stride = weight1.stride(-2)
-    weight2_row_stride = weight2.stride(-1)
-    bias_row_stride = bias.stride(-1)
-    output_row_stride = out.stride(-2)
+    # Flatten input and weight1 for kernel processing
+    input_flat = input.view(-1, n_in)
+    weight1_flat = weight1.view(n_in, n_out)
+    weight2_flat = weight2.view(-1, n_out)
+    bias_flat = bias.view(-1, n_out)
     
-    combined_activation_kernel[grid](
-        input_reshaped, weight1, weight2, bias, out,
-        input_row_stride, weight1_row_stride, weight2_row_stride, bias_row_stride,
-        output_row_stride,
-        N, D_in, D_out
+    # Create output tensor with flattened shape
+    out_flat = out.view(-1, n_out)
+    
+    # Launch kernel
+    _combined_activation_kernel[grid](
+        input_flat, weight1_flat, weight2_flat, bias_flat, out_flat,
+        batch_size, n_in, n_out, BLOCK=block
     )
     
-    # Reshape output to match original batch dimensions
-    return out.view(*batch_shape, N, D_out)
+    return out

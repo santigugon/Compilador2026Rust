@@ -8,10 +8,12 @@ def _selu_kernel(x_ptr, out_ptr, n: tl.constexpr, alpha: tl.constexpr, scale: tl
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
     # SELU: scale * (max(0, x) + min(0, alpha * (exp(x) - 1)))
     exp_x = tl.exp(x)
-    selu_val = scale * (tl.maximum(0, x) + tl.minimum(0, alpha * (exp_x - 1.0)))
-    tl.store(out_ptr + offsets, selu_val, mask=mask)
+    selu_value = scale * (tl.maximum(0, x) + tl.minimum(0, alpha * (exp_x - 1.0)))
+    
+    tl.store(out_ptr + offsets, selu_value, mask=mask)
 
 def selu(input, inplace=False):
     alpha = 1.6732632423543772848170429916717
@@ -25,6 +27,7 @@ def selu(input, inplace=False):
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
+    
     _selu_kernel[grid](input, out, n, alpha, scale, BLOCK=block)
     
     return out

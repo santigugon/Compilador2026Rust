@@ -1,5 +1,5 @@
 {
-  "run_id": "631a99c9-9760-466a-abef-554c9657311d",
+  "run_id": "69b1f80b-e4ab-47ab-bad0-bb465d4ff117",
   "experiment_id": "qwen3_coder_grammar_prompts_fullsuite_v1",
   "model_name": "qwen3_coder_30b_awq_8bit",
   "hf_model_id": "cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-8bit",
@@ -10,7 +10,7 @@
     "temperature": 0.0,
     "top_p": 1.0,
     "max_output_tokens": 2048,
-    "prompt_variant": "one_shot",
+    "prompt_variant": "two_shot",
     "repair_budget": 0,
     "runtime_limit": {
       "name": "default",

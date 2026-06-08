@@ -14,18 +14,14 @@ def _relu_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
 def relu(input, inplace=False):
     if inplace:
         out = input
-        n = input.numel()
-        block = 256
-        grid = (triton.cdiv(n, block),)
-        _relu_kernel[grid](input, input, n, BLOCK=block)
-        return out
     else:
         out = torch.empty_like(input)
-        n = input.numel()
-        block = 256
-        grid = (triton.cdiv(n, block),)
-        _relu_kernel[grid](input, out, n, BLOCK=block)
-        return out
+    
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _relu_kernel[grid](input, out, n, BLOCK=block)
+    return out
 
 ##################################################################################################################################################
 

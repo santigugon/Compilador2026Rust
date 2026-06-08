@@ -24,13 +24,12 @@ def _i0_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     
     # Series expansion: I0(x) = 1 + sum_{m=1}^{\infty} (x^2/4)^m / (m!)^2
     # We'll compute a few terms for reasonable accuracy
-    while m < 20:  # Limit iterations for numerical stability
+    for _ in range(50):  # Maximum iterations
         term = term * x2 / (4.0 * m * m)
         sum_val += term
-        m += 1
-        # Stop when term becomes very small
-        if tl.abs(term) < 1e-12:
+        if tl.abs(term) < 1e-12:  # Convergence check
             break
+        m += 1
     
     tl.store(out_ptr + offsets, sum_val, mask=mask)
 

@@ -12,7 +12,7 @@ def _sqrt_exp_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     exp_sqrt_x = tl.exp(sqrt_x)
     tl.store(out_ptr + offsets, exp_sqrt_x, mask=mask)
 
-def sqrt_exp(input, out=None) -> torch.Tensor:
+def sqrt_exp(input, out=None):
     if out is None:
         out = torch.empty_like(input)
     else:

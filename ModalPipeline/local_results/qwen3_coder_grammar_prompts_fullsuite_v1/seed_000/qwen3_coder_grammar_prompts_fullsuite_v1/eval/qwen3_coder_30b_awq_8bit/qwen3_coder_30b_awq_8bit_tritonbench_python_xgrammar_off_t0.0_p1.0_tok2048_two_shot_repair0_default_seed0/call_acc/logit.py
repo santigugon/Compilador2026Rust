@@ -9,7 +9,7 @@ def _logit_kernel(x_ptr, out_ptr, n: tl.constexpr, eps: tl.constexpr, BLOCK: tl.
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     
-    # Clamp input to [eps, 1 - eps] if eps is not None
+    # Clamp input to [eps, 1 - eps]
     if eps is not None:
         x = tl.clamp(x, eps, 1.0 - eps)
     
@@ -34,16 +34,18 @@ def logit(input, eps=None, *, out=None):
     
     # Handle special case where eps is None and input is outside [0, 1]
     if eps is None:
-        # Check if any values are outside [0, 1] - this would produce NaN
-        # For now, we'll let PyTorch handle this case naturally
-        pass
+        # Check if any values are outside [0, 1] range
+        if (input < 0).any() or (input > 1).any():
+            # Fall back to PyTorch for NaN handling
+            return torch.logit(input, eps=eps, out=out)
     
+    # Launch kernel
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
     
-    # Convert eps to a proper Triton constant if it's not None
-    eps_val = eps if eps is not None else None
+    # Convert eps to a proper Triton constant
+    eps_val = eps if eps is not None else 0.0
     
     _logit_kernel[grid](input, out, n, eps_val, BLOCK=block)
     return out

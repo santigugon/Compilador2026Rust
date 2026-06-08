@@ -3,44 +3,80 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def symmetric_mm_and_abs_sum_kernel(
-    A_ptr, C_ptr, out_ptr,
-    n, m,
-    alpha, beta,
-    BLOCK_SIZE_M=16, BLOCK_SIZE_N=16
+def _symmetric_mm_and_abs_sum_kernel(
+    a_ptr, c_ptr, out_ptr,
+    n: tl.constexpr, m: tl.constexpr,
+    alpha: tl.constexpr, beta: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     
-    # Compute the symmetric matrix multiplication
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # Compute the symmetric matrix multiplication part
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     
-    for k in range(0, m, BLOCK_SIZE_N):
-        a = tl.load(A_ptr + pid_m * BLOCK_SIZE_M + k * BLOCK_SIZE_N)
-        b = tl.load(A_ptr + pid_n * BLOCK_SIZE_N + k * BLOCK_SIZE_M)
-        acc += tl.dot(a, b)
+    # Loop over the K dimension (m in this case)
+    for k in range(0, m, BLOCK_N):
+        # Load A block
+        a_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        a_mask = a_offsets < n
+        a_block = tl.load(a_ptr + a_offsets * m + k, mask=a_mask[:, None], other=0.0)
+        
+        # Load A.T block (transpose)
+        a_t_offsets = k + tl.arange(0, BLOCK_N)
+        a_t_mask = a_t_offsets < m
+        a_t_block = tl.load(a_ptr + a_t_offsets + pid_n * BLOCK_N * m, mask=a_t_mask[None, :], other=0.0)
+        
+        # Compute dot product
+        acc += tl.dot(a_block, a_t_block)
     
-    # Scale and accumulate
-    c = tl.load(C_ptr + pid_m * BLOCK_SIZE_M + pid_n * BLOCK_SIZE_N)
-    result = alpha * acc + beta * c
+    # Scale by alpha
+    acc *= alpha
     
-    # Store result
-    tl.store(out_ptr + pid_m * BLOCK_SIZE_M + pid_n * BLOCK_SIZE_N, result)
+    # Load C and scale by beta
+    c_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    c_mask = c_offsets < n
+    c_block = tl.load(c_ptr + c_offsets * m + pid_n * BLOCK_N, mask=c_mask[:, None], other=0.0)
+    c_block *= beta
+    
+    # Add to result
+    result = acc + c_block
+    
+    # Store result back to C
+    tl.store(c_ptr + c_offsets * m + pid_n * BLOCK_N, result, mask=c_mask[:, None])
+    
+    # Compute sum of absolute values
+    abs_result = tl.abs(result)
+    sum_abs = tl.sum(abs_result)
+    
+    # Store the sum of absolute values
+    tl.store(out_ptr, sum_abs, mask=True)
 
 def symmetric_mm_and_abs_sum(A: torch.Tensor, C: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
-    n, m = A.shape
-    assert C.shape == (n, n), "C must have shape (n, n)"
+    # Ensure inputs are contiguous
+    A = A.contiguous()
+    C = C.contiguous()
     
-    # Create output tensor
-    out = torch.zeros_like(C)
+    n, m = A.shape
+    
+    # Create output tensor for the sum of absolute values
+    out = torch.empty(1, dtype=torch.float32, device=A.device)
+    
+    # Define block size
+    BLOCK_M = 32
+    BLOCK_N = 32
+    
+    # Grid size
+    grid_m = triton.cdiv(n, BLOCK_M)
+    grid_n = triton.cdiv(m, BLOCK_N)
+    grid = (grid_m, grid_n)
     
     # Launch kernel
-    grid = (triton.cdiv(n, 16), triton.cdiv(n, 16))
-    symmetric_mm_and_abs_sum_kernel[grid](
+    _symmetric_mm_and_abs_sum_kernel[grid](
         A, C, out,
         n, m,
-        alpha, beta
+        alpha, beta,
+        BLOCK_M, BLOCK_N
     )
     
-    # Return sum of absolute values
-    return torch.sum(torch.abs(out))
+    return out

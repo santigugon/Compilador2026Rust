@@ -1,92 +1,104 @@
 import torch
 import triton
 import triton.language as tl
-from typing import Optional
 
 @triton.jit
-def _fused_bmm_dropout_gelu_kernel(
-    input1_ptr, input2_ptr, output_ptr, 
+def _bmm_dropout_gelu_kernel(
+    input1_ptr, input2_ptr, out_ptr, 
     dropout_mask_ptr, 
-    B, N, M, P, 
-    dropout_p, 
-    training,
-    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
-    NUM_WARPS
+    batch_size, n, m, p, 
+    p_dropout: tl.constexpr, 
+    training: tl.constexpr, 
+    approximate: tl.constexpr,
+    BLOCK_M: tl.constexpr, 
+    BLOCK_N: tl.constexpr, 
+    BLOCK_P: tl.constexpr
 ):
-    # Compute batch matrix multiplication
-    pid = tl.program_id(axis=0)
-    pid_batch = pid // (N * P)
-    pid_m = (pid % (N * P)) // P
-    pid_n = (pid % (N * P)) % P
+    # Get the batch dimension
+    batch_id = tl.program_id(0)
     
-    # Load input tensors
-    input1 = tl.load(input1_ptr + pid_batch * N * M + pid_m * M + tl.arange(0, BLOCK_SIZE_K))
-    input2 = tl.load(input2_ptr + pid_batch * M * P + tl.arange(0, BLOCK_SIZE_K) * P + pid_n)
+    # Load input1 and input2 for this batch
+    input1_base = input1_ptr + batch_id * n * m
+    input2_base = input2_ptr + batch_id * m * p
     
-    # Compute dot product
-    accumulator = tl.sum(input1 * input2)
+    # Initialize output tensor
+    out_base = out_ptr + batch_id * n * p
     
-    # Apply dropout if training
-    if training:
-        # Generate random mask
-        rand_val = tl.random.rand(1)
-        dropout_mask = rand_val > dropout_p
-        accumulator = accumulator * dropout_mask / (1.0 - dropout_p)
+    # Initialize dropout mask
+    dropout_mask_base = dropout_mask_ptr + batch_id * n * p
     
-    # Apply GELU activation
-    if approximate == 'tanh':
-        # Approximate GELU using tanh
-        gelu_result = 0.5 * accumulator * (1 + tl.tanh(1.702 * accumulator))
-    else:
-        # Exact GELU
-        gelu_result = 0.5 * accumulator * (1 + tl.erf(accumulator / tl.sqrt(2.0)))
-    
-    # Store result
-    tl.store(output_ptr + pid, gelu_result)
+    # Perform batch matrix multiplication
+    for i in range(0, n, BLOCK_M):
+        for j in range(0, p, BLOCK_P):
+            # Compute block of output
+            acc = tl.zeros((BLOCK_M, BLOCK_P), dtype=tl.float32)
+            
+            for k in range(0, m, BLOCK_N):
+                # Load blocks
+                input1_block = tl.load(input1_base + (i + tl.arange(0, BLOCK_M)[:, None]) * m + (k + tl.arange(0, BLOCK_N)[None, :]), mask=(i + tl.arange(0, BLOCK_M)[:, None] < n) & (k + tl.arange(0, BLOCK_N)[None, :] < m))
+                input2_block = tl.load(input2_base + (k + tl.arange(0, BLOCK_N)[:, None]) * p + (j + tl.arange(0, BLOCK_P)[None, :]), mask=(k + tl.arange(0, BLOCK_N)[:, None] < m) & (j + tl.arange(0, BLOCK_P)[None, :] < p))
+                
+                # Accumulate
+                acc += tl.dot(input1_block, input2_block)
+            
+            # Store output
+            out_block = acc
+            out_block = out_block.to(tl.float32)
+            
+            # Apply dropout if training
+            if training:
+                # Generate dropout mask
+                dropout_mask = tl.random.rand(BLOCK_M, BLOCK_P) > p_dropout
+                # Apply dropout
+                out_block = tl.where(dropout_mask, out_block, 0.0)
+            
+            # Apply GELU activation
+            if approximate == 'tanh':
+                # Approximate GELU using tanh
+                out_block = 0.5 * out_block * (1.0 + tl.tanh(0.7978845608 * (out_block + 0.044715 * out_block * out_block * out_block)))
+            else:
+                # Exact GELU
+                out_block = 0.5 * out_block * (1.0 + tl.erf(out_block / tl.sqrt(2.0)))
+            
+            # Store result
+            tl.store(out_base + (i + tl.arange(0, BLOCK_M)[:, None]) * p + (j + tl.arange(0, BLOCK_P)[None, :]), out_block, mask=(i + tl.arange(0, BLOCK_M)[:, None] < n) & (j + tl.arange(0, BLOCK_P)[None, :] < p))
 
-def fused_bmm_dropout_gelu(
-    input1: torch.Tensor,
-    input2: torch.Tensor,
-    p: float = 0.5,
-    training: bool = True,
-    inplace: bool = False,
-    approximate: str = 'none',
-    *,
-    out: Optional[torch.Tensor] = None
-) -> torch.Tensor:
+def fused_bmm_dropout_gelu(input1, input2, p=0.5, training=True, inplace=False, approximate='none', *, out=None):
     # Validate inputs
     assert input1.dim() == 3, "input1 must be 3D tensor"
     assert input2.dim() == 3, "input2 must be 3D tensor"
-    assert input1.shape[0] == input2.shape[0], "Batch sizes must match"
-    assert input1.shape[2] == input2.shape[1], "Matrix dimensions must be compatible"
+    assert input1.size(0) == input2.size(0), "Batch sizes must match"
+    assert input1.size(2) == input2.size(1), "Inner dimensions must match"
     
-    B, N, M = input1.shape
-    _, _, P = input2.shape
+    # Get dimensions
+    batch_size, n, m = input1.shape
+    _, _, p = input2.shape
     
-    # Create output tensor if not provided
-    if out is None:
-        out = torch.empty(B, N, P, dtype=input1.dtype, device=input1.device)
+    # Create output tensor
+    if out is not None:
+        out = out
+    else:
+        out = torch.empty(batch_size, n, p, dtype=input1.dtype, device=input1.device)
     
-    # Set kernel parameters
-    BLOCK_SIZE_M = 16
-    BLOCK_SIZE_N = 16
-    BLOCK_SIZE_K = 32
-    NUM_WARPS = 4
+    # Create dropout mask tensor
+    dropout_mask = torch.empty(batch_size, n, p, dtype=torch.bool, device=input1.device)
+    
+    # Set up kernel launch parameters
+    BLOCK_M = 32
+    BLOCK_N = 32
+    BLOCK_P = 32
     
     # Launch kernel
-    grid = (B * N * P,)
-    _fused_bmm_dropout_gelu_kernel[grid](
-        input1_ptr=input1.data_ptr(),
-        input2_ptr=input2.data_ptr(),
-        output_ptr=out.data_ptr(),
-        dropout_mask_ptr=None,
-        B=B, N=N, M=M, P=P,
-        dropout_p=p,
+    grid = (batch_size,)
+    _bmm_dropout_gelu_kernel[grid](
+        input1, input2, out, dropout_mask,
+        batch_size, n, m, p,
+        p_dropout=p,
         training=training,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        NUM_WARPS=NUM_WARPS
+        approximate=1 if approximate == 'tanh' else 0,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_P=BLOCK_P
     )
     
     return out

@@ -29,22 +29,42 @@ def sum_std(input, dim=None, keepdim=False, dtype=None, correction=1, out=None):
     if dim is None:
         # Sum all elements
         sum_result = input.sum()
-        # Calculate standard deviation of the single sum value
-        # This is a bit unusual but follows the specification
-        std_result = sum_result.std(correction=correction)
+        # Calculate std of the single sum value
+        # For a single value, std is 0
+        std_result = torch.tensor(0.0, dtype=input.dtype, device=input.device)
+        if out is not None:
+            out.copy_(std_result)
+            return out
+        return std_result
     else:
-        # Handle specific dimensions
-        # For simplicity, we'll compute the sum along the specified dimension
-        # and then compute std of the resulting tensor
+        # Handle multi-dimensional case
+        # First compute sum along specified dimensions
         sum_result = input.sum(dim=dim, keepdim=keepdim)
-        std_result = sum_result.std(correction=correction)
-    
-    # If out is provided, we need to handle it
-    if out is not None:
-        out.copy_(std_result)
-        return out
-    
-    return std_result
+        
+        # Calculate standard deviation of the sum values
+        # This is a simplified approach - in practice, we'd need to handle
+        # the case where we're computing std of a reduced tensor
+        if keepdim:
+            # If keepdim is True, we need to compute std of the reduced tensor
+            # For simplicity, we'll compute std of the flattened tensor
+            flattened = sum_result.flatten()
+            if flattened.numel() == 1:
+                std_result = torch.tensor(0.0, dtype=flattened.dtype, device=flattened.device)
+            else:
+                # Use PyTorch's std function for the actual computation
+                std_result = flattened.std(unbiased=correction == 1)
+        else:
+            # If keepdim is False, we compute std of the flattened tensor
+            flattened = sum_result.flatten()
+            if flattened.numel() == 1:
+                std_result = torch.tensor(0.0, dtype=flattened.dtype, device=flattened.device)
+            else:
+                std_result = flattened.std(unbiased=correction == 1)
+        
+        if out is not None:
+            out.copy_(std_result)
+            return out
+        return std_result
 
 ##################################################################################################################################################
 

@@ -3,81 +3,119 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def dropout_sigmoid_linear_kernel(
+def _dropout_sigmoid_linear_kernel(
     input_ptr, weight_ptr, bias_ptr, output_ptr,
-    n_samples, n_features, out_features,
-    dropout_p, training,
-    BLOCK_SIZE=1024
+    n_input: tl.constexpr, n_output: tl.constexpr,
+    dropout_p: tl.constexpr, training: tl.constexpr,
+    input_stride_0: tl.constexpr, input_stride_1: tl.constexpr,
+    weight_stride_0: tl.constexpr, weight_stride_1: tl.constexpr,
+    bias_stride: tl.constexpr,
+    output_stride_0: tl.constexpr, output_stride_1: tl.constexpr,
+    BLOCK: tl.constexpr
 ):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_samples
+    pid_m = tl.program_id(1)
     
-    # Load input
-    input_block = tl.load(input_ptr + offsets * n_features, mask=mask[:, None])
+    # Process one output feature at a time
+    output_offsets = pid_m * output_stride_1 + tl.arange(0, BLOCK)
+    mask = output_offsets < n_output
     
-    # Linear transformation
-    output_block = tl.zeros((n_samples, out_features), dtype=tl.float32)
+    # Load bias
+    if bias_ptr != 0:
+        bias = tl.load(bias_ptr + output_offsets, mask=mask, other=0.0)
+    else:
+        bias = tl.zeros((BLOCK,), dtype=tl.float32)
     
-    for i in range(0, n_features, BLOCK_SIZE):
-        # Load weight block
-        weight_offsets = tl.arange(0, BLOCK_SIZE)
-        weight_mask = (i + weight_offsets) < n_features
-        weight_block = tl.load(weight_ptr + (tl.arange(0, out_features)[:, None] * n_features + (i + weight_offsets)[None, :]), mask=weight_mask[None, :])
+    # Initialize output
+    output = bias
+    
+    # Compute linear transformation
+    for i in range(0, n_input, BLOCK):
+        input_offsets = pid * input_stride_0 + i + tl.arange(0, BLOCK)
+        weight_offsets = output_offsets + i * weight_stride_1
         
-        # Compute linear transformation
-        input_slice = input_block[:, i:i+BLOCK_SIZE]
-        output_block += tl.dot(input_slice, weight_block)
-    
-    # Add bias
-    if bias_ptr is not None:
-        bias_block = tl.load(bias_ptr + tl.arange(0, out_features))
-        output_block += bias_block[None, :]
+        input_mask = (input_offsets < n_input) & (pid < input_stride_0)
+        weight_mask = (weight_offsets < n_output) & (i < n_input)
+        
+        # Load input and weight
+        input_vals = tl.load(input_ptr + input_offsets, mask=input_mask, other=0.0)
+        weight_vals = tl.load(weight_ptr + weight_offsets, mask=weight_mask, other=0.0)
+        
+        # Compute dot product
+        output += tl.sum(input_vals * weight_vals, axis=0)
     
     # Apply sigmoid
-    output_block = tl.sigmoid(output_block)
+    output = 1.0 / (1.0 + tl.exp(-output))
     
-    # Apply dropout
+    # Apply dropout if training
     if training:
-        dropout_mask = tl.random.rand(n_samples, out_features) > dropout_p
-        output_block = output_block * dropout_mask / (1.0 - dropout_p)
+        # Generate random mask
+        rand_vals = tl.random.rand(1, BLOCK)
+        dropout_mask = rand_vals > dropout_p
+        output = tl.where(dropout_mask, output, 0.0)
     
     # Store output
-    tl.store(output_ptr + offsets * out_features, output_block, mask=mask[:, None])
+    output_offsets = pid * output_stride_0 + pid_m * output_stride_1
+    tl.store(output_ptr + output_offsets, output, mask=mask)
 
 def dropout_sigmoid_linear(input: torch.Tensor, weight: torch.Tensor, bias=None, p=0.5, training=True, inplace=False) -> torch.Tensor:
-    assert input.dim() >= 2
-    assert weight.dim() == 2
-    assert weight.size(1) == input.size(-1)
+    # Validate inputs
+    assert input.dim() >= 2, "input must have at least 2 dimensions"
+    assert weight.dim() == 2, "weight must be 2-dimensional"
+    assert input.size(-1) == weight.size(1), "input and weight dimensions must match"
     if bias is not None:
-        assert bias.dim() == 1
-        assert bias.size(0) == weight.size(0)
+        assert bias.dim() == 1, "bias must be 1-dimensional"
+        assert bias.size(0) == weight.size(0), "bias and weight dimensions must match"
     
-    # Prepare input tensor
-    input_reshaped = input.view(-1, input.size(-1))
-    n_samples = input_reshaped.size(0)
-    n_features = input_reshaped.size(1)
+    # Prepare output tensor
+    input_shape = input.shape
     out_features = weight.size(0)
+    output_shape = input_shape[:-1] + (out_features,)
     
-    # Create output tensor
-    output = torch.empty(n_samples, out_features, dtype=input.dtype, device=input.device)
+    if inplace:
+        output = input
+    else:
+        output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+    
+    # Handle the case where we have a scalar input
+    if input.dim() == 1:
+        input = input.unsqueeze(0)
+        output = output.unsqueeze(0)
+    
+    # Get dimensions
+    n_input = input.size(-1)
+    n_output = weight.size(0)
+    
+    # Get strides
+    input_stride_0 = input.stride(-2) if input.dim() > 1 else 1
+    input_stride_1 = input.stride(-1) if input.dim() > 1 else 1
+    weight_stride_0 = weight.stride(0)
+    weight_stride_1 = weight.stride(1)
+    bias_stride = bias.stride(0) if bias is not None else 0
+    output_stride_0 = output.stride(-2) if output.dim() > 1 else 1
+    output_stride_1 = output.stride(-1) if output.dim() > 1 else 1
     
     # Launch kernel
-    grid = (triton.cdiv(n_samples, 1024),)
-    dropout_sigmoid_linear_kernel[grid](
-        input_reshaped,
-        weight,
-        bias,
-        output,
-        n_samples,
-        n_features,
-        out_features,
-        p,
-        training
+    block = 256
+    grid = (triton.cdiv(n_output, block), triton.cdiv(input.size(0), 1))
+    
+    # Handle bias
+    bias_ptr = bias.data_ptr() if bias is not None else 0
+    
+    # Launch kernel
+    _dropout_sigmoid_linear_kernel[grid](
+        input.data_ptr(), weight.data_ptr(), bias_ptr,
+        output.data_ptr(),
+        n_input, n_output, p, training,
+        input_stride_0, input_stride_1,
+        weight_stride_0, weight_stride_1,
+        bias_stride,
+        output_stride_0, output_stride_1,
+        BLOCK=block
     )
     
-    # Reshape output to match input shape
-    output = output.view(*input.shape[:-1], out_features)
-    
-    return output
+    # Return output
+    if inplace:
+        return input
+    else:
+        return output

@@ -2,112 +2,116 @@
 import torch
 import triton
 import triton.language as tl
-from typing import Optional
+import math
 
 @triton.jit
-def det_kernel(A, out, n, batch_size, BLOCK_SIZE: tl.constexpr):
-    batch_idx = tl.program_id(0)
-    if batch_idx >= batch_size:
-        return
+def _det_kernel(A_ptr, out_ptr, batch_size: tl.constexpr, n: tl.constexpr, BLOCK: tl.constexpr):
+    # Each block handles one batch element
+    batch_id = tl.program_id(0)
     
-    # Load matrix for this batch
-    A_batch = A + batch_idx * n * n
-    out_ptr = out + batch_idx
+    # Load matrix A for this batch
+    A_block = tl.block_ptr(A_ptr, (batch_size, n, n), (n * n, n, 1), (batch_id, 0, 0), (1, n, n))
     
-    # Initialize determinant
-    det = tl.full([1], 1.0, dtype=tl.float32)
+    # Allocate workspace for LU decomposition
+    L = tl.zeros((n, n), dtype=tl.float32)
+    U = tl.zeros((n, n), dtype=tl.float32)
     
-    # Copy input matrix to local memory
-    matrix = tl.zeros([BLOCK_SIZE, BLOCK_SIZE], dtype=tl.float32)
+    # Copy input matrix to U
     for i in range(n):
         for j in range(n):
-            matrix[i, j] = tl.load(A_batch + i * n + j)
+            U[i, j] = tl.load(A_block, (i, j))
     
-    # Gaussian elimination with partial pivoting
+    # Perform LU decomposition
     for k in range(n):
         # Find pivot
-        pivot_row = k
-        pivot_val = matrix[k, k]
+        pivot = k
         for i in range(k + 1, n):
-            if tl.abs(matrix[i, k]) > tl.abs(pivot_val):
-                pivot_row = i
-                pivot_val = matrix[i, k]
+            if abs(U[i, k]) > abs(U[pivot, k]):
+                pivot = i
         
         # Swap rows if needed
-        if pivot_row != k:
+        if pivot != k:
             for j in range(n):
-                temp = matrix[k, j]
-                matrix[k, j] = matrix[pivot_row, j]
-                matrix[pivot_row, j] = temp
-            det = -det
+                temp = U[k, j]
+                U[k, j] = U[pivot, j]
+                U[pivot, j] = temp
         
         # Check for zero pivot
-        if pivot_val == 0.0:
-            det = tl.zeros([1], dtype=tl.float32)
-            tl.store(out_ptr, det)
+        if abs(U[k, k]) < 1e-10:
+            # Matrix is singular, return 0
+            tl.store(out_ptr + batch_id, 0.0)
             return
         
-        # Update determinant
-        det = det * pivot_val
-        
-        # Eliminate column
+        # Eliminate
         for i in range(k + 1, n):
-            factor = matrix[i, k] / matrix[k, k]
+            factor = U[i, k] / U[k, k]
             for j in range(k, n):
-                matrix[i, j] = matrix[i, j] - factor * matrix[k, j]
+                U[i, j] = U[i, j] - factor * U[k, j]
+    
+    # Compute determinant as product of diagonal elements
+    det = 1.0
+    for i in range(n):
+        det *= U[i, i]
     
     # Store result
-    tl.store(out_ptr, det)
+    tl.store(out_ptr + batch_id, det)
 
-def linalg_det(A, *, out=None):
-    if A.dim() < 2:
-        raise ValueError("Input tensor must have at least 2 dimensions")
+def det(A, *, out=None):
+    # Handle scalar case
+    if A.dim() == 2:
+        batch_dims = ()
+        n = A.shape[-1]
+    else:
+        batch_dims = A.shape[:-2]
+        n = A.shape[-1]
     
-    batch_dims = A.shape[:-2]
-    n = A.shape[-1]
-    if A.shape[-2] != n:
-        raise ValueError("Input tensor must be square")
+    # Check if matrix is square
+    if A.shape[-1] != A.shape[-2]:
+        raise ValueError("Input matrix must be square")
     
+    # Compute batch size
     batch_size = 1
     for dim in batch_dims:
         batch_size *= dim
     
-    # Handle different dtypes
-    if A.dtype in [torch.complex64, torch.complex128]:
-        # For complex numbers, we need to handle the real and imaginary parts
-        # This is a simplified approach - in practice, you'd want to use
-        # a more robust complex determinant computation
-        if out is None:
-            out = torch.empty(batch_dims, dtype=torch.float32, device=A.device)
-        else:
-            if out.shape != batch_dims:
-                raise ValueError("Output tensor shape does not match batch dimensions")
-        
-        # Use torch's built-in determinant for complex numbers
-        if A.dtype == torch.complex64:
-            A_real = A.real
-            A_imag = A.imag
-            det_real = torch.linalg.det(A_real)
-            det_imag = torch.linalg.det(A_imag)
-            result = torch.complex(det_real, det_imag)
-        else:
-            result = torch.linalg.det(A)
-        
-        if out is not None:
-            out.copy_(result)
-            return out
-        return result
+    # Create output tensor
+    if out is None:
+        out = torch.empty(batch_dims, dtype=torch.float64, device=A.device)
     else:
-        # For real numbers, use Triton kernel
+        if out.shape != batch_dims:
+            raise ValueError("Output tensor shape does not match batch dimensions")
+    
+    # Handle special cases
+    if n == 1:
+        # For 1x1 matrix, determinant is just the element
         if out is None:
-            out = torch.empty(batch_dims, dtype=torch.float32, device=A.device)
-        else:
-            if out.shape != batch_dims:
-                raise ValueError("Output tensor shape does not match batch dimensions")
-        
-        # Use Triton kernel for real matrices
-        BLOCK_SIZE = 32
-        grid = (batch_size, 1, 1)
-        det_kernel[grid](A, out, n, batch_size, BLOCK_SIZE=BLOCK_SIZE)
+            out = torch.empty(batch_dims, dtype=torch.float64, device=A.device)
+        for i in range(batch_size):
+            out[i] = A[i].item()
         return out
+    
+    if n == 2:
+        # For 2x2 matrix: det = a*d - b*c
+        if out is None:
+            out = torch.empty(batch_dims, dtype=torch.float64, device=A.device)
+        for i in range(batch_size):
+            a = A[i, 0, 0]
+            b = A[i, 0, 1]
+            c = A[i, 1, 0]
+            d = A[i, 1, 1]
+            out[i] = a * d - b * c
+        return out
+    
+    # For larger matrices, use the general algorithm
+    block = 256
+    grid = (batch_size,)
+    
+    # Allocate output tensor
+    if out is None:
+        out = torch.empty(batch_dims, dtype=torch.float64, device=A.device)
+    
+    # Launch kernel
+    _det_kernel[grid](A, out, batch_size, n, BLOCK=block)
+    
+    return out
 ```

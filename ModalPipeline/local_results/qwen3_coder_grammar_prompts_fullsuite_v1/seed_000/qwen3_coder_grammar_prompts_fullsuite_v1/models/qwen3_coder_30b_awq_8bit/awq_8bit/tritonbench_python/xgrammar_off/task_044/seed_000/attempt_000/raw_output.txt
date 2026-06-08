@@ -31,26 +31,25 @@ def _softplus_linear_kernel(
     for i in range(0, n_cols, BLOCK_SIZE):
         weight_offsets = i + tl.arange(0, BLOCK_SIZE)
         weight_mask = weight_offsets < n_cols
-        
-        # Load weight column
-        weight_col = tl.load(weight_ptr + i * weight_stride_col + tl.arange(0, n_out), mask=weight_mask, other=0.0)
-        
-        # Compute partial dot product
+        weight_block = tl.load(weight_ptr + i * weight_stride_col + tl.arange(0, n_out), mask=weight_mask, other=0.0)
         input_val = tl.load(input_ptr + row * input_stride_row + i, mask=i < n_cols, other=0.0)
-        output_block += input_val * weight_col
+        output_block += input_val * weight_block
     
     # Add bias if provided
     if bias_ptr is not None:
         bias_offsets = tl.arange(0, n_out)
-        bias_vals = tl.load(bias_ptr + bias_offsets, mask=bias_offsets < n_out, other=0.0)
-        output_block += bias_vals
+        bias_block = tl.load(bias_ptr + bias_offsets, mask=bias_offsets < n_out, other=0.0)
+        output_block += bias_block
     
     # Apply softplus activation
-    output_block = tl.where(
-        output_block * beta > threshold,
-        output_block,
-        tl.log(1.0 + tl.exp(beta * output_block)) / beta
-    )
+    # Softplus(x) = (1/beta) * log(1 + exp(beta * x))
+    # For numerical stability, when x > threshold, we use x instead of softplus(x)
+    for i in range(n_out):
+        x = output_block[i]
+        if x > threshold:
+            output_block[i] = x
+        else:
+            output_block[i] = (1.0 / beta) * tl.log(1.0 + tl.exp(beta * x))
     
     # Store result
     tl.store(output_ptr + output_offsets, output_block, mask=output_offsets < n_rows * output_stride_row)
@@ -61,13 +60,17 @@ def softplus_linear(input, weight, bias=None, beta=1, threshold=20):
         raise ValueError("input must be a 2D tensor")
     if weight.dim() != 2:
         raise ValueError("weight must be a 2D tensor")
-    if input.size(1) != weight.size(1):
-        raise ValueError("input size(1) must match weight size(1)")
-    if bias is not None and bias.size(0) != weight.size(0):
-        raise ValueError("bias size(0) must match weight size(0)")
+    if bias is not None and bias.dim() != 1:
+        raise ValueError("bias must be a 1D tensor or None")
     
     n_rows, n_cols = input.shape
-    n_out = weight.size(0)
+    n_out = weight.shape[0]
+    
+    if bias is not None and bias.shape[0] != n_out:
+        raise ValueError("bias must have the same number of elements as weight rows")
+    
+    if n_cols != weight.shape[1]:
+        raise ValueError("input columns must match weight columns")
     
     # Create output tensor
     output = torch.empty(n_rows, n_out, dtype=input.dtype, device=input.device)
@@ -78,17 +81,18 @@ def softplus_linear(input, weight, bias=None, beta=1, threshold=20):
     # Launch kernel
     grid = (triton.cdiv(n_rows, BLOCK_SIZE),)
     
-    # Handle bias being None
-    bias_ptr = bias if bias is not None else None
-    
     # Get strides
     input_stride_row, input_stride_col = input.stride()
     weight_stride_row, weight_stride_col = weight.stride()
     output_stride_row, output_stride_col = output.stride()
-    bias_stride = bias.stride(0) if bias is not None else 0
+    bias_stride = bias.stride()[0] if bias is not None else 0
     
+    # Handle bias being None
+    bias_ptr = bias if bias is not None else tl.tensor(0, dtype=tl.float32)
+    
+    # Launch kernel
     _softplus_linear_kernel[grid](
-        input, weight, bias_ptr, output,
+        input, weight, bias, output,
         n_rows, n_cols, n_out,
         beta, threshold,
         input_stride_row, input_stride_col,

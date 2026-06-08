@@ -4,11 +4,13 @@ import triton.language as tl
 
 @triton.jit
 def _addmm_kernel(mat1_ptr, mat2_ptr, input_ptr, out_ptr, 
-                  mat1_rows: tl.constexpr, mat1_cols: tl.constexpr, 
-                  mat2_cols: tl.constexpr, 
+                  m: tl.constexpr, n: tl.constexpr, k: tl.constexpr,
+                  stride_mat1_m: tl.constexpr, stride_mat1_k: tl.constexpr,
+                  stride_mat2_k: tl.constexpr, stride_mat2_n: tl.constexpr,
+                  stride_input_m: tl.constexpr, stride_input_n: tl.constexpr,
+                  stride_out_m: tl.constexpr, stride_out_n: tl.constexpr,
                   beta: tl.constexpr, alpha: tl.constexpr,
-                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, 
-                  BLOCK_K: tl.constexpr):
+                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     
@@ -17,91 +19,90 @@ def _addmm_kernel(mat1_ptr, mat2_ptr, input_ptr, out_ptr,
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
     
-    # Initialize accumulator
-    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # Initialize accumulator for mat1 @ mat2
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     
     # Loop over the K dimension
-    for k in range(0, mat1_cols, BLOCK_K):
-        # Load mat1 and mat2 with appropriate masks
-        mat1_mask = (offs_m[:, None] < mat1_rows) & (offs_k[None, :] < mat1_cols - k)
-        mat2_mask = (offs_k[:, None] < mat1_cols - k) & (offs_n[None, :] < mat2_cols)
+    for k in range(0, k, BLOCK_K):
+        # Load mat1 and mat2 with appropriate strides
+        mat1_ptrs = mat1_ptr + (offs_m[:, None] * stride_mat1_m + offs_k[None, :] * stride_mat1_k)
+        mat2_ptrs = mat2_ptr + (offs_k[:, None] * stride_mat2_k + offs_n[None, :] * stride_mat2_n)
         
-        mat1_block = tl.load(mat1_ptr + offs_m[:, None] * mat1_cols + (k + offs_k[None, :]), 
-                            mask=mat1_mask, other=0.0)
-        mat2_block = tl.load(mat2_ptr + (k + offs_k[:, None]) * mat2_cols + offs_n[None, :], 
-                            mask=mat2_mask, other=0.0)
+        # Load blocks
+        mat1_block = tl.load(mat1_ptrs, mask=(offs_m[:, None] < m) & (offs_k[None, :] < k), other=0.0)
+        mat2_block = tl.load(mat2_ptrs, mask=(offs_k[:, None] < k) & (offs_n[None, :] < n), other=0.0)
         
         # Matrix multiplication
-        accumulator = tl.dot(mat1_block, mat2_block, accumulator)
+        acc += tl.dot(mat1_block, mat2_block)
     
     # Scale and add input
-    out_mask = (offs_m[:, None] < mat1_rows) & (offs_n[None, :] < mat2_cols)
+    out_ptrs = out_ptr + (offs_m[:, None] * stride_out_m + offs_n[None, :] * stride_out_n)
     
     # Load input
-    input_block = tl.load(input_ptr + offs_m[:, None] * mat2_cols + offs_n[None, :], 
-                         mask=out_mask, other=0.0)
+    input_ptrs = input_ptr + (offs_m[:, None] * stride_input_m + offs_n[None, :] * stride_input_n)
+    input_block = tl.load(input_ptrs, mask=(offs_m[:, None] < m) & (offs_n[None, :] < n), other=0.0)
     
     # Compute output
-    out_block = alpha * accumulator + beta * input_block
+    out_block = alpha * acc + beta * input_block
     
     # Store result
-    tl.store(out_ptr + offs_m[:, None] * mat2_cols + offs_n[None, :], 
-             out_block, mask=out_mask)
+    tl.store(out_ptrs, out_block, mask=(offs_m[:, None] < m) & (offs_n[None, :] < n))
 
 def addmm(input, mat1, mat2, *, beta=1, alpha=1, out=None):
-    # Handle scalar inputs
-    if not torch.is_tensor(beta):
-        beta = torch.tensor(beta, dtype=torch.float32, device=mat1.device)
-    if not torch.is_tensor(alpha):
-        alpha = torch.tensor(alpha, dtype=torch.float32, device=mat1.device)
+    # Ensure inputs are contiguous for easier handling
+    mat1 = mat1.contiguous()
+    mat2 = mat2.contiguous()
+    input = input.contiguous()
     
-    # Check dimensions
-    if mat1.dim() != 2 or mat2.dim() != 2:
-        raise ValueError("mat1 and mat2 must be 2D tensors")
+    # Get dimensions
+    m, k = mat1.shape
+    k2, n = mat2.shape
     
-    if mat1.size(1) != mat2.size(0):
-        raise ValueError("mat1 and mat2 must be compatible for matrix multiplication")
+    # Check dimensions match
+    if k != k2:
+        raise ValueError(f"mat1 and mat2 cannot be multiplied: {m}x{k} and {k2}x{n}")
     
-    # Get output shape
-    n, m = mat1.shape
-    m2, p = mat2.shape
-    
-    if input.shape != (n, p):
-        # Try to broadcast input
+    # Check if input is broadcastable with output shape (m, n)
+    if input.shape != (m, n):
+        # Try to broadcast
         try:
-            input = input.expand(n, p)
+            torch.broadcast_tensors(input, torch.empty(m, n))
         except RuntimeError:
-            raise ValueError("input must be broadcastable to (n, p) tensor")
+            raise ValueError(f"input shape {input.shape} is not broadcastable to {m}x{n}")
     
     # Create output tensor
     if out is None:
-        out = torch.empty(n, p, dtype=mat1.dtype, device=mat1.device)
+        out = torch.empty(m, n, dtype=mat1.dtype, device=mat1.device)
     else:
-        if out.shape != (n, p):
-            raise ValueError("out tensor must have shape (n, p)")
+        if out.shape != (m, n):
+            raise ValueError(f"out tensor must have shape {m}x{n}, got {out.shape}")
         if out.dtype != mat1.dtype or out.device != mat1.device:
             raise ValueError("out tensor must have the same dtype and device as mat1")
     
     # Launch kernel
     BLOCK_M = 16
     BLOCK_N = 16
-    BLOCK_K = 16
+    BLOCK_K = 32
     
-    grid_m = triton.cdiv(n, BLOCK_M)
-    grid_n = triton.cdiv(p, BLOCK_N)
+    grid_m = triton.cdiv(m, BLOCK_M)
+    grid_n = triton.cdiv(n, BLOCK_N)
     grid = (grid_m, grid_n)
     
-    # Ensure all tensors are contiguous for kernel access
-    mat1 = mat1.contiguous()
-    mat2 = mat2.contiguous()
-    input = input.contiguous()
-    out = out.contiguous()
+    # Get strides
+    stride_mat1_m, stride_mat1_k = mat1.stride()
+    stride_mat2_k, stride_mat2_n = mat2.stride()
+    stride_input_m, stride_input_n = input.stride()
+    stride_out_m, stride_out_n = out.stride()
     
+    # Launch kernel
     _addmm_kernel[grid](
         mat1, mat2, input, out,
-        n, m, p,
-        beta.item() if torch.is_tensor(beta) else beta,
-        alpha.item() if torch.is_tensor(alpha) else alpha,
+        m, n, k,
+        stride_mat1_m, stride_mat1_k,
+        stride_mat2_k, stride_mat2_n,
+        stride_input_m, stride_input_n,
+        stride_out_m, stride_out_n,
+        beta, alpha,
         BLOCK_M, BLOCK_N, BLOCK_K
     )
     

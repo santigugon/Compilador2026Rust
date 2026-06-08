@@ -1,116 +1,161 @@
 import torch
 import triton
 import triton.language as tl
-import math
 
 @triton.jit
-def _conv2d_kernel(
-    input_ptr, weight_ptr, bias_ptr, output_ptr,
-    input_shape, weight_shape, output_shape,
-    stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w, groups,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr
+def conv2d_kernel(
+    input_ptr, weight_ptr, output_ptr,
+    input_shape, weight_shape,
+    stride_h, stride_w,
+    padding_h, padding_w,
+    dilation_h, dilation_w,
+    groups,
+    BLOCK_SIZE_M=16,
+    BLOCK_SIZE_N=16,
+    BLOCK_SIZE_K=16
 ):
-    pid = tl.program_id(0)
-    pid_group = pid // GROUP_SIZE_M
-    pid_batch = pid_group // (output_shape[2] * output_shape[3])
-    pid_h = (pid_group % (output_shape[2] * output_shape[3])) // output_shape[3]
-    pid_w = (pid_group % (output_shape[2] * output_shape[3])) % output_shape[3]
+    # Get thread indices
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
     
-    # Compute output indices
-    batch_idx = pid_batch
-    out_h = pid_h
-    out_w = pid_w
+    # Load input and weight
+    input_ptr = input_ptr + pid_m * BLOCK_SIZE_M * input_shape[3] + pid_k * BLOCK_SIZE_K
+    weight_ptr = weight_ptr + pid_n * BLOCK_SIZE_N * weight_shape[2] * weight_shape[3] + pid_k * BLOCK_SIZE_K
     
-    # Shared memory for input tiles
-    input_tile = tl.shared_ptr(input_ptr, shape=(BLOCK_M, BLOCK_N), dtype=tl.float32)
-    weight_tile = tl.shared_ptr(weight_ptr, shape=(BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # Compute convolution
+    output_ptr = output_ptr + pid_m * BLOCK_SIZE_M * BLOCK_SIZE_N + pid_n * BLOCK_SIZE_N
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     
-    # Initialize accumulator
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # Perform convolution computation
+    for i in range(0, input_shape[2] * input_shape[3], BLOCK_SIZE_K):
+        input_tile = tl.load(input_ptr + i)
+        weight_tile = tl.load(weight_ptr + i)
+        accumulator += tl.dot(input_tile, weight_tile)
     
-    # Loop over groups
-    for g in range(groups):
-        # Compute input indices
-        in_c_start = g * (weight_shape[1] // groups)
-        in_c_end = (g + 1) * (weight_shape[1] // groups)
-        
-        # Loop over kernel
-        for kh in range(weight_shape[2]):
-            for kw in range(weight_shape[3]):
-                # Compute input indices
-                in_h_start = out_h * stride_h - padding_h + kh * dilation_h
-                in_w_start = out_w * stride_w - padding_w + kw * dilation_w
-                
-                # Load input tile
-                input_offsets = (
-                    batch_idx * input_shape[1] * input_shape[2] * input_shape[3] +
-                    in_c_start * input_shape[2] * input_shape[3] +
-                    in_h_start * input_shape[3] + in_w_start
-                )
-                
-                # Load weight tile
-                weight_offsets = (
-                    0 * weight_shape[1] * weight_shape[2] * weight_shape[3] +
-                    in_c_start * weight_shape[2] * weight_shape[3] +
-                    kh * weight_shape[3] + kw
-                )
-                
-                # Perform convolution
-                for i in range(BLOCK_M):
-                    for j in range(BLOCK_N):
-                        if (in_h_start + i < input_shape[2] and 
-                            in_w_start + j < input_shape[3] and
-                            in_h_start + i >= 0 and
-                            in_w_start + j >= 0):
-                            input_val = tl.load(input_ptr + input_offsets + i * input_shape[3] + j)
-                            weight_val = tl.load(weight_ptr + weight_offsets + i * weight_shape[3] + j)
-                            acc += input_val * weight_val
-    
-    # Store output
-    output_offsets = (
-        batch_idx * output_shape[1] * output_shape[2] * output_shape[3] +
-        0 * output_shape[2] * output_shape[3] +
-        out_h * output_shape[3] + out_w
-    )
-    tl.store(output_ptr + output_offsets, acc)
+    # Store result
+    tl.store(output_ptr, accumulator)
 
-def dropout_relu_batch_norm_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, p=0.5, training=True, inplace=False):
-    # Handle scalar inputs
-    if not isinstance(stride, tuple):
-        stride = (stride, stride)
-    if not isinstance(padding, tuple):
-        padding = (padding, padding)
-    if not isinstance(dilation, tuple):
-        dilation = (dilation, dilation)
+@triton.jit
+def batch_norm_kernel(
+    input_ptr, output_ptr, mean_ptr, var_ptr, weight_ptr, bias_ptr,
+    input_shape, eps=1e-5,
+    BLOCK_SIZE=256
+):
+    # Get thread indices
+    pid = tl.program_id(0)
     
-    # Conv2d
-    conv_out = torch.nn.functional.conv2d(
-        input, weight, bias, stride, padding, dilation, groups
+    # Load input
+    input_ptr = input_ptr + pid * BLOCK_SIZE
+    output_ptr = output_ptr + pid * BLOCK_SIZE
+    
+    # Compute mean and variance
+    mean = tl.sum(input_ptr) / input_shape[0]
+    var = tl.sum((input_ptr - mean) ** 2) / input_shape[0]
+    
+    # Normalize and scale
+    normalized = (input_ptr - mean) / tl.sqrt(var + eps)
+    output = normalized * weight_ptr + bias_ptr
+    
+    # Store result
+    tl.store(output_ptr, output)
+
+@triton.jit
+def relu_kernel(
+    input_ptr, output_ptr,
+    input_shape,
+    BLOCK_SIZE=256
+):
+    # Get thread indices
+    pid = tl.program_id(0)
+    
+    # Load input
+    input_ptr = input_ptr + pid * BLOCK_SIZE
+    output_ptr = output_ptr + pid * BLOCK_SIZE
+    
+    # Apply ReLU
+    output = tl.maximum(input_ptr, 0.0)
+    
+    # Store result
+    tl.store(output_ptr, output)
+
+@triton.jit
+def dropout_kernel(
+    input_ptr, output_ptr, mask_ptr,
+    input_shape, p=0.5,
+    BLOCK_SIZE=256
+):
+    # Get thread indices
+    pid = tl.program_id(0)
+    
+    # Load input
+    input_ptr = input_ptr + pid * BLOCK_SIZE
+    output_ptr = output_ptr + pid * BLOCK_SIZE
+    mask_ptr = mask_ptr + pid * BLOCK_SIZE
+    
+    # Generate random mask
+    mask = tl.rand() > p
+    
+    # Apply dropout
+    output = input_ptr * mask / (1.0 - p)
+    
+    # Store result
+    tl.store(output_ptr, output)
+
+def dropout_relu_batch_norm_conv2d(
+    input: torch.Tensor, 
+    weight: torch.Tensor, 
+    bias=None, 
+    stride=1, 
+    padding=0, 
+    dilation=1, 
+    groups=1, 
+    p=0.5, 
+    training=True, 
+    inplace=False
+) -> torch.Tensor:
+    # Ensure input and weight are on the same device and have correct dtype
+    device = input.device
+    input = input.to(torch.float32)
+    weight = weight.to(torch.float32)
+    
+    # Conv2D
+    N, C_in, H, W = input.shape
+    C_out, _, kH, kW = weight.shape
+    
+    # Calculate output dimensions
+    H_out = (H + 2 * padding - (dilation * (kH - 1) + 1)) // stride + 1
+    W_out = (W + 2 * padding - (dilation * (kW - 1) + 1)) // stride + 1
+    
+    # Initialize output tensor
+    output = torch.empty(N, C_out, H_out, W_out, device=device, dtype=torch.float32)
+    
+    # Conv2D kernel launch
+    grid = (triton.cdiv(H_out, 16), triton.cdiv(C_out, 16), triton.cdiv(C_in, 16))
+    conv2d_kernel[grid](
+        input, weight, output,
+        input.shape, weight.shape,
+        stride, stride,
+        padding, padding,
+        dilation, dilation,
+        groups
     )
     
-    # BatchNorm
-    # For simplicity, we'll use PyTorch's batch norm
-    # In a real implementation, we'd need to compute batch stats
-    batch_norm_out = torch.nn.functional.batch_norm(
-        conv_out, 
-        weight=torch.ones_like(conv_out[0]),  # Placeholder
-        bias=torch.zeros_like(conv_out[0]),  # Placeholder
-        running_mean=torch.zeros_like(conv_out[0]),  # Placeholder
-        running_var=torch.ones_like(conv_out[0]),  # Placeholder
-        training=training,
-        momentum=0.1,
-        eps=1e-5
-    )
+    # Batch normalization
+    mean = output.mean(dim=(0, 2, 3), keepdim=True)
+    var = output.var(dim=(0, 2, 3), keepdim=True)
+    weight_bn = torch.ones_like(mean)
+    bias_bn = torch.zeros_like(mean)
+    
+    # Apply batch norm
+    output = (output - mean) / torch.sqrt(var + 1e-5) * weight_bn + bias_bn
     
     # ReLU
-    relu_out = torch.nn.functional.relu(batch_norm_out)
+    output = torch.relu(output)
     
     # Dropout
     if training and p > 0:
-        dropout_mask = torch.rand_like(relu_out) > p
-        dropout_out = relu_out * dropout_mask / (1 - p)
-    else:
-        dropout_out = relu_out
+        mask = torch.rand_like(output) > p
+        output = output * mask / (1.0 - p)
     
-    return dropout_out
+    return output

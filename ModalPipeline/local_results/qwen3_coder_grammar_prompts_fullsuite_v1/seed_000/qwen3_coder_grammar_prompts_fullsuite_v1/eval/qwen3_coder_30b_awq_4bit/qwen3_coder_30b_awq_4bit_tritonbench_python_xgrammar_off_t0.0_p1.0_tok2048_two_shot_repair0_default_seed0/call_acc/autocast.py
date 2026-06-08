@@ -14,22 +14,13 @@ def _elementwise_add_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.co
 def autocast(device_type, enabled=True, dtype=None, cache_enabled=True):
     """
     This is a simplified Triton-based wrapper for demonstration purposes.
-    In practice, torch.amp.autocast is a context manager that handles
-    mixed precision operations internally and cannot be directly replaced
-    with a simple Triton kernel.
+    In practice, torch.amp.autocast is implemented at the PyTorch level
+    and handles complex mixed precision logic including kernel selection,
+    dtype inference, and automatic casting.
     
-    This implementation shows how one might structure a wrapper that
-    could potentially handle some of the operations within an autocast
-    context, but it does not fully replicate the behavior of
-    torch.amp.autocast.
+    This implementation shows how a basic elementwise operation
+    could be implemented in Triton within an autocast-like context.
     """
-    # This is a placeholder implementation that demonstrates
-    # how a Triton kernel might be used in a mixed precision context
-    # The actual torch.amp.autocast functionality is much more complex
-    # and involves kernel selection, dtype management, and automatic
-    # precision switching that cannot be fully captured in a simple
-    # kernel wrapper.
-    
     class AutocastContext:
         def __init__(self, device_type, enabled, dtype, cache_enabled):
             self.device_type = device_type
@@ -38,40 +29,36 @@ def autocast(device_type, enabled=True, dtype=None, cache_enabled=True):
             self.cache_enabled = cache_enabled
             
         def __enter__(self):
-            # In a real implementation, this would set up the autocast context
-            # For this example, we just return self
+            # In a real implementation, this would set up the autocast state
             return self
             
         def __exit__(self, exc_type, exc_val, exc_tb):
-            # Cleanup would happen here in a real implementation
+            # In a real implementation, this would clean up the autocast state
             pass
             
-        def __call__(self, func):
-            # For decorator usage
-            def wrapper(*args, **kwargs):
-                with self:
-                    return func(*args, **kwargs)
-            return wrapper
-    
+        def elementwise_add(self, input1, input2):
+            """
+            Example of how a simple operation might be implemented
+            with Triton within an autocast context.
+            """
+            if not self.enabled:
+                return input1 + input2
+                
+            # For demonstration, we'll use a simple Triton kernel
+            # In practice, this would be more complex and involve
+            # proper dtype handling and kernel selection
+            out = torch.empty_like(input1)
+            n = input1.numel()
+            block = 256
+            grid = (triton.cdiv(n, block),)
+            
+            if input1.is_cuda and input2.is_cuda:
+                _elementwise_add_kernel[grid](input1, input2, out, n, BLOCK=block)
+                return out
+            else:
+                return input1 + input2
+                
     return AutocastContext(device_type, enabled, dtype, cache_enabled)
-
-# Helper function to demonstrate a simple Triton operation
-# that could be part of a larger mixed precision system
-def _simple_mixed_precision_add(input1, input2):
-    """
-    A simple example of how a Triton kernel might be used
-    in a mixed precision computation.
-    """
-    out = torch.empty_like(input1)
-    n = input1.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    
-    if input1.is_cuda and input2.is_cuda:
-        _elementwise_add_kernel[grid](input1, input2, out, n, BLOCK=block)
-        return out
-    else:
-        return input1 + input2
 
 ##################################################################################################################################################
 

@@ -4,62 +4,67 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _logspace_kernel(start_ptr, end_ptr, out_ptr, steps: tl.constexpr, base: tl.constexpr, BLOCK: tl.constexpr):
+def logspace_kernel(
+    start_ptr, end_ptr, out_ptr, steps, base, 
+    BLOCK_SIZE: tl.constexpr
+):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < steps
     
-    # Load start and end values (assuming they are scalar)
     start_val = tl.load(start_ptr)
     end_val = tl.load(end_ptr)
     
-    # Calculate the logarithmic spacing
-    # We want: base^(start + i * (end - start) / (steps - 1)) for i in [0, steps-1]
-    # This is equivalent to: base^(start + i * delta) where delta = (end - start) / (steps - 1)
-    if steps > 1:
-        delta = (end_val - start_val) / (steps - 1)
-        indices = offsets * delta + start_val
-    else:
-        # If steps == 1, just return base^start
-        indices = tl.full((BLOCK,), start_val, dtype=tl.float32)
-        mask = offsets < 1
+    # Calculate log base^start to log base^end
+    log_start = tl.log(start_val) / tl.log(base)
+    log_end = tl.log(end_val) / tl.log(base)
     
-    # Compute base^indices
-    # Using the identity: base^x = exp(x * log(base))
-    result = tl.exp(indices * tl.log(base))
+    # Generate linearly spaced values in log space
+    log_vals = tl.libdevice.log10(1.0 + (log_end - log_start) * offsets / (steps - 1))
     
-    # Store the result
+    # Convert back to base^value
+    result = tl.pow(base, log_vals)
+    
     tl.store(out_ptr + offsets, result, mask=mask)
 
 def logspace(start, end, steps, base=10.0, *, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False):
-    # Handle scalar inputs
-    if not torch.is_tensor(start):
-        start = torch.tensor(start, dtype=torch.float32)
-    if not torch.is_tensor(end):
-        end = torch.tensor(end, dtype=torch.float32)
+    if device is None:
+        device = torch.get_default_device()
     
-    # Create output tensor
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    
     if out is None:
-        if dtype is None:
-            dtype = torch.get_default_dtype()
-        out = torch.empty(steps, dtype=dtype, device=device, layout=layout, requires_grad=requires_grad)
+        out = torch.empty(steps, dtype=dtype, device=device)
     else:
-        if out.numel() != steps:
-            raise ValueError(f"Output tensor must have {steps} elements")
-        if dtype is not None and out.dtype != dtype:
-            out = out.to(dtype)
-        if device is not None and out.device != device:
-            out = out.to(device)
+        if out.shape != (steps,):
+            raise ValueError("out tensor must have shape (steps,)")
+        if out.dtype != dtype:
+            raise ValueError("out tensor must have the same dtype as requested")
+        if out.device != device:
+            raise ValueError("out tensor must be on the same device as requested")
     
-    # Handle special case of 0 steps
-    if steps == 0:
-        return out
+    # Handle scalar inputs
+    if not isinstance(start, torch.Tensor):
+        start = torch.tensor(start, device=device, dtype=dtype)
+    if not isinstance(end, torch.Tensor):
+        end = torch.tensor(end, device=device, dtype=dtype)
+    
+    # Ensure tensors are 0-dimensional
+    if start.dim() != 0:
+        raise ValueError("start must be a 0-dimensional tensor")
+    if end.dim() != 0:
+        raise ValueError("end must be a 0-dimensional tensor")
     
     # Launch kernel
-    block = 256
-    grid = (triton.cdiv(steps, block),)
+    BLOCK_SIZE = 256
+    grid_size = (steps + BLOCK_SIZE - 1) // BLOCK_SIZE
     
-    _logspace_kernel[grid](start, end, out, steps, base, BLOCK=block)
+    logspace_kernel[grid_size,](start, end, out, steps, base, BLOCK_SIZE)
+    
+    if requires_grad:
+        out.requires_grad_(True)
     
     return out
 ```

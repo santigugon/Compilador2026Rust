@@ -19,26 +19,21 @@ def _add_gelu_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, alpha: tl.constexpr
     gelu = 0.5 * z * (1.0 + tl.tanh(gelu_input))
     tl.store(out_ptr + offsets, gelu, mask=mask)
 
-def add_gelu(input, other, alpha=1, approximate='none', out=None):
+def add_gelu(input, other, alpha=1, approximate='none', out=None) -> torch.Tensor:
     if out is None:
         out = torch.empty_like(input)
-    
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
     
     # Handle scalar other
     if not torch.is_tensor(other):
         other = torch.tensor(other, dtype=input.dtype, device=input.device)
-        # Expand to match input shape for broadcasting
+    
+    # Expand other to match input shape for broadcasting
+    if other.shape != input.shape:
         other = other.expand_as(input)
     
-    # Ensure other has the same shape as input for broadcasting
-    if other.shape != input.shape:
-        # This is a simplified approach - in practice, you might want to handle
-        # broadcasting more carefully, but for this implementation we assume
-        # that the shapes are compatible for element-wise operations
-        pass
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
     
     _add_gelu_kernel[grid](input, other, out, n, alpha, BLOCK=block)
     return out

@@ -19,7 +19,7 @@ def _qr_solve_kernel(A_ptr, b_ptr, x_ptr, m: tl.constexpr, n: tl.constexpr, k: t
                 acc += a_val * b_val
             tl.store(x_ptr + i * x_stride_0 + pid * x_stride_1, acc)
     
-    # Solve Rx = Q^T * b using back substitution
+    # Solve R * x = Q^T * b using back substitution
     if pid < k:
         for i in range(n - 1, -1, -1):
             acc = tl.load(x_ptr + i * x_stride_0 + pid * x_stride_1)
@@ -34,21 +34,34 @@ def fused_qr_solve(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     m, n = A.shape
     k = b.shape[1] if len(b.shape) > 1 else 1
     
-    # Create output tensor
-    x = torch.empty(n, k, dtype=A.dtype, device=A.device)
-    
-    # Copy A to a temporary tensor for QR decomposition
-    A_copy = A.clone()
-    
-    # Perform QR decomposition using torch (for simplicity)
-    Q, R = torch.linalg.qr(A_copy)
+    # Perform QR decomposition using torch's built-in function
+    Q, R = torch.linalg.qr(A, mode='reduced')
     
     # Compute Q^T * b
-    Qt_b = Q.t() @ b
+    Qt_b = torch.matmul(Q.t(), b)
     
-    # Solve Rx = Q^T * b using back substitution
-    # We'll use a simple approach with torch for the triangular solve
-    x = torch.linalg.solve_triangular(R, Qt_b, upper=True)
+    # Solve R * x = Q^T * b using back substitution
+    x = torch.zeros((n, k), dtype=A.dtype, device=A.device)
+    
+    # Use Triton kernel for solving
+    block = 256
+    grid = (triton.cdiv(k, block),)
+    
+    # Create a temporary tensor for the result
+    out = torch.empty_like(Qt_b)
+    
+    # Copy Qt_b to out for the kernel
+    out.copy_(Qt_b)
+    
+    # Launch kernel
+    _qr_solve_kernel[grid](
+        R, out, x,
+        m, n, k,
+        R.stride(0), R.stride(1),
+        out.stride(0), out.stride(1),
+        x.stride(0), x.stride(1),
+        BLOCK=block
+    )
     
     return x
 

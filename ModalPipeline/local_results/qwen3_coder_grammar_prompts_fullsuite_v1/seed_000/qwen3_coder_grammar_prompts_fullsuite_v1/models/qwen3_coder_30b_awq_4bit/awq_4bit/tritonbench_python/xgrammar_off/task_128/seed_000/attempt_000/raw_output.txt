@@ -4,92 +4,88 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _rms_norm_kernel(x_ptr, weight_ptr, out_ptr, n: tl.constexpr, eps: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0)
-    # Compute RMS
-    mean_square = tl.sum(x * x, axis=0) / n
-    inv_rms = 1.0 / tl.sqrt(mean_square + eps)
-    # Normalize and scale
-    y = x * inv_rms * weight
-    tl.store(out_ptr + offsets, y, mask=mask)
-
-@triton.jit
-def _gelu_kernel(x_ptr, out_ptr, n: tl.constexpr, approximate: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    if approximate == 'tanh':
-        # GELU with tanh approximation
-        y = 0.5 * x * (1.0 + tl.tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
+def fused_bmm_rmsnorm_gelu_dropout_kernel(
+    input1_ptr, input2_ptr, output_ptr, 
+    input1_row_stride, input1_col_stride,
+    input2_row_stride, input2_col_stride,
+    output_row_stride, output_col_stride,
+    normalized_shape, dropout_p, eps, training,
+    B, N, M, P,
+    BLOCK_SIZE: tl.constexpr,
+    APPROXIMATE: tl.constexpr
+):
+    # Get the batch and sequence dimensions
+    batch_idx = tl.program_id(0)
+    seq_idx = tl.program_id(1)
+    
+    # Load input1 and input2 for this batch and sequence
+    input1_block = tl.load(input1_ptr + batch_idx * input1_row_stride + seq_idx * input1_col_stride, mask=None)
+    input2_block = tl.load(input2_ptr + batch_idx * input2_row_stride + seq_idx * input2_col_stride, mask=None)
+    
+    # Perform batch matrix multiplication
+    output_block = tl.zeros((N, P), dtype=tl.float32)
+    for i in range(M):
+        output_block += tl.expand_dims(input1_block[:, i], 1) * tl.expand_dims(input2_block[i, :], 0)
+    
+    # Apply RMS normalization
+    mean = tl.sum(output_block * output_block, axis=1) / normalized_shape
+    rms = tl.sqrt(mean + eps)
+    output_block = output_block / rms
+    
+    # Apply GELU activation
+    if APPROXIMATE == "tanh":
+        output_block = 0.5 * output_block * (1 + tl.tanh(0.7978845608 * (output_block + 0.044715 * output_block * output_block * output_block)))
     else:
-        # GELU exact
-        y = 0.5 * x * (1.0 + tl.erf(x / tl.sqrt(2.0)))
-    tl.store(out_ptr + offsets, y, mask=mask)
-
-@triton.jit
-def _dropout_kernel(x_ptr, out_ptr, mask_ptr, n: tl.constexpr, p: tl.constexpr, training: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+        output_block = 0.5 * output_block * (1 + tl.erf(output_block / tl.sqrt(2.0)))
+    
+    # Apply dropout
     if training:
-        # Generate random mask
-        # Note: In practice, we'd use a proper random number generator
-        # For simplicity, we'll use a deterministic approach
-        # This is a placeholder - real implementation would use proper RNG
-        rand_val = tl.random.normal(offsets)  # This is a placeholder
-        keep_mask = rand_val > p
-        y = x * keep_mask / (1.0 - p)
-    else:
-        y = x
-    tl.store(out_ptr + offsets, y, mask=mask)
+        dropout_mask = tl.rand(1, 1) > dropout_p
+        output_block = output_block * dropout_mask / (1.0 - dropout_p)
+    
+    # Store the result
+    tl.store(output_ptr + batch_idx * output_row_stride + seq_idx * output_col_stride, output_block)
 
 def fused_bmm_rmsnorm_gelu_dropout(input1, input2, normalized_shape, dropout_p=0.1, eps=1e-5, training=True, approximate='none', *, out=None):
     # Validate inputs
-    if not isinstance(normalized_shape, (int, list, torch.Size)):
-        raise ValueError("normalized_shape must be an int, list, or torch.Size")
+    assert input1.dim() == 3 and input2.dim() == 3
+    assert input1.size(0) == input2.size(0) and input1.size(2) == input2.size(1)
+    assert isinstance(normalized_shape, (int, list, torch.Size))
     
+    # Prepare dimensions
+    B, N, M = input1.shape
+    _, _, P = input2.shape
+    
+    # Ensure normalized_shape is a list
     if isinstance(normalized_shape, int):
         normalized_shape = [normalized_shape]
+    elif isinstance(normalized_shape, torch.Size):
+        normalized_shape = list(normalized_shape)
     
-    batch_size, seq_len, hidden_size = input1.shape[0], input1.shape[1], input2.shape[2]
-    if input2.shape[0] != batch_size or input2.shape[1] != input1.shape[2]:
-        raise ValueError("input1 and input2 shapes are incompatible for batch matrix multiplication")
+    # Compute output shape
+    output_shape = (B, N, P)
     
-    # Compute batch matrix multiplication
-    bmm_out = torch.bmm(input1, input2)
-    
-    # Prepare for RMS normalization
-    # We'll normalize over the last dimension (hidden_size)
-    n = hidden_size
+    # Initialize output tensor
     if out is None:
-        out = torch.empty_like(bmm_out)
-    
-    # Initialize weight tensor for RMS normalization
-    weight = torch.ones(n, dtype=torch.float32, device=input1.device)
-    
-    # RMS normalization
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    _rms_norm_kernel[grid](bmm_out, weight, out, n, eps, BLOCK=block)
-    
-    # GELU activation
-    if approximate == 'tanh':
-        approx = 'tanh'
+        out = torch.empty(output_shape, dtype=input1.dtype, device=input1.device)
     else:
-        approx = 'none'
+        assert out.shape == output_shape and out.dtype == input1.dtype and out.device == input1.device
     
-    gelu_out = torch.empty_like(out)
-    _gelu_kernel[grid](out, gelu_out, n, approx, BLOCK=block)
+    # Launch kernel
+    grid = (B, N)
+    BLOCK_SIZE = 32
+    APPROXIMATE = 1 if approximate == "tanh" else 0
     
-    # Dropout
-    dropout_out = torch.empty_like(gelu_out)
-    _dropout_kernel[grid](gelu_out, dropout_out, None, n, dropout_p, training, BLOCK=block)
+    fused_bmm_rmsnorm_gelu_dropout_kernel[grid](
+        input1, input2, out,
+        input1.stride(0), input1.stride(1),
+        input2.stride(0), input2.stride(1),
+        out.stride(0), out.stride(1),
+        normalized_shape[0], dropout_p, eps, training,
+        B, N, M, P,
+        BLOCK_SIZE=BLOCK_SIZE,
+        APPROXIMATE=APPROXIMATE
+    )
     
-    return dropout_out
+    return out
 ```

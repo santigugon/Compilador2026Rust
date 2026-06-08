@@ -3,39 +3,45 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _signbit_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+def signbit_bitwise_and_kernel(
+    input_ptr, other_ptr, signbit_ptr, bitwise_and_ptr,
+    n_elements, BLOCK_SIZE: tl.constexpr
+):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    # Extract sign bit: cast to int32 and check the 31st bit
-    x_bits = tl.bitwise_and(tl.cast(x, tl.int32), 0x80000000)
-    signbit_result = tl.cast(x_bits != 0, tl.int8)
-    tl.store(out_ptr + offsets, signbit_result, mask=mask)
-
-@triton.jit
-def _bitwise_and_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0)
-    y = tl.load(y_ptr + offsets, mask=mask, other=0)
-    result = tl.bitwise_and(x, y)
-    tl.store(out_ptr + offsets, result, mask=mask)
-
-def signbit_bitwise_and(input: torch.Tensor, other: torch.Tensor):
-    # For signbit operation
-    signbit_out = torch.empty(input.shape, dtype=torch.bool, device=input.device)
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    _signbit_kernel[grid](input, signbit_out, n, BLOCK=block)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
     
-    # For bitwise_and operation
-    bitwise_and_out = torch.empty(other.shape, dtype=other.dtype, device=other.device)
-    n = other.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    _bitwise_and_kernel[grid](input.to(torch.int32), other, bitwise_and_out, n, BLOCK=block)
+    input_vals = tl.load(input_ptr + offsets, mask=mask)
+    other_vals = tl.load(other_ptr + offsets, mask=mask)
     
-    return signbit_out, bitwise_and_out
+    signbit_result = tl.where(input_vals < 0.0, True, False)
+    bitwise_and_result = input_vals & other_vals
+    
+    tl.store(signbit_ptr + offsets, signbit_result, mask=mask)
+    tl.store(bitwise_and_ptr + offsets, bitwise_and_result, mask=mask)
+
+def signbit_bitwise_and(input: torch.Tensor, other: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    assert input.dtype == torch.float32 or input.dtype == torch.float64
+    assert other.dtype in [torch.int8, torch.int16, torch.int32, torch.int64, torch.bool]
+    assert input.shape == other.shape
+    
+    n_elements = input.numel()
+    BLOCK_SIZE = 1024
+    output_shape = input.shape
+    
+    signbit_result = torch.empty_like(input, dtype=torch.bool)
+    bitwise_and_result = torch.empty_like(other, dtype=other.dtype)
+    
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    signbit_bitwise_and_kernel[grid](
+        input_ptr=input,
+        other_ptr=other,
+        signbit_ptr=signbit_result,
+        bitwise_and_ptr=bitwise_and_result,
+        n_elements=n_elements,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return signbit_result, bitwise_and_result

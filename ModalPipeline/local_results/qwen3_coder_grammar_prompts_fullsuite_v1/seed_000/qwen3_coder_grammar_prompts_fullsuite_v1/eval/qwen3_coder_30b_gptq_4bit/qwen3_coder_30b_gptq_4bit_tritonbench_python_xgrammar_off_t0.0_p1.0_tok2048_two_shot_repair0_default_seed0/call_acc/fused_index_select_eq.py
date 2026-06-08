@@ -7,32 +7,29 @@ def _index_select_eq_kernel(
     input_ptr, index_ptr, other_ptr, out_ptr,
     input_shape0: tl.constexpr, input_shape1: tl.constexpr,
     index_size: tl.constexpr,
-    dim: tl.constexpr,
     BLOCK: tl.constexpr
 ):
     pid = tl.program_id(0)
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     
-    # Calculate total elements in output
-    total_elements = input_shape0 * input_shape1
+    # Compute the total number of elements in the output
+    total_elements = input_shape0 * index_size
     
-    # Create mask for valid indices
+    # Mask for valid elements
     mask = offsets < total_elements
     
-    # For simplicity, we'll handle the indexing in the main function
-    # and just do the comparison in the kernel
-    if dim == 0:
-        # Select elements along dim 0
-        input_offsets = offsets
-        other_offsets = offsets
-    else:
-        # Select elements along dim 1
-        input_offsets = offsets
-        other_offsets = offsets
+    # Calculate which index we're working with
+    index_id = offsets // input_shape0
+    input_id = offsets % input_shape0
     
-    # Load input and other values
-    input_val = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
-    other_val = tl.load(other_ptr + other_offsets, mask=mask, other=0.0)
+    # Load index values
+    index_val = tl.load(index_ptr + index_id, mask=index_id < index_size, other=0)
+    
+    # Load input values
+    input_val = tl.load(input_ptr + input_id * input_shape1 + index_val, mask=mask, other=0.0)
+    
+    # Load other values (scalar or tensor)
+    other_val = tl.load(other_ptr + input_id, mask=mask, other=0.0)
     
     # Perform equality comparison
     result = input_val == other_val
@@ -45,15 +42,20 @@ def fused_index_select_eq(input, dim, index, other, *, out=None):
     if dim < 0:
         dim = input.dim() + dim
     
+    if dim >= input.dim():
+        raise ValueError("dim must be within the range of input tensor dimensions")
+    
     # Handle scalar other
     if not torch.is_tensor(other):
         other = torch.tensor(other, dtype=input.dtype, device=input.device)
     
-    # Ensure other is the same device and dtype as input
-    if other.device != input.device:
-        other = other.to(input.device)
+    # Ensure other is the same dtype as input
     if other.dtype != input.dtype:
         other = other.to(input.dtype)
+    
+    # Ensure other is on the same device as input
+    if other.device != input.device:
+        other = other.to(input.device)
     
     # Get output shape
     output_shape = list(input.shape)
@@ -64,41 +66,40 @@ def fused_index_select_eq(input, dim, index, other, *, out=None):
         out = torch.empty(output_shape, dtype=torch.bool, device=input.device)
     else:
         if out.shape != tuple(output_shape):
-            raise ValueError("Output tensor shape does not match expected shape")
+            raise ValueError("out tensor must have the same shape as the selected elements")
         if out.dtype != torch.bool:
-            raise ValueError("Output tensor must be boolean type")
+            raise ValueError("out tensor must have bool dtype")
     
-    # Handle the case where we need to do index selection
-    # For simplicity, we'll use PyTorch's native implementation for index selection
-    # and only use Triton for the comparison part
+    # Handle the case where we need to broadcast other
+    if other.numel() == 1:
+        # Scalar case - broadcast to match output shape
+        other = other.expand(output_shape)
+    else:
+        # Ensure other has the right shape for broadcasting
+        other = other.expand(output_shape)
     
-    # Select elements using PyTorch's index_select
-    selected = torch.index_select(input, dim, index)
+    # Flatten input and other for easier indexing
+    input_flat = input.view(input.shape[0], -1)
+    other_flat = other.view(output_shape[0], -1)
     
-    # Perform element-wise equality comparison using Triton
-    n = selected.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    # Get the size of the dimension we're indexing along
+    index_size = index.size(0)
     
-    # Create temporary tensors for Triton kernel
-    selected_flat = selected.view(-1)
-    other_flat = other.view(-1)
-    out_flat = out.view(-1)
-    
-    # Ensure other is broadcastable
-    if other_flat.size(0) == 1:
-        # Scalar case - broadcast to match selected
-        other_flat = other_flat.expand(selected_flat.size(0))
-    elif other_flat.size(0) != selected_flat.size(0):
-        # If other is not scalar and not matching, we need to handle differently
-        # For now, we'll assume they are compatible or other is scalar
-        pass
+    # Calculate total elements in output
+    total_elements = output_shape[0] * index_size
     
     # Launch kernel
+    block = 256
+    grid = (triton.cdiv(total_elements, block),)
+    
+    # Flatten the tensors for kernel execution
+    input_flat = input.view(-1)
+    other_flat = other.view(-1)
+    index_flat = index.view(-1)
+    
     _index_select_eq_kernel[grid](
-        selected_flat, index, other_flat, out_flat,
-        selected_flat.size(0), 1,  # For simplicity, assuming 1D indexing
-        index.size(0), dim, BLOCK=block
+        input_flat, index_flat, other_flat, out.view(-1),
+        output_shape[0], input.shape[1], index_size, BLOCK=block
     )
     
     return out

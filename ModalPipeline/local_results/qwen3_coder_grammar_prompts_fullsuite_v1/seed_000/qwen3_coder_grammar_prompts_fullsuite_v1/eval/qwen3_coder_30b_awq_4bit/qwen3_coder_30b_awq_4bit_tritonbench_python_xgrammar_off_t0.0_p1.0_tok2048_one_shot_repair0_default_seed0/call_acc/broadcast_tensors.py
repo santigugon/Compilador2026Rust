@@ -7,13 +7,15 @@ def broadcast_kernel(
     input_ptr, 
     output_ptr, 
     size, 
+    stride, 
     BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < size
-    input_vals = tl.load(input_ptr + offsets, mask=mask)
-    tl.store(output_ptr + offsets, input_vals, mask=mask)
+    input_ptrs = input_ptr + offsets * stride
+    output_ptrs = output_ptr + offsets
+    tl.store(output_ptrs, tl.load(input_ptrs, mask=mask), mask=mask)
 
 def broadcast_tensors(*tensors):
     # Convert to torch tensors if needed
@@ -24,18 +26,13 @@ def broadcast_tensors(*tensors):
     max_shape = torch.broadcast_shapes(*shapes)
     
     # Create output tensors with the broadcasted shape
-    output_tensors = []
-    
+    result = []
     for tensor in torch_tensors:
         # Create a new tensor with the broadcasted shape
-        if tensor.shape == max_shape:
-            output_tensors.append(tensor)
-        else:
-            # Create a new tensor with the broadcasted shape
-            expanded_tensor = tensor.expand(max_shape)
-            output_tensors.append(expanded_tensor)
+        broadcasted = tensor.expand(max_shape)
+        result.append(broadcasted)
     
-    return output_tensors
+    return result
 
 ##################################################################################################################################################
 

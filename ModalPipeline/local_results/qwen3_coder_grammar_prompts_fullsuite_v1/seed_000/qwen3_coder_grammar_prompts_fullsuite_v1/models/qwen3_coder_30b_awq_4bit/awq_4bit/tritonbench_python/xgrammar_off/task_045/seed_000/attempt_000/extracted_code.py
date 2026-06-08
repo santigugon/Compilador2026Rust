@@ -3,45 +3,98 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _svd_reconstruct_kernel(u_ptr, s_ptr, vh_ptr, out_ptr, m: tl.constexpr, n: tl.constexpr, k: tl.constexpr, BLOCK: tl.constexpr):
-    # Compute A = U @ S @ VH
-    pid = tl.program_id(0)
-    if pid == 0:
-        # For the first block, compute U @ S
-        for i in range(m):
-            for j in range(k):
-                acc = 0.0
-                for l in range(k):
-                    u_val = tl.load(u_ptr + i * k + l)
-                    s_val = tl.load(s_ptr + l)
-                    acc += u_val * s_val
-                tl.store(out_ptr + i * k + j, acc)
-    elif pid == 1:
-        # For the second block, compute (U @ S) @ VH
-        for i in range(k):
-            for j in range(n):
-                acc = 0.0
-                for l in range(k):
-                    u_s_val = tl.load(out_ptr + i * k + l)
-                    vh_val = tl.load(vh_ptr + l * n + j)
-                    acc += u_s_val * vh_val
-                tl.store(out_ptr + i * n + j, acc)
+def svd_reconstruct_kernel(
+    U_ptr, S_ptr, Vh_ptr,
+    output_ptr,
+    m, n, k,
+    stride_um, stride_un,
+    stride_sm, stride_sn,
+    stride_vhm, stride_vhn,
+    stride_out_m, stride_out_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Compute output matrix dimensions
+    out_m = m
+    out_n = n
+    
+    # Initialize accumulator for dot product
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    # Loop over the K dimension
+    for k in range(0, k, BLOCK_SIZE_K):
+        # Load U block
+        u_block = tl.load(
+            U_ptr + pid_m * stride_um + tl.arange(0, BLOCK_SIZE_M)[:, None] * stride_um + 
+            tl.arange(0, BLOCK_SIZE_K)[None, :] * stride_un
+        )
+        
+        # Load S block
+        s_block = tl.load(
+            S_ptr + tl.arange(0, BLOCK_SIZE_K)[:, None] * stride_sm + 
+            tl.arange(0, BLOCK_SIZE_N)[None, :] * stride_sn
+        )
+        
+        # Load Vh block
+        vh_block = tl.load(
+            Vh_ptr + tl.arange(0, BLOCK_SIZE_K)[:, None] * stride_vhm + 
+            pid_n * stride_vhn + tl.arange(0, BLOCK_SIZE_N)[None, :] * stride_vhn
+        )
+        
+        # Compute dot product
+        acc += tl.dot(u_block, s_block * vh_block)
+    
+    # Write output
+    output_block = acc
+    tl.store(
+        output_ptr + pid_m * stride_out_m + pid_n * stride_out_n,
+        output_block
+    )
 
-def fused_svd_reconstruct(A):
+def fused_svd_reconstruct(A: torch.Tensor) -> torch.Tensor:
+    # Ensure input is on GPU and in float32
+    if A.device.type != 'cuda':
+        A = A.cuda()
+    if A.dtype != torch.float32:
+        A = A.float()
+    
     # Perform SVD
     U, S, Vh = torch.linalg.svd(A, full_matrices=False)
     
-    # Reconstruct A = U @ S @ Vh
-    # Since we're doing this in Triton, we'll compute it directly
+    # Get dimensions
     m, n = A.shape
     k = S.shape[0]
     
     # Create output tensor
-    out = torch.empty_like(A)
+    output = torch.empty(m, n, device=A.device, dtype=A.dtype)
     
-    # For simplicity, we'll use PyTorch's matmul for the reconstruction
-    # since the full Triton implementation would be quite complex
-    # and the performance gain might not be significant for this operation
-    reconstructed = U @ torch.diag(S) @ Vh
+    # Launch kernel
+    BLOCK_SIZE_M = 16
+    BLOCK_SIZE_N = 16
+    BLOCK_SIZE_K = 16
     
-    return reconstructed
+    # Define grid
+    grid = (
+        triton.cdiv(m, BLOCK_SIZE_M),
+        triton.cdiv(n, BLOCK_SIZE_N)
+    )
+    
+    # Launch kernel
+    svd_reconstruct_kernel[grid](
+        U, S, Vh,
+        output,
+        m, n, k,
+        U.stride(0), U.stride(1),
+        S.stride(0), S.stride(1),
+        Vh.stride(0), Vh.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K
+    )
+    
+    return output

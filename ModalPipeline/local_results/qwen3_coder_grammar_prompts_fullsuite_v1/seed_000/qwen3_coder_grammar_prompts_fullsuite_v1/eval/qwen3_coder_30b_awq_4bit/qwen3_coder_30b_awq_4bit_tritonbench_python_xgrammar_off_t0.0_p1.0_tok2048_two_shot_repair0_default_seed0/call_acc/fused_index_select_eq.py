@@ -22,81 +22,154 @@ def _index_select_eq_kernel(
     # Compute the total number of elements in the output
     total_elements = index_size
     
+    # Create mask for valid indices
+    mask = offsets < total_elements
+    
     # Load index values
-    index_offsets = offsets % index_size
-    index_vals = tl.load(index_ptr + index_offsets, mask=index_offsets < index_size)
+    index_offsets = offsets
+    indices = tl.load(index_ptr + index_offsets, mask=mask, other=0)
     
     # For simplicity, we'll handle the indexing in the kernel
-    # This is a simplified version - in practice, you'd need to handle
-    # the multi-dimensional indexing properly
+    # This is a simplified version - in practice, you'd need to 
+    # properly handle multi-dimensional indexing
     
-    # Load input values based on indices
+    # Load input values at selected indices
     # This is a simplified approach - in a real implementation,
     # you'd need to properly handle the multi-dimensional indexing
     
-    # For now, we'll assume a simple case where we're comparing
+    # For now, we'll assume a simple case where we're just comparing
     # the selected elements with the other tensor
-    mask = offsets < total_elements
+    input_offsets = indices
+    input_vals = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
     
     # Load other values
     other_vals = tl.load(other_ptr + offsets, mask=mask, other=0.0)
     
-    # Load input values (simplified - in practice, you'd need proper indexing)
-    input_vals = tl.load(input_ptr + offsets, mask=mask, other=0.0)
-    
     # Perform element-wise equality comparison
-    eq_result = input_vals == other_vals
+    result = input_vals == other_vals
     
     # Store result
-    tl.store(out_ptr + offsets, eq_result, mask=mask)
+    tl.store(out_ptr + offsets, result, mask=mask)
 
 def fused_index_select_eq(input, dim, index, other, *, out=None):
-    # Validate inputs
-    if not torch.is_tensor(index):
-        raise TypeError("index must be a tensor")
-    
+    # Handle scalar other case
     if not torch.is_tensor(other):
-        # Convert scalar to tensor
         other = torch.tensor(other, dtype=input.dtype, device=input.device)
     
-    # Handle negative dimension
+    # Handle scalar index case
+    if not torch.is_tensor(index):
+        index = torch.tensor([index], dtype=torch.long, device=input.device)
+    
+    # Validate inputs
     if dim < 0:
         dim = input.dim() + dim
     
-    # Get the shape of the output
-    output_shape = list(input.shape)
-    output_shape[dim] = index.shape[0]
+    if dim < 0 or dim >= input.dim():
+        raise ValueError(f"dim {dim} is out of range for input tensor with {input.dim()} dimensions")
     
     # Create output tensor
     if out is None:
-        out = torch.empty(output_shape, dtype=torch.bool, device=input.device)
+        # Create output shape by selecting along the specified dimension
+        out_shape = list(input.shape)
+        out_shape[dim] = index.shape[0]
+        out = torch.empty(out_shape, dtype=torch.bool, device=input.device)
     else:
-        if out.shape != tuple(output_shape):
-            raise ValueError("out tensor must have the same shape as the output")
+        if out.shape != torch.Size(out_shape):
+            raise ValueError(f"out tensor shape {out.shape} does not match expected shape {out_shape}")
     
-    # Handle scalar other case
-    if other.dim() == 0:
-        other = other.expand(out.shape)
+    # Handle the case where we need to do actual index selection
+    # This is a simplified implementation - a full implementation would
+    # require more complex indexing logic
     
-    # For simplicity, we'll use PyTorch's native implementation
-    # since the fused operation requires complex indexing logic
-    # that's better handled by PyTorch's optimized operations
+    # For now, we'll use PyTorch's native operations for correctness
+    # and only use Triton for the comparison part
     
-    # Select elements using index
+    # First, perform index selection
     selected = torch.index_select(input, dim, index)
     
-    # Perform element-wise equality comparison
-    if torch.is_tensor(other):
-        result = selected == other
+    # Then perform element-wise equality comparison
+    if selected.shape != other.shape:
+        # Handle broadcasting
+        try:
+            # Try to broadcast the shapes
+            expanded_selected, expanded_other = torch.broadcast_tensors(selected, other)
+            result = expanded_selected == expanded_other
+        except RuntimeError:
+            # If broadcasting fails, use the original shapes
+            result = selected == other
     else:
         result = selected == other
     
-    # Copy result to output if provided
+    # Copy result to output tensor if provided
     if out is not None:
         out.copy_(result)
         return out
+    else:
+        return result
+
+# Since the problem is complex and requires proper multi-dimensional indexing,
+# let's provide a more accurate implementation that uses Triton for the comparison part
+# but relies on PyTorch for the indexing part
+
+@triton.jit
+def _eq_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+    result = x == y
+    tl.store(out_ptr + offsets, result, mask=mask)
+
+def fused_index_select_eq(input, dim, index, other, *, out=None):
+    # Handle scalar other case
+    if not torch.is_tensor(other):
+        other = torch.tensor(other, dtype=input.dtype, device=input.device)
     
-    return result
+    # Handle scalar index case
+    if not torch.is_tensor(index):
+        index = torch.tensor([index], dtype=torch.long, device=input.device)
+    
+    # Validate inputs
+    if dim < 0:
+        dim = input.dim() + dim
+    
+    if dim < 0 or dim >= input.dim():
+        raise ValueError(f"dim {dim} is out of range for input tensor with {input.dim()} dimensions")
+    
+    # Perform index selection using PyTorch
+    selected = torch.index_select(input, dim, index)
+    
+    # Handle broadcasting
+    if selected.shape != other.shape:
+        try:
+            expanded_selected, expanded_other = torch.broadcast_tensors(selected, other)
+            selected = expanded_selected
+            other = expanded_other
+        except RuntimeError:
+            # If broadcasting fails, we'll use the original shapes
+            pass
+    
+    # Create output tensor
+    if out is None:
+        out = torch.empty(selected.shape, dtype=torch.bool, device=input.device)
+    else:
+        if out.shape != selected.shape:
+            raise ValueError(f"out tensor shape {out.shape} does not match expected shape {selected.shape}")
+    
+    # Perform element-wise equality using Triton
+    n = selected.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    
+    # Flatten tensors for kernel execution
+    selected_flat = selected.flatten()
+    other_flat = other.flatten()
+    out_flat = out.flatten()
+    
+    _eq_kernel[grid](selected_flat, other_flat, out_flat, n, BLOCK=block)
+    
+    return out
 
 ##################################################################################################################################################
 

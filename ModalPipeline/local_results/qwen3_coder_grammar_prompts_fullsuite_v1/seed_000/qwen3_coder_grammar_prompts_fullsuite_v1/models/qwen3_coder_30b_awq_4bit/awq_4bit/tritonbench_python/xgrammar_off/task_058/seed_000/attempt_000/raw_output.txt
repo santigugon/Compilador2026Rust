@@ -4,50 +4,53 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _logit_kernel(x_ptr, out_ptr, n: tl.constexpr, eps: tl.constexpr, BLOCK: tl.constexpr):
+def logit_kernel(
+    input_ptr,
+    output_ptr,
+    eps,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
     
-    # Clamp input to [eps, 1 - eps]
     if eps is not None:
-        x = tl.clamp(x, eps, 1.0 - eps)
+        input = tl.clamp(input, eps, 1.0 - eps)
     
-    # Compute logit: log(x / (1 - x))
-    y = tl.log(x / (1.0 - x))
-    
-    tl.store(out_ptr + offsets, y, mask=mask)
+    output = tl.log(input / (1.0 - input))
+    tl.store(output_ptr + offsets, output, mask=mask)
 
 def logit(input, eps=None, *, out=None):
-    # Handle scalar input
-    if not torch.is_tensor(input):
-        if eps is not None:
-            input = torch.clamp(input, eps, 1.0 - eps)
-        return torch.log(input / (1.0 - input))
-    
-    # Create output tensor
     if out is None:
-        out = torch.empty_like(input)
+        out = torch.empty_like(input, dtype=torch.float32, device=input.device)
+    
+    if input.numel() == 0:
+        return out
+    
+    n_elements = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    if eps is not None:
+        eps = eps if isinstance(eps, float) else float(eps)
+        logit_kernel[grid](
+            input_ptr=input,
+            output_ptr=out,
+            eps=eps,
+            n_elements=n_elements,
+            BLOCK_SIZE=BLOCK_SIZE
+        )
     else:
-        assert out.shape == input.shape, "Output tensor must have the same shape as input"
-        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input"
+        logit_kernel[grid](
+            input_ptr=input,
+            output_ptr=out,
+            eps=None,
+            n_elements=n_elements,
+            BLOCK_SIZE=BLOCK_SIZE
+        )
     
-    # Handle special case where eps is None and input is outside [0, 1]
-    if eps is None:
-        # Check for invalid values that would produce NaN
-        if (input < 0).any() or (input > 1).any():
-            # For now, we'll let PyTorch handle the NaN case
-            return torch.logit(input, eps=eps, out=out)
-    
-    # Launch kernel
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    
-    # Convert eps to a scalar for kernel
-    eps_val = eps if eps is not None else 0.0
-    
-    _logit_kernel[grid](input, out, n, eps_val, BLOCK=block)
     return out
 ```

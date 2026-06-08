@@ -2,149 +2,127 @@
 import torch
 import triton
 import triton.language as tl
-import math
 
 @triton.jit
-def _qr_decomposition_kernel(A_ptr, Q_ptr, R_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
-    # This is a simplified implementation for demonstration
-    # In practice, a full QR decomposition would be more complex
-    pid = tl.program_id(0)
-    if pid >= n:
-        return
+def _qr_decomposition_kernel(A, R, Q, n, block_size=16):
+    # Shared memory for intermediate computations
+    shared_A = tl.shared_memory(shape=(block_size, block_size), dtype=tl.float32)
+    shared_R = tl.shared_memory(shape=(block_size, block_size), dtype=tl.float32)
     
-    # Initialize R with A
-    for j in range(n):
-        if j < n:
-            R_val = tl.load(A_ptr + pid * n + j)
-            tl.store(R_ptr + pid * n + j, R_val)
+    # Thread and block indices
+    tx = tl.program_id(0)
+    ty = tl.program_id(1)
     
-    # Initialize Q as identity matrix
-    if pid < n:
-        for j in range(n):
-            if j == pid:
-                tl.store(Q_ptr + pid * n + j, 1.0)
+    # Load data into shared memory
+    if tx < n and ty < n:
+        shared_A[tx, ty] = A[tx, ty]
+    
+    # Synchronize to ensure all threads have loaded data
+    tl.sync()
+    
+    # Initialize R and Q matrices
+    if tx < n and ty < n:
+        if tx == ty:
+            R[tx, ty] = shared_A[tx, ty]
+        else:
+            R[tx, ty] = 0.0
+            Q[tx, ty] = 0.0
+    
+    # Synchronize to ensure initialization is complete
+    tl.sync()
+    
+    # Perform QR decomposition using Givens rotations
+    for k in range(min(n, block_size)):
+        # Compute Givens rotation
+        if tx == k and ty == k:
+            # Compute norm of k-th column
+            norm = 0.0
+            for i in range(k, n):
+                norm += shared_A[i, k] * shared_A[i, k]
+            norm = tl.sqrt(norm)
+            
+            # Update R and Q
+            if norm > 0.0:
+                R[k, k] = norm
+                Q[k, k] = 1.0
+                for i in range(k + 1, n):
+                    Q[i, k] = shared_A[i, k] / norm
+                    R[i, k] = 0.0
             else:
-                tl.store(Q_ptr + pid * n + j, 0.0)
+                R[k, k] = 0.0
+                Q[k, k] = 0.0
+                for i in range(k + 1, n):
+                    Q[i, k] = 0.0
+                    R[i, k] = 0.0
+        
+        # Synchronize to ensure Givens rotation is computed
+        tl.sync()
+        
+        # Apply Givens rotation to remaining columns
+        for j in range(k + 1, n):
+            if tx == k and ty == j:
+                # Compute cosine and sine
+                cos = R[k, k] / (R[k, k] + R[k, j])
+                sin = R[k, j] / (R[k, k] + R[k, j])
+                
+                # Update R matrix
+                R[k, j] = cos * R[k, j] + sin * R[k, k]
+                R[k, k] = cos * R[k, k] - sin * R[k, j]
+                
+                # Update Q matrix
+                Q[k, j] = cos * Q[k, j] + sin * Q[k, k]
+                Q[k, k] = cos * Q[k, k] - sin * Q[k, j]
+        
+        # Synchronize to ensure updates are complete
+        tl.sync()
 
 @triton.jit
-def _diagonal_product_kernel(R_ptr, det_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    if pid >= n:
-        return
-    
-    # Compute product of diagonal elements
-    product = 1.0
+def _determinant_kernel(R, det, n):
+    # Compute determinant as product of diagonal elements
+    det_val = 1.0
     for i in range(n):
-        diag_val = tl.load(R_ptr + i * n + i)
-        product *= diag_val
+        det_val *= R[i, i]
     
     # Store result
-    tl.store(det_ptr, product)
+    det[0] = det_val
 
 def determinant_via_qr(A, *, mode='reduced', out=None):
     # Validate input
-    if A.dim() != 2 or A.size(0) != A.size(1):
+    if not isinstance(A, torch.Tensor):
+        raise TypeError("Input must be a torch.Tensor")
+    
+    if A.dim() != 2:
+        raise ValueError("Input must be a 2D tensor")
+    
+    if A.size(0) != A.size(1):
         raise ValueError("Input must be a square matrix")
     
     n = A.size(0)
     
-    # For small matrices, use PyTorch directly
-    if n <= 32:
-        return torch.linalg.det(A)
+    # Ensure input is on GPU and float32
+    if A.device.type != 'cuda':
+        A = A.cuda()
     
-    # For larger matrices, use a simplified approach
-    # In practice, a full QR decomposition would be more complex
-    # This is a placeholder implementation
+    if A.dtype != torch.float32:
+        A = A.float()
     
-    # Create output tensor
-    if out is not None:
-        if out.shape != () or out.dtype != A.dtype:
-            raise ValueError("Output tensor must be a scalar with matching dtype")
-        det = out
+    # Allocate output tensor
+    if out is None:
+        out = torch.empty(1, dtype=torch.float32, device=A.device)
     else:
-        det = torch.empty((), dtype=A.dtype, device=A.device)
+        if out.shape != (1,) or out.dtype != torch.float32:
+            raise ValueError("Output tensor must be of shape (1,) and dtype torch.float32")
     
-    # For demonstration, we'll compute determinant using a simpler approach
-    # A full QR decomposition implementation would be more complex
-    try:
-        # Use PyTorch's implementation for correctness
-        det_val = torch.linalg.det(A)
-        if out is not None:
-            out.copy_(det_val)
-            return out
-        return det_val
-    except Exception:
-        # Fallback to manual computation for small matrices
-        if n <= 4:
-            return torch.linalg.det(A)
-        else:
-            # For larger matrices, we'll use a simplified approach
-            # This is a placeholder - a full implementation would be more complex
-            return torch.linalg.det(A)
-
-# Since the full QR decomposition is complex to implement in Triton,
-# we'll use a hybrid approach that leverages PyTorch for correctness
-# and only use Triton for specific parts if needed.
-
-# For a more complete implementation, here's a simplified version:
-def _determinant_via_qr_triton(A, *, mode='reduced', out=None):
-    # This is a simplified version that demonstrates the concept
-    # A full implementation would require a proper QR decomposition kernel
+    # Allocate memory for R and Q matrices
+    R = torch.empty_like(A)
+    Q = torch.empty_like(A)
     
-    # For now, we'll use PyTorch's implementation for correctness
-    # but structure it to show how it could be done with Triton
+    # Launch QR decomposition kernel
+    grid = (triton.cdiv(n, 16), triton.cdiv(n, 16))
+    _qr_decomposition_kernel[grid](A, R, Q, n)
     
-    if A.dim() != 2 or A.size(0) != A.size(1):
-        raise ValueError("Input must be a square matrix")
+    # Launch determinant kernel
+    _determinant_kernel[1](R, out, n)
     
-    n = A.size(0)
-    
-    # Create output tensor
-    if out is not None:
-        if out.shape != () or out.dtype != A.dtype:
-            raise ValueError("Output tensor must be a scalar with matching dtype")
-        det = out
-    else:
-        det = torch.empty((), dtype=A.dtype, device=A.device)
-    
-    # Use PyTorch's QR decomposition for correctness
-    Q, R = torch.linalg.qr(A)
-    det_val = torch.prod(torch.diag(R))
-    
-    if out is not None:
-        out.copy_(det_val)
-        return out
-    return det_val
-
-# Final implementation using PyTorch for correctness with Triton structure
-def determinant_via_qr(A, *, mode='reduced', out=None):
-    # Validate input
-    if A.dim() != 2 or A.size(0) != A.size(1):
-        raise ValueError("Input must be a square matrix")
-    
-    # Create output tensor
-    if out is not None:
-        if out.shape != () or out.dtype != A.dtype:
-            raise ValueError("Output tensor must be a scalar with matching dtype")
-        det = out
-    else:
-        det = torch.empty((), dtype=A.dtype, device=A.device)
-    
-    # Use PyTorch's QR decomposition for correctness
-    try:
-        # This is the actual implementation that matches the requirements
-        Q, R = torch.linalg.qr(A)
-        det_val = torch.prod(torch.diag(R))
-        
-        if out is not None:
-            out.copy_(det_val)
-            return out
-        return det_val
-    except Exception:
-        # Fallback to standard determinant computation
-        det_val = torch.linalg.det(A)
-        if out is not None:
-            out.copy_(det_val)
-            return out
-        return det_val
+    return out
 ```

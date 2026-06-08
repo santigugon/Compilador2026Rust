@@ -3,73 +3,72 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def matmul_kernel(
+def _matrix_multiply_and_row_dot_kernel(
     A_ptr, B_ptr, C_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    alpha, beta,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr
+    out_ptr,
+    n: tl.constexpr, m: tl.constexpr, p: tl.constexpr,
+    alpha: tl.constexpr, beta: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr
 ):
-    # Get the block indices
-    block_idx_m = tl.program_id(0)
-    block_idx_n = tl.program_id(1)
-    block_idx_k = tl.program_id(2)
-    
-    # Compute the starting positions for this block
-    start_m = block_idx_m * BLOCK_SIZE_M
-    start_n = block_idx_n * BLOCK_SIZE_N
-    start_k = block_idx_k * BLOCK_SIZE_K
+    # Compute matrix multiplication A @ B
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
     
     # Initialize accumulator
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     
-    # Loop over the K dimension
-    for k in range(0, K, BLOCK_SIZE_K):
+    # Loop over K dimension
+    for k in range(0, m, BLOCK_SIZE_K):
         # Load A and B tiles
-        a = tl.load(A_ptr + start_m * stride_am + k * stride_ak)
-        b = tl.load(B_ptr + k * stride_bk + start_n * stride_bn)
+        a_tile = tl.load(A_ptr + (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)[:, None]) * m + 
+                         (k + tl.arange(0, BLOCK_SIZE_K)[None, :]))
+        b_tile = tl.load(B_ptr + (k + tl.arange(0, BLOCK_SIZE_K)[:, None]) * p + 
+                         (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)[None, :]))
         
-        # Perform matrix multiplication
-        acc += tl.dot(a, b)
+        # Accumulate
+        acc += tl.dot(a_tile, b_tile)
     
     # Scale and add to C
-    c = tl.load(C_ptr + start_m * stride_cm + start_n * stride_cn)
-    acc = acc * alpha + c * beta
+    c_tile = tl.load(C_ptr + (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)[:, None]) * p + 
+                     (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)[None, :]))
     
-    # Store the result
-    tl.store(C_ptr + start_m * stride_cm + start_n * stride_cn, acc)
+    # Apply alpha and beta
+    result = alpha * acc + beta * c_tile
+    
+    # Store result
+    tl.store(out_ptr + (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)[:, None]) * p + 
+             (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)[None, :]), result)
 
 def matrix_multiply_and_row_dot(A: torch.Tensor, B: torch.Tensor, alpha: float, beta: float, C: torch.Tensor) -> torch.Tensor:
-    # Ensure tensors are on the same device and have correct dtypes
-    assert A.device == B.device == C.device
-    assert A.dtype == B.dtype == C.dtype
-    
-    # Get dimensions
-    n, m = A.shape
-    m2, p = B.shape
-    assert m == m2, "Incompatible dimensions between A and B"
+    # Validate input dimensions
+    assert A.shape[1] == B.shape[0], "Incompatible dimensions for matrix multiplication"
+    assert A.shape[0] == C.shape[0] and B.shape[1] == C.shape[1], "Incompatible dimensions for C"
     
     # Create output tensor
-    output = torch.empty_like(C)
+    out = torch.empty_like(C)
+    
+    # Get dimensions
+    n, m, p = A.shape[0], A.shape[1], B.shape[1]
+    
+    # Define block sizes
+    BLOCK_SIZE_M = 16
+    BLOCK_SIZE_N = 16
+    BLOCK_SIZE_K = 16
+    
+    # Grid size
+    grid_m = triton.cdiv(n, BLOCK_SIZE_M)
+    grid_n = triton.cdiv(p, BLOCK_SIZE_N)
+    grid = (grid_m, grid_n)
     
     # Launch kernel
-    grid = (triton.cdiv(n, 128), triton.cdiv(p, 128), 1)
-    matmul_kernel[grid](
-        A, B, output,
-        n, p, m,
-        A.stride(0), A.stride(1),
-        B.stride(0), B.stride(1),
-        output.stride(0), output.stride(1),
+    _matrix_multiply_and_row_dot_kernel[grid](
+        A, B, C, out,
+        n, m, p,
         alpha, beta,
-        BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=32, GROUP_SIZE_M=8
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
     )
     
     # Compute dot product of first two rows
-    result = torch.dot(output[0], output[1])
+    result = torch.dot(out[0], out[1])
     
     return result

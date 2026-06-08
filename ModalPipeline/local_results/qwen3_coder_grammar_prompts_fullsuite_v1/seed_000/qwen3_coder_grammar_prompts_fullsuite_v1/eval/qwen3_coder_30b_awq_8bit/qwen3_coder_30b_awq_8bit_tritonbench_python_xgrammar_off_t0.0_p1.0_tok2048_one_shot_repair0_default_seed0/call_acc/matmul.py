@@ -78,7 +78,7 @@ def matmul(input, other, *, out=None):
             return out
         return torch.mm(input, other)
     else:
-        # Batched matrix multiplication
+        # Batched matrix multiply
         if out is not None:
             torch.bmm(input, other, out=out)
             return out

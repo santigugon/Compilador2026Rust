@@ -23,30 +23,33 @@ def softplus_linear_kernel(
         
         input_vals = tl.load(input_row + col_offset * 1, mask=mask)
         weight_vals = tl.load(weight_ptr + col_offset * weight_col_stride, mask=mask)
-        output_vals = tl.sum(input_vals * weight_vals, axis=0)
         
+        # Linear transformation
+        linear_result = tl.sum(input_vals * weight_vals)
+        
+        # Softplus with threshold
+        scaled_linear = linear_result * beta
+        softplus_val = tl.log(1.0 + tl.exp(scaled_linear))
+        softplus_val = tl.where(scaled_linear > threshold, linear_result, softplus_val)
+        
+        # Add bias if present
         if bias_ptr is not None:
-            bias_vals = tl.load(bias_ptr + col_offset * 1, mask=mask)
-            output_vals += bias_vals
+            bias_val = tl.load(bias_ptr + col_offset * 1, mask=mask)
+            softplus_val += bias_val
         
-        # Apply softplus
-        output_vals = tl.where(
-            output_vals > threshold,
-            output_vals,
-            tl.log(1.0 + tl.exp(beta * output_vals)) / beta
-        )
-        
-        tl.store(output_row + col_offset * output_col_stride, output_vals, mask=mask)
+        tl.store(output_row + col_offset * output_col_stride, softplus_val, mask=mask)
 
 def softplus_linear(input, weight, bias=None, beta=1, threshold=20):
     input = input.contiguous()
     weight = weight.contiguous()
+    
     if bias is not None:
         bias = bias.contiguous()
     
     n_rows, n_cols = input.shape
     output = torch.empty(n_rows, weight.shape[0], dtype=input.dtype, device=input.device)
     
+    # Launch kernel
     BLOCK_SIZE = 128
     grid = (triton.cdiv(n_rows, 1),)
     

@@ -3,191 +3,162 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _adam_kernel(
-    param_ptr, 
-    grad_ptr, 
-    exp_avg_ptr, 
-    exp_avg_sq_ptr, 
-    max_exp_avg_sq_ptr,
-    lr, 
-    beta1, 
-    beta2, 
-    eps, 
-    weight_decay,
-    amsgrad,
-    maximize,
-    step_size,
-    n: tl.constexpr,
-    BLOCK: tl.constexpr
+def adam_kernel(
+    param_ptr, grad_ptr, exp_avg_ptr, exp_avg_sq_ptr, max_exp_avg_sq_ptr,
+    lr, beta1, beta2, eps, weight_decay, step_size, amsgrad, maximize,
+    num_elements, BLOCK_SIZE: tl.constexpr
 ):
+    # Compute the global thread index
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_elements
     
-    param = tl.load(param_ptr + offsets, mask=mask, other=0.0)
-    grad = tl.load(grad_ptr + offsets, mask=mask, other=0.0)
+    # Load data
+    param = tl.load(param_ptr + offsets, mask=mask)
+    grad = tl.load(grad_ptr + offsets, mask=mask)
     
-    exp_avg = tl.load(exp_avg_ptr + offsets, mask=mask, other=0.0)
-    exp_avg_sq = tl.load(exp_avg_sq_ptr + offsets, mask=mask, other=0.0)
+    # Load momentum states
+    exp_avg = tl.load(exp_avg_ptr + offsets, mask=mask)
+    exp_avg_sq = tl.load(exp_avg_sq_ptr + offsets, mask=mask)
     
-    # Update biased first moment estimate
+    # Update momentum states
     exp_avg = beta1 * exp_avg + (1 - beta1) * grad
-    
-    # Update biased second raw moment estimate
     exp_avg_sq = beta2 * exp_avg_sq + (1 - beta2) * grad * grad
-    
-    # Compute bias-corrected first moment estimate
-    exp_avg_corrected = exp_avg / (1 - tl.pow(beta1, step_size))
-    
-    # Compute bias-corrected second raw moment estimate
-    exp_avg_sq_corrected = exp_avg_sq / (1 - tl.pow(beta2, step_size))
     
     # AMSGrad variant
     if amsgrad:
-        max_exp_avg_sq = tl.load(max_exp_avg_sq_ptr + offsets, mask=mask, other=0.0)
-        max_exp_avg_sq = tl.maximum(max_exp_avg_sq, exp_avg_sq_corrected)
+        max_exp_avg_sq = tl.load(max_exp_avg_sq_ptr + offsets, mask=mask)
+        max_exp_avg_sq = tl.maximum(max_exp_avg_sq, exp_avg_sq)
         denom = tl.sqrt(max_exp_avg_sq) + eps
         tl.store(max_exp_avg_sq_ptr + offsets, max_exp_avg_sq, mask=mask)
     else:
-        denom = tl.sqrt(exp_avg_sq_corrected) + eps
+        denom = tl.sqrt(exp_avg_sq) + eps
     
-    # Compute step
-    if maximize:
-        step = -lr * exp_avg_corrected / denom
-    else:
-        step = lr * exp_avg_corrected / denom
-    
-    # Apply weight decay
-    if weight_decay != 0:
-        step = step + weight_decay * param
+    # Compute step size
+    step_size = step_size if not maximize else -step_size
     
     # Update parameters
-    new_param = param - step
+    if weight_decay != 0:
+        param = param - weight_decay * param
     
-    # Store updated values
-    tl.store(param_ptr + offsets, new_param, mask=mask)
+    param = param - step_size * exp_avg / denom
+    
+    # Store updated parameters and momentum states
+    tl.store(param_ptr + offsets, param, mask=mask)
     tl.store(exp_avg_ptr + offsets, exp_avg, mask=mask)
     tl.store(exp_avg_sq_ptr + offsets, exp_avg_sq, mask=mask)
 
-def Adam(params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, amsgrad=False, foreach=None, maximize=False, capturable=False, differentiable=False, fused=None):
-    # This is a simplified implementation for demonstration purposes
-    # A full implementation would handle multiple parameter groups and more complex logic
+class Adam:
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, amsgrad=False, foreach=None, maximize=False, capturable=False, differentiable=False, fused=None):
+        self.params = list(params)
+        self.lr = lr
+        self.betas = betas
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.amsgrad = amsgrad
+        self.maximize = maximize
+        self.capturable = capturable
+        self.differentiable = differentiable
+        self.fused = fused
+        self.foreach = foreach
+        self.state = {}
+        self.step = 0
+        
+        # Initialize momentum states
+        for i, param in enumerate(self.params):
+            self.state[i] = {
+                'exp_avg': torch.zeros_like(param),
+                'exp_avg_sq': torch.zeros_like(param),
+                'max_exp_avg_sq': torch.zeros_like(param) if amsgrad else None
+            }
     
-    if not params:
-        return None
+    def step(self):
+        if self.fused:
+            self._fused_step()
+        else:
+            self._basic_step()
     
-    # For simplicity, we'll process the first parameter group
-    param_groups = params if isinstance(params, list) else [params]
-    
-    # Initialize state for each parameter group
-    state = []
-    for i, param in enumerate(param_groups):
-        if param.requires_grad:
-            # Initialize momentum and variance terms
-            exp_avg = torch.zeros_like(param, device=param.device)
-            exp_avg_sq = torch.zeros_like(param, device=param.device)
-            max_exp_avg_sq = torch.zeros_like(param, device=param.device) if amsgrad else None
-            
-            state.append({
-                'exp_avg': exp_avg,
-                'exp_avg_sq': exp_avg_sq,
-                'max_exp_avg_sq': max_exp_avg_sq,
-                'step': 0
-            })
-    
-    # Create a simple Adam optimizer implementation
-    # This is a simplified version that doesn't fully match the PyTorch API
-    # but demonstrates the core concept with Triton
-    
-    def step():
-        # For demonstration, we'll process all parameters in one go
-        for i, param in enumerate(param_groups):
-            if param.requires_grad:
-                # Get state
-                s = state[i]
-                exp_avg = s['exp_avg']
-                exp_avg_sq = s['exp_avg_sq']
-                max_exp_avg_sq = s['max_exp_avg_sq']
-                step_count = s['step']
+    def _basic_step(self):
+        self.step += 1
+        beta1, beta2 = self.betas
+        bias_correction1 = 1 - beta1 ** self.step
+        bias_correction2 = 1 - beta2 ** self.step
+        step_size = self.lr / bias_correction1 if not self.maximize else -self.lr / bias_correction1
+        
+        for i, param in enumerate(self.params):
+            if param.grad is None:
+                continue
                 
-                # Update step count
-                step_count += 1
-                s['step'] = step_count
-                
-                # Get gradients
-                grad = param.grad
-                
-                if grad is not None:
-                    # Convert to appropriate device and dtype
-                    param_device = param.device
-                    param_dtype = param.dtype
-                    
-                    # Create output tensors
-                    new_param = torch.empty_like(param, device=param_device, dtype=param_dtype)
-                    new_exp_avg = torch.empty_like(exp_avg, device=param_device, dtype=param_dtype)
-                    new_exp_avg_sq = torch.empty_like(exp_avg_sq, device=param_device, dtype=param_dtype)
-                    new_max_exp_avg_sq = torch.empty_like(max_exp_avg_sq, device=param_device, dtype=param_dtype) if amsgrad else None
-                    
-                    # Launch kernel
-                    n = param.numel()
-                    block = 256
-                    grid = (triton.cdiv(n, block),)
-                    
-                    # Convert to contiguous tensors for kernel
-                    param_flat = param.contiguous().view(-1)
-                    grad_flat = grad.contiguous().view(-1)
-                    exp_avg_flat = exp_avg.contiguous().view(-1)
-                    exp_avg_sq_flat = exp_avg_sq.contiguous().view(-1)
-                    new_param_flat = new_param.contiguous().view(-1)
-                    new_exp_avg_flat = new_exp_avg.contiguous().view(-1)
-                    new_exp_avg_sq_flat = new_exp_avg_sq.contiguous().view(-1)
-                    
-                    if amsgrad:
-                        max_exp_avg_sq_flat = max_exp_avg_sq.contiguous().view(-1)
-                        new_max_exp_avg_sq_flat = new_max_exp_avg_sq.contiguous().view(-1)
-                        
-                        # Launch kernel with amsgrad
-                        _adam_kernel[grid](
-                            param_flat, grad_flat, exp_avg_flat, exp_avg_sq_flat, 
-                            max_exp_avg_sq_flat,
-                            lr, betas[0], betas[1], eps, weight_decay, 
-                            amsgrad, maximize, step_count, n, block
-                        )
-                    else:
-                        # Launch kernel without amsgrad
-                        _adam_kernel[grid](
-                            param_flat, grad_flat, exp_avg_flat, exp_avg_sq_flat, 
-                            torch.empty(0, device=param_device, dtype=param_dtype),  # dummy for amsgrad
-                            lr, betas[0], betas[1], eps, weight_decay, 
-                            amsgrad, maximize, step_count, n, block
-                        )
-                    
-                    # Copy results back
-                    param.copy_(new_param)
-                    exp_avg.copy_(new_exp_avg)
-                    exp_avg_sq.copy_(new_exp_avg_sq)
-                    
-                    if amsgrad and max_exp_avg_sq is not None:
-                        max_exp_avg_sq.copy_(new_max_exp_avg_sq)
-    
-    # Return a simple optimizer-like object
-    class SimpleAdam:
-        def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, amsgrad=False, maximize=False):
-            self.params = params
-            self.lr = lr
-            self.betas = betas
-            self.eps = eps
-            self.weight_decay = weight_decay
-            self.amsgrad = amsgrad
-            self.maximize = maximize
-            self.state = []
+            grad = param.grad
+            exp_avg = self.state[i]['exp_avg']
+            exp_avg_sq = self.state[i]['exp_avg_sq']
+            max_exp_avg_sq = self.state[i]['max_exp_avg_sq']
             
-        def step(self):
-            step()
+            # Update momentum states
+            exp_avg = beta1 * exp_avg + (1 - beta1) * grad
+            exp_avg_sq = beta2 * exp_avg_sq + (1 - beta2) * grad * grad
             
-        def zero_grad(self):
-            for param in self.params:
-                if param.grad is not None:
-                    param.grad.zero_()
+            if self.amsgrad:
+                max_exp_avg_sq = torch.maximum(max_exp_avg_sq, exp_avg_sq)
+                denom = torch.sqrt(max_exp_avg_sq) + self.eps
+            else:
+                denom = torch.sqrt(exp_avg_sq) + self.eps
+            
+            # Update parameters
+            if self.weight_decay != 0:
+                param = param - self.weight_decay * param
+            
+            param = param - step_size * exp_avg / denom
+            
+            # Store updated states
+            self.state[i]['exp_avg'] = exp_avg
+            self.state[i]['exp_avg_sq'] = exp_avg_sq
+            if self.amsgrad:
+                self.state[i]['max_exp_avg_sq'] = max_exp_avg_sq
     
-    return SimpleAdam(param_groups, lr, betas, eps, weight_decay, amsgrad, maximize)
+    def _fused_step(self):
+        # Fused implementation using Triton
+        self.step += 1
+        beta1, beta2 = self.betas
+        bias_correction1 = 1 - beta1 ** self.step
+        bias_correction2 = 1 - beta2 ** self.step
+        step_size = self.lr / bias_correction1 if not self.maximize else -self.lr / bias_correction1
+        
+        BLOCK_SIZE = 256
+        num_elements = self.params[0].numel()
+        
+        for i, param in enumerate(self.params):
+            if param.grad is None:
+                continue
+                
+            grad = param.grad
+            exp_avg = self.state[i]['exp_avg']
+            exp_avg_sq = self.state[i]['exp_avg_sq']
+            max_exp_avg_sq = self.state[i]['max_exp_avg_sq']
+            
+            # Launch Triton kernel
+            grid = (triton.cdiv(num_elements, BLOCK_SIZE),)
+            adam_kernel[grid](
+                param.data_ptr(),
+                grad.data_ptr(),
+                exp_avg.data_ptr(),
+                exp_avg_sq.data_ptr(),
+                max_exp_avg_sq.data_ptr() if self.amsgrad else 0,
+                self.lr,
+                beta1,
+                beta2,
+                self.eps,
+                self.weight_decay,
+                step_size,
+                self.amsgrad,
+                self.maximize,
+                num_elements,
+                BLOCK_SIZE
+            )
+            
+            # Update states
+            self.state[i]['exp_avg'] = exp_avg
+            self.state[i]['exp_avg_sq'] = exp_avg_sq
+            if self.amsgrad:
+                self.state[i]['max_exp_avg_sq'] = max_exp_avg_sq

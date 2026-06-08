@@ -3,88 +3,59 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _fused_masked_select_add_gelu_kernel(
-    input_ptr, mask_ptr, other_ptr, out_ptr, 
-    n: tl.constexpr, 
-    alpha: tl.constexpr,
-    input_stride: tl.constexpr,
-    mask_stride: tl.constexpr,
-    other_stride: tl.constexpr,
-    out_stride: tl.constexpr,
-    BLOCK: tl.constexpr
+def fused_masked_select_add_gelu_kernel(
+    input_ptr, mask_ptr, other_ptr, output_ptr,
+    input_size, other_size,
+    alpha,
+    BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < input_size
     
-    # Load input, mask, and other
-    input_vals = tl.load(input_ptr + offsets * input_stride, mask=mask, other=0.0)
-    mask_vals = tl.load(mask_ptr + offsets * mask_stride, mask=mask, other=0.0)
-    other_vals = tl.load(other_ptr + offsets * other_stride, mask=mask, other=0.0)
+    input_ptrs = input_ptr + offsets
+    mask_ptrs = mask_ptr + offsets
+    other_ptrs = other_ptr + (offsets % other_size)
+    output_ptrs = output_ptr + offsets
     
-    # Select elements based on mask
+    input_vals = tl.load(input_ptrs, mask=mask)
+    mask_vals = tl.load(mask_ptrs, mask=mask)
+    other_vals = tl.load(other_ptrs, mask=mask)
+    
     selected_vals = tl.where(mask_vals, input_vals, 0.0)
-    
-    # Add other (scaled by alpha)
     added_vals = selected_vals + alpha * other_vals
+    gelu_vals = tl.gelu(added_vals)
     
-    # Apply GELU activation
-    # GELU(x) = x * Φ(x) where Φ is the CDF of the standard normal distribution
-    # Approximation: GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x^3)))
-    sqrt_2_over_pi = 0.7978845608028654  # sqrt(2/pi)
-    x = added_vals
-    x_cubed = x * x * x
-    tanh_arg = sqrt_2_over_pi * (x + 0.044715 * x_cubed)
-    gelu_val = 0.5 * x * (1.0 + tl.tanh(tanh_arg))
-    
-    # Store result
-    tl.store(out_ptr + offsets * out_stride, gelu_val, mask=mask)
+    tl.store(output_ptrs, gelu_vals, mask=mask)
 
 def fused_masked_select_add_gelu(input, mask, other, *, alpha=1, approximate='none', out=None):
-    # Handle scalar other
-    if not torch.is_tensor(other):
-        other = torch.tensor(other, dtype=input.dtype, device=input.device)
-    
-    # Ensure mask is boolean
-    if mask.dtype != torch.bool:
-        mask = mask.bool()
-    
-    # Handle out parameter
     if out is None:
-        out = torch.empty_like(input)
-    else:
-        if out.shape != input.shape:
-            raise ValueError("out tensor must have the same shape as input")
+        out = torch.empty_like(input, dtype=torch.float32, device=input.device)
     
-    # Flatten tensors for processing
-    input_flat = input.flatten()
-    mask_flat = mask.flatten()
-    other_flat = other.flatten()
-    out_flat = out.flatten()
+    input_size = input.numel()
+    other_size = other.numel()
     
-    # Get total number of elements
-    n = input_flat.numel()
+    if input_size != mask.numel():
+        raise ValueError("input and mask must have the same number of elements")
     
-    # Set up block size and grid
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    if other_size == 0:
+        raise ValueError("other tensor must not be empty")
     
-    # Get strides
-    input_stride = input_flat.stride(0) if input_flat.numel() > 0 else 1
-    mask_stride = mask_flat.stride(0) if mask_flat.numel() > 0 else 1
-    other_stride = other_flat.stride(0) if other_flat.numel() > 0 else 1
-    out_stride = out_flat.stride(0) if out_flat.numel() > 0 else 1
+    BLOCK_SIZE = 1024
+    num_blocks = (input_size + BLOCK_SIZE - 1) // BLOCK_SIZE
     
-    # Launch kernel
-    _fused_masked_select_add_gelu_kernel[grid](
-        input_flat, mask_flat, other_flat, out_flat,
-        n,
-        alpha,
-        input_stride,
-        mask_stride,
-        other_stride,
-        out_stride,
-        BLOCK=block
+    grid = (num_blocks,)
+    
+    fused_masked_select_add_gelu_kernel[grid](
+        input_ptr=input.data_ptr(),
+        mask_ptr=mask.data_ptr(),
+        other_ptr=other.data_ptr(),
+        output_ptr=out.data_ptr(),
+        input_size=input_size,
+        other_size=other_size,
+        alpha=alpha,
+        BLOCK_SIZE=BLOCK_SIZE
     )
     
     return out

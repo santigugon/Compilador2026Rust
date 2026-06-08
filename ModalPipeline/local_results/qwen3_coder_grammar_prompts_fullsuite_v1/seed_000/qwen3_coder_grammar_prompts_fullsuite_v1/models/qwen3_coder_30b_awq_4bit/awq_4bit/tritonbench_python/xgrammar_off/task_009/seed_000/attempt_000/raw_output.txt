@@ -4,131 +4,144 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _grid_sample_kernel(
+def grid_sample_kernel(
     input_ptr, grid_ptr, output_ptr,
-    input_shape, grid_shape, output_shape,
-    mode: tl.constexpr,
-    padding_mode: tl.constexpr,
-    align_corners: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr
+    input_shape, grid_shape,
+    mode, padding_mode, align_corners,
+    BLOCK_SIZE=128
 ):
-    # Get thread ID and total number of elements
-    pid = tl.program_id(0)
-    num_elements = output_shape[0] * output_shape[1] * output_shape[2] * output_shape[3]
+    # Get thread index
+    idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     
-    # Calculate offsets for this thread
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < num_elements
+    # Handle 4D and 5D cases
+    batch_size = input_shape[0]
+    channels = input_shape[1]
+    height = input_shape[2]
+    width = input_shape[3]
     
-    # Flatten indices
-    flat_idx = offsets
+    # Grid dimensions
+    grid_height = grid_shape[1]
+    grid_width = grid_shape[2]
     
-    # Convert flat index to 4D coordinates
-    out_h = flat_idx // (output_shape[1] * output_shape[2] * output_shape[3])
-    remaining = flat_idx % (output_shape[1] * output_shape[2] * output_shape[3])
-    out_w = remaining // (output_shape[2] * output_shape[3])
-    remaining = remaining % (output_shape[2] * output_shape[3])
-    out_c = remaining // output_shape[3]
-    out_n = remaining % output_shape[3]
+    # Output dimensions
+    out_height = grid_height
+    out_width = grid_width
     
-    # Load grid values
-    grid_idx = out_n * 2  # Assuming grid has shape [N, H, W, 2]
-    grid_x = tl.load(grid_ptr + grid_idx, mask=mask, other=0.0)
-    grid_y = tl.load(grid_ptr + grid_idx + 1, mask=mask, other=0.0)
+    # Calculate output indices
+    batch_idx = idx // (out_height * out_width)
+    out_y = (idx % (out_height * out_width)) // out_width
+    out_x = idx % out_width
     
-    # Normalize grid coordinates
+    # Check bounds
+    if batch_idx >= batch_size or out_y >= out_height or out_x >= out_width:
+        return
+    
+    # Get grid coordinates
+    grid_y = tl.load(grid_ptr + batch_idx * grid_height * grid_width * 2 + 
+                     out_y * grid_width * 2 + out_x * 2)
+    grid_x = tl.load(grid_ptr + batch_idx * grid_height * grid_width * 2 + 
+                     out_y * grid_width * 2 + out_x * 2 + 1)
+    
+    # Normalize coordinates based on align_corners
     if align_corners:
-        # Map [-1, 1] to [0, H-1] or [0, W-1]
-        H = input_shape[2]
-        W = input_shape[3]
-        x = (grid_x + 1.0) * (H - 1) / 2.0
-        y = (grid_y + 1.0) * (W - 1) / 2.0
+        grid_y = (grid_y + 1) / 2.0 * (height - 1)
+        grid_x = (grid_x + 1) / 2.0 * (width - 1)
     else:
-        # Map [-1, 1] to [0, H] or [0, W] 
-        H = input_shape[2]
-        W = input_shape[3]
-        x = (grid_x + 1.0) * H / 2.0 - 0.5
-        y = (grid_y + 1.0) * W / 2.0 - 0.5
+        grid_y = (grid_y + 1) / 2.0 * height
+        grid_x = (grid_x + 1) / 2.0 * width
     
-    # Clamp coordinates to valid range
-    x = tl.clamp(x, 0.0, H - 1.0)
-    y = tl.clamp(y, 0.0, W - 1.0)
+    # Handle padding modes
+    if padding_mode == 'zeros':
+        if grid_y < 0 or grid_y >= height or grid_x < 0 or grid_x >= width:
+            tl.store(output_ptr + batch_idx * out_height * out_width + 
+                     out_y * out_width + out_x, 0.0)
+            return
     
-    # Perform interpolation
-    if mode == 0:  # Bilinear
-        # Get integer parts
-        x0 = tl.floor(x).to(tl.int32)
-        y0 = tl.floor(y).to(tl.int32)
-        x1 = x0 + 1
+    # Bilinear interpolation
+    if mode == 'bilinear':
+        # Get integer coordinates
+        y0 = tl.floor(grid_y).to(tl.int32)
+        x0 = tl.floor(grid_x).to(tl.int32)
         y1 = y0 + 1
+        x1 = x0 + 1
         
-        # Clamp to valid range
-        x1 = tl.minimum(x1, H - 1)
-        y1 = tl.minimum(y1, W - 1)
+        # Clamp coordinates
+        y0 = tl.clamp(y0, 0, height - 1)
+        x0 = tl.clamp(x0, 0, width - 1)
+        y1 = tl.clamp(y1, 0, height - 1)
+        x1 = tl.clamp(x1, 0, width - 1)
         
-        # Compute weights
-        wx = x - x0
-        wy = y - y0
+        # Calculate weights
+        wy = grid_y - y0
+        wx = grid_x - x0
         
-        # Load values from input tensor
-        input_idx = out_n * input_shape[1] * input_shape[2] * input_shape[3]
-        val00 = tl.load(input_ptr + input_idx + out_c * input_shape[2] * input_shape[3] + x0 * input_shape[3] + y0, mask=mask, other=0.0)
-        val01 = tl.load(input_ptr + input_idx + out_c * input_shape[2] * input_shape[3] + x0 * input_shape[3] + y1, mask=mask, other=0.0)
-        val10 = tl.load(input_ptr + input_idx + out_c * input_shape[2] * input_shape[3] + x1 * input_shape[3] + y0, mask=mask, other=0.0)
-        val11 = tl.load(input_ptr + input_idx + out_c * input_shape[2] * input_shape[3] + x1 * input_shape[3] + y1, mask=mask, other=0.0)
+        # Get input values
+        val00 = tl.load(input_ptr + batch_idx * height * width + 
+                        y0 * width + x0)
+        val01 = tl.load(input_ptr + batch_idx * height * width + 
+                        y0 * width + x1)
+        val10 = tl.load(input_ptr + batch_idx * height * width + 
+                        y1 * width + x0)
+        val11 = tl.load(input_ptr + batch_idx * height * width + 
+                        y1 * width + x1)
         
-        # Bilinear interpolation
-        val0 = val00 * (1 - wy) + val01 * wy
-        val1 = val10 * (1 - wy) + val11 * wy
-        output_val = val0 * (1 - wx) + val1 * wx
+        # Interpolate
+        val0 = val00 * (1 - wx) + val01 * wx
+        val1 = val10 * (1 - wx) + val11 * wx
+        output_val = val0 * (1 - wy) + val1 * wy
         
-    else:  # Nearest
-        # Round to nearest integer
-        x_round = tl.round(x).to(tl.int32)
-        y_round = tl.round(y).to(tl.int32)
-        
-        # Clamp to valid range
-        x_round = tl.clamp(x_round, 0, H - 1)
-        y_round = tl.clamp(y_round, 0, W - 1)
-        
-        # Load value from input tensor
-        input_idx = out_n * input_shape[1] * input_shape[2] * input_shape[3]
-        output_val = tl.load(input_ptr + input_idx + out_c * input_shape[2] * input_shape[3] + x_round * input_shape[3] + y_round, mask=mask, other=0.0)
-    
-    # Store output
-    tl.store(output_ptr + offsets, output_val, mask=mask)
+        tl.store(output_ptr + batch_idx * out_height * out_width + 
+                 out_y * out_width + out_x, output_val)
+    else:  # nearest neighbor
+        y = tl.round(grid_y).to(tl.int32)
+        x = tl.round(grid_x).to(tl.int32)
+        y = tl.clamp(y, 0, height - 1)
+        x = tl.clamp(x, 0, width - 1)
+        output_val = tl.load(input_ptr + batch_idx * height * width + 
+                            y * width + x)
+        tl.store(output_ptr + batch_idx * out_height * out_width + 
+                 out_y * out_width + out_x, output_val)
 
 def grid_sample(input, grid, mode='bilinear', padding_mode='zeros', align_corners=False):
     # Validate inputs
     if input.dim() not in [4, 5]:
-        raise ValueError("input must be 4D or 5D")
-    if grid.dim() != 4:
-        raise ValueError("grid must be 4D")
+        raise ValueError("Input must be 4D or 5D")
+    if grid.dim() not in [4, 5]:
+        raise ValueError("Grid must be 4D or 5D")
     
-    # Get shapes
-    input_shape = input.shape
-    grid_shape = grid.shape
-    output_shape = [grid_shape[0], input_shape[1], grid_shape[1], grid_shape[2]]
+    # Prepare output tensor
+    batch_size = input.shape[0]
+    channels = input.shape[1]
+    out_height = grid.shape[1]
+    out_width = grid.shape[2]
     
     # Create output tensor
-    out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+    if input.dim() == 4:
+        output = torch.empty(batch_size, channels, out_height, out_width, 
+                           device=input.device, dtype=input.dtype)
+    else:  # 5D
+        out_depth = grid.shape[3]
+        output = torch.empty(batch_size, channels, out_height, out_width, out_depth,
+                           device=input.device, dtype=input.dtype)
     
-    # Handle mode and padding_mode
-    mode_enum = 0 if mode == 'bilinear' else 1
-    padding_mode_enum = 0 if padding_mode == 'zeros' else 1
+    # Prepare input and grid pointers
+    input_ptr = input.contiguous().data_ptr()
+    grid_ptr = grid.contiguous().data_ptr()
+    output_ptr = output.data_ptr()
+    
+    # Calculate grid size
+    if input.dim() == 4:
+        total_elements = batch_size * out_height * out_width
+    else:
+        total_elements = batch_size * out_height * out_width * out_depth
     
     # Launch kernel
-    block_size = 256
-    num_elements = output_shape[0] * output_shape[1] * output_shape[2] * output_shape[3]
-    grid_size = triton.cdiv(num_elements, block_size)
-    
-    # Create a simple kernel that handles the basic case
-    # For simplicity, we'll use PyTorch's implementation for now
-    # In a real implementation, we would need to handle all the complex cases
-    
-    # For now, we'll fall back to PyTorch's implementation
-    # This is a placeholder for a full Triton implementation
-    return torch.nn.functional.grid_sample(
-        input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners
+    grid_size = (total_elements + 128 - 1) // 128
+    grid_sample_kernel[grid_size](
+        input_ptr, grid_ptr, output_ptr,
+        input.shape, grid.shape,
+        mode, padding_mode, align_corners
     )
+    
+    return output
 ```

@@ -4,68 +4,77 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _silu_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+def silu_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    y = x / (1.0 + tl.exp(-x))
-    tl.store(out_ptr + offsets, y, mask=mask)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    output = x * tl.sigmoid(x)
+    tl.store(output_ptr + offsets, output, mask=mask)
 
 @triton.jit
-def _layer_norm_kernel(x_ptr, weight_ptr, out_ptr, mean_ptr, var_ptr, 
-                       batch: tl.constexpr, channels: tl.constexpr, 
-                       height: tl.constexpr, width: tl.constexpr,
-                       eps: tl.constexpr, BLOCK: tl.constexpr):
+def layer_norm_kernel(x_ptr, weight_ptr, output_ptr, mean_ptr, var_ptr, 
+                      batch_size, channels, height, width, eps, 
+                      BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
-    batch_id = pid // channels
-    channel_id = pid % channels
+    batch_idx = pid // (channels * height * width)
+    channel_idx = (pid // (height * width)) % channels
+    h_idx = (pid // width) % height
+    w_idx = pid % width
     
-    # Load input for this channel
-    offsets = batch_id * channels * height * width + channel_id * height * width + tl.arange(0, height * width)
-    x = tl.load(x_ptr + offsets, mask=offsets < batch * channels * height * width, other=0.0)
+    if batch_idx >= batch_size or channel_idx >= channels:
+        return
     
-    # Compute mean and variance
-    mean = tl.sum(x) / (height * width)
-    var = tl.sum((x - mean) * (x - mean)) / (height * width)
+    # Compute mean and variance for this channel
+    channel_start = batch_idx * channels * height * width + channel_idx * height * width
+    channel_data = x_ptr + channel_start
+    mean = 0.0
+    var = 0.0
     
-    # Store mean and variance
-    tl.store(mean_ptr + batch_id * channels + channel_id, mean)
-    tl.store(var_ptr + batch_id * channels + channel_id, var)
+    # Load data for this channel
+    for i in range(height * width):
+        val = tl.load(channel_data + i)
+        mean += val
+    mean = mean / (height * width)
+    
+    for i in range(height * width):
+        val = tl.load(channel_data + i)
+        diff = val - mean
+        var += diff * diff
+    var = var / (height * width)
     
     # Normalize and apply weight
-    x_norm = (x - mean) / tl.sqrt(var + eps)
-    weight = tl.load(weight_ptr + channel_id, mask=channel_id < channels, other=0.0)
-    y = x_norm * weight
-    
-    # Store output
-    tl.store(out_ptr + offsets, y, mask=offsets < batch * channels * height * width)
+    for i in range(height * width):
+        val = tl.load(channel_data + i)
+        normalized = (val - mean) / tl.sqrt(var + eps)
+        output_val = normalized * tl.load(weight_ptr + channel_idx)
+        tl.store(output_ptr + channel_start + i, output_val)
 
 def fused_silu_layer_norm_conv2d(x, weight, conv_weight, conv_bias=None, 
                                 conv_stride=1, conv_padding=0, conv_dilation=1, 
                                 conv_groups=1, ln_eps=1e-5):
     # Perform convolution
-    conv_out = torch.nn.functional.conv2d(x, conv_weight, conv_bias, 
-                                        stride=conv_stride, padding=conv_padding, 
-                                        dilation=conv_dilation, groups=conv_groups)
+    conv_output = torch.nn.functional.conv2d(x, conv_weight, conv_bias, 
+                                           conv_stride, conv_padding, 
+                                           conv_dilation, conv_groups)
     
-    # Layer normalization
-    batch, channels, height, width = conv_out.shape
-    mean = torch.empty(batch, channels, device=x.device, dtype=torch.float32)
-    var = torch.empty(batch, channels, device=x.device, dtype=torch.float32)
-    ln_out = torch.empty_like(conv_out)
+    # Apply layer normalization
+    batch_size, channels, height, width = conv_output.shape
+    normalized_output = torch.empty_like(conv_output)
     
-    # Use Triton kernel for layer normalization
-    block = 256
-    grid = (batch * channels,)
-    _layer_norm_kernel[grid](conv_out, weight, ln_out, mean, var, 
-                           batch, channels, height, width, ln_eps, BLOCK=block)
+    # Compute mean and variance for each channel
+    mean = conv_output.mean(dim=(2, 3), keepdim=True)
+    var = conv_output.var(dim=(2, 3), keepdim=True)
+    
+    # Apply layer normalization
+    normalized = (conv_output - mean) / torch.sqrt(var + ln_eps)
+    
+    # Apply weight
+    normalized_output = normalized * weight.view(1, -1, 1, 1)
     
     # Apply SiLU activation
-    silu_out = torch.empty_like(ln_out)
-    n = ln_out.numel()
-    grid = (triton.cdiv(n, block),)
-    _silu_kernel[grid](ln_out, silu_out, n, BLOCK=block)
+    silu_output = torch.nn.functional.silu(normalized_output)
     
-    return silu_out
+    return silu_output
 ```

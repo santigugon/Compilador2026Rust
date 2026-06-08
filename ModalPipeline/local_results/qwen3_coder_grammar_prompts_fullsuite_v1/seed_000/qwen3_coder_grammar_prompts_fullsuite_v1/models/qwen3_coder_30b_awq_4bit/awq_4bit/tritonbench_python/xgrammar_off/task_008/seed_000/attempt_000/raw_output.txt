@@ -4,48 +4,49 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _sub_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, alpha: tl.constexpr, BLOCK: tl.constexpr):
+def _sub_kernel(
+    input_ptr,
+    other_ptr,
+    output_ptr,
+    alpha,
+    size,
+    BLOCK_SIZE: tl.constexpr,
+):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
-    result = x - alpha * y
-    tl.store(out_ptr + offsets, result, mask=mask)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < size
+    input = tl.load(input_ptr + offsets, mask=mask)
+    other = tl.load(other_ptr + offsets, mask=mask)
+    output = input - alpha * other
+    tl.store(output_ptr + offsets, output, mask=mask)
 
 def sub(input, other, *, alpha=1, out=None):
-    # Handle scalar other case
-    if not torch.is_tensor(other):
+    if not isinstance(other, torch.Tensor):
         other = torch.tensor(other, dtype=input.dtype, device=input.device)
     
-    # Handle broadcasting
+    if input.dtype != other.dtype:
+        other = other.to(input.dtype)
+    
     if input.shape != other.shape:
-        # Use torch's broadcasting to get the result shape
-        expanded_input, expanded_other = torch.broadcast_tensors(input, other)
-        out_shape = expanded_input.shape
-    else:
-        out_shape = input.shape
+        # Broadcasting is handled by PyTorch's native implementation
+        # We'll use the standard torch.sub for broadcasting
+        return torch.sub(input, other, alpha=alpha, out=out)
     
-    # Create output tensor
-    if out is not None:
-        if out.shape != out_shape:
-            raise ValueError("Output tensor shape does not match expected broadcast shape")
-        out = out
-    else:
-        out = torch.empty(out_shape, dtype=input.dtype, device=input.device)
+    if out is None:
+        out = torch.empty_like(input)
     
-    # Flatten tensors for kernel execution
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    size = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(size, BLOCK_SIZE),)
     
-    # Prepare pointers
-    input_ptr = input.data_ptr()
-    other_ptr = other.data_ptr()
-    out_ptr = out.data_ptr()
-    
-    # Launch kernel
-    _sub_kernel[grid](input_ptr, other_ptr, out_ptr, n, alpha, BLOCK=block)
+    _sub_kernel[grid](
+        input_ptr=input.data_ptr(),
+        other_ptr=other.data_ptr(),
+        output_ptr=out.data_ptr(),
+        alpha=alpha,
+        size=size,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
     
     return out
 ```

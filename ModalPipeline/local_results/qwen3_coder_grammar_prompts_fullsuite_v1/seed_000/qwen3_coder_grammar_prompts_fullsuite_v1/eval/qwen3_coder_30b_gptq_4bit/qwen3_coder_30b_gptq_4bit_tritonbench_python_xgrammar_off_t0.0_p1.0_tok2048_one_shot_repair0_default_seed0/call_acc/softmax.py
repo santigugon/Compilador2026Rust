@@ -40,15 +40,13 @@ def softmax(input, dim, dtype=None):
     n_rows = 1
     n_cols = shape[dim]
     
-    # Compute total number of rows
+    # Compute number of rows
     for i in range(len(shape)):
         if i != dim:
             n_rows *= shape[i]
     
     # Set block size
     BLOCK_SIZE = 1024
-    if n_cols > BLOCK_SIZE:
-        BLOCK_SIZE = triton.next_power_of_2(n_cols)
     
     # Launch kernel
     grid = (n_rows,)

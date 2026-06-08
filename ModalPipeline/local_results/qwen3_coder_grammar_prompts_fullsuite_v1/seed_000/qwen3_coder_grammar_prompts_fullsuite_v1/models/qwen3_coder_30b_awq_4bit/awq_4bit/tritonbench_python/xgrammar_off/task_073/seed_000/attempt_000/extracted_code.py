@@ -1,95 +1,55 @@
 import torch
 import triton
 import triton.language as tl
-from typing import Union, Tuple, Optional
 
 @triton.jit
-def _conv2d_kernel(
+def conv2d_kernel(
     input_ptr, weight_ptr, bias_ptr, output_ptr,
     batch_size, in_channels, out_channels, iH, iW, oH, oW,
     kH, kW, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w,
     groups, in_channels_per_group, out_channels_per_group,
-    BLOCK_SIZE: tl.constexpr
+    BLOCK_SIZE_M=16, BLOCK_SIZE_N=16, BLOCK_SIZE_K=16
 ):
-    # Get program ID
-    batch_id = tl.program_id(0)
-    out_ch_id = tl.program_id(1)
+    # Get the block indices
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
     
-    # Calculate group and channel indices
-    group_id = out_ch_id // out_channels_per_group
-    ch_id = out_ch_id % out_channels_per_group
+    # Compute the output indices
+    output_m = pid_m * BLOCK_SIZE_M
+    output_n = pid_n * BLOCK_SIZE_N
+    output_k = pid_k * BLOCK_SIZE_K
     
-    # Shared memory for input tile
-    input_tile = tl.shared_ptr(input_ptr + batch_id * in_channels * iH * iW, 
-                              shape=(in_channels_per_group, iH, iW), 
-                              strides=(iH * iW, iW, 1))
+    # Compute the input indices
+    input_m = output_m
+    input_n = output_n
+    input_k = output_k
     
-    # Shared memory for weight tile
-    weight_tile = tl.shared_ptr(weight_ptr + out_ch_id * in_channels_per_group * kH * kW, 
-                               shape=(in_channels_per_group, kH, kW), 
-                               strides=(kH * kW, kW, 1))
+    # Load the input and weight tensors
+    input_tile = tl.load(input_ptr + input_m * iW + input_n)
+    weight_tile = tl.load(weight_ptr + output_k * kH * kW + input_k)
     
-    # Initialize output accumulator
-    acc = tl.zeros((oH, oW), dtype=tl.float32)
+    # Compute the convolution
+    output_tile = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for i in range(kH):
+        for j in range(kW):
+            input_val = input_tile[input_m + i * dilation_h, input_n + j * dilation_w]
+            weight_val = weight_tile[output_k + i * kW + j]
+            output_tile += input_val * weight_val
     
-    # Loop over kernel elements
-    for kh in range(kH):
-        for kw in range(kW):
-            # Calculate input indices
-            ih = kh * dilation_h - pad_h
-            iw = kw * dilation_w - pad_w
-            
-            # Load weight
-            weight_val = tl.load(weight_ptr + out_ch_id * in_channels_per_group * kH * kW + 
-                               ch_id * kH * kW + kh * kW + kw)
-            
-            # Load input and compute convolution
-            for oh in range(oH):
-                for ow in range(oW):
-                    ih_idx = oh * stride_h + ih
-                    iw_idx = ow * stride_w + iw
-                    
-                    # Check bounds
-                    if ih_idx >= 0 and ih_idx < iH and iw_idx >= 0 and iw_idx < iW:
-                        input_val = tl.load(input_ptr + batch_id * in_channels * iH * iW + 
-                                          group_id * in_channels_per_group * iH * iW + 
-                                          ch_id * iH * iW + ih_idx * iW + iw_idx)
-                        acc[oh, ow] += input_val * weight_val
-    
-    # Add bias if present
-    if bias_ptr is not None:
-        bias_val = tl.load(bias_ptr + out_ch_id)
-        acc += bias_val
-    
-    # Store output
-    for oh in range(oH):
-        for ow in range(oW):
-            tl.store(output_ptr + batch_id * out_channels * oH * oW + 
-                    out_ch_id * oH * oW + oh * oW + ow, acc[oh, ow])
+    # Store the output
+    tl.store(output_ptr + output_m * oW + output_n, output_tile)
 
-def conv2d(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    stride: Union[int, Tuple[int, int]] = 1,
-    padding: Union[int, Tuple[int, int], str] = 0,
-    dilation: Union[int, Tuple[int, int]] = 1,
-    groups: int = 1
-) -> torch.Tensor:
+def conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
     # Handle scalar inputs
-    if isinstance(stride, int):
+    if not isinstance(stride, tuple):
         stride = (stride, stride)
-    if isinstance(padding, str):
-        if padding == 'valid':
-            padding = (0, 0)
-        elif padding == 'same':
-            padding = (0, 0)  # For simplicity, we'll use 0 padding for 'same'
-        else:
-            padding = (padding, padding)
-    if isinstance(dilation, int):
+    if not isinstance(padding, tuple):
+        padding = (padding, padding)
+    if not isinstance(dilation, tuple):
         dilation = (dilation, dilation)
     
-    # Extract dimensions
+    # Get input dimensions
     batch_size, in_channels, iH, iW = input.shape
     out_channels, _, kH, kW = weight.shape
     
@@ -108,80 +68,42 @@ def conv2d(
     in_channels_per_group = in_channels // groups
     out_channels_per_group = out_channels // groups
     
-    # Check for valid group division
-    if in_channels % groups != 0 or out_channels % groups != 0:
-        raise ValueError("in_channels and out_channels must be divisible by groups")
+    # Launch kernel
+    grid = (
+        triton.cdiv(oH, 16),
+        triton.cdiv(oW, 16),
+        triton.cdiv(out_channels, 16)
+    )
+    
+    # Create a kernel launch configuration
+    config = {
+        'batch_size': batch_size,
+        'in_channels': in_channels,
+        'out_channels': out_channels,
+        'iH': iH,
+        'iW': iW,
+        'oH': oH,
+        'oW': oW,
+        'kH': kH,
+        'kW': kW,
+        'stride_h': stride_h,
+        'stride_w': stride_w,
+        'pad_h': pad_h,
+        'pad_w': pad_w,
+        'dilation_h': dilation_h,
+        'dilation_w': dilation_w,
+        'groups': groups,
+        'in_channels_per_group': in_channels_per_group,
+        'out_channels_per_group': out_channels_per_group
+    }
     
     # Launch kernel
-    BLOCK_SIZE = 256
-    grid = (batch_size, out_channels)
-    
-    # For simplicity, we'll use a basic implementation that doesn't fully utilize shared memory
-    # A more optimized version would use shared memory tiling
-    
-    # Create a simple kernel for demonstration
-    @triton.jit
-    def _simple_conv2d_kernel(
-        input_ptr, weight_ptr, bias_ptr, output_ptr,
-        batch_size, in_channels, out_channels, iH, iW, oH, oW,
-        kH, kW, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w,
-        groups, in_channels_per_group, out_channels_per_group,
-        BLOCK_SIZE: tl.constexpr
-    ):
-        batch_id = tl.program_id(0)
-        out_ch_id = tl.program_id(1)
-        
-        # Calculate group and channel indices
-        group_id = out_ch_id // out_channels_per_group
-        ch_id = out_ch_id % out_channels_per_group
-        
-        # Initialize accumulator
-        acc = tl.zeros((oH, oW), dtype=tl.float32)
-        
-        # Loop over kernel elements and input channels
-        for kh in range(kH):
-            for kw in range(kW):
-                for ch in range(in_channels_per_group):
-                    # Calculate input indices
-                    ih = kh * dilation_h - pad_h
-                    iw = kw * dilation_w - pad_w
-                    
-                    # Load weight
-                    weight_val = tl.load(weight_ptr + out_ch_id * in_channels_per_group * kH * kW + 
-                                       ch * kH * kW + kh * kW + kw)
-                    
-                    # Load input and compute convolution
-                    for oh in range(oH):
-                        for ow in range(oW):
-                            ih_idx = oh * stride_h + ih
-                            iw_idx = ow * stride_w + iw
-                            
-                            # Check bounds
-                            if ih_idx >= 0 and ih_idx < iH and iw_idx >= 0 and iw_idx < iW:
-                                input_val = tl.load(input_ptr + batch_id * in_channels * iH * iW + 
-                                                  group_id * in_channels_per_group * iH * iW + 
-                                                  ch * iH * iW + ih_idx * iW + iw_idx)
-                                acc[oh, ow] += input_val * weight_val
-        
-        # Add bias if present
-        if bias_ptr is not None:
-            bias_val = tl.load(bias_ptr + out_ch_id)
-            acc += bias_val
-        
-        # Store output
-        for oh in range(oH):
-            for ow in range(oW):
-                tl.store(output_ptr + batch_id * out_channels * oH * oW + 
-                        out_ch_id * oH * oW + oh * oW + ow, acc[oh, ow])
-    
-    # Launch kernel
-    grid = (batch_size, out_channels)
-    _simple_conv2d_kernel[grid](
-        input, weight, bias, output,
-        batch_size, in_channels, out_channels, iH, iW, oH, oW,
-        kH, kW, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w,
-        groups, in_channels_per_group, out_channels_per_group,
-        BLOCK_SIZE=BLOCK_SIZE
+    conv2d_kernel[grid](
+        input,
+        weight,
+        bias,
+        output,
+        **config
     )
     
     return output

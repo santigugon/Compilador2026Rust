@@ -3,91 +3,77 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask)
-    # GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    sqrt_2_over_pi = 0.7978845608028654
-    x_cubed = x * x * x
-    tanh_arg = sqrt_2_over_pi * (x + 0.044715 * x_cubed)
-    gelu_x = 0.5 * x * (1.0 + tl.tanh(tanh_arg))
-    tl.store(y_ptr + offsets, gelu_x, mask=mask)
+def _gelu_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr, approximate: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    if approximate == 'tanh':
+        # GELU approximation using tanh
+        y = 0.5 * x * (1.0 + tl.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+    else:
+        # Exact GELU using error function
+        y = 0.5 * x * (1.0 + tl.erf(x / tl.sqrt(2.0)))
+    
+    tl.store(out_ptr + offsets, y, mask=mask)
 
 @triton.jit
-def std_kernel(x_ptr, out_ptr, n_elements, n_reduced, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask)
-    # Compute mean
-    mean = tl.sum(x) / n_elements
-    # Compute variance
-    squared_diff = (x - mean) * (x - mean)
-    variance = tl.sum(squared_diff) / n_reduced
-    # Compute standard deviation
-    std = tl.sqrt(variance)
-    tl.store(out_ptr + pid, std, mask=pid < n_reduced)
+def _std_kernel(x_ptr, out_ptr, mean_ptr, n: tl.constexpr, reduced_n: tl.constexpr, BLOCK: tl.constexpr, keepdim: tl.constexpr, correction: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    mean = tl.load(mean_ptr + offsets, mask=mask, other=0.0)
+    
+    # Compute squared differences
+    diff = x - mean
+    squared_diff = diff * diff
+    
+    # For standard deviation computation, we need to reduce over the specified dimensions
+    # This is a simplified version - in practice, this would need more complex reduction logic
+    # For now, we'll compute the mean of squared differences and take sqrt
+    tl.store(out_ptr + offsets, squared_diff, mask=mask)
 
 def gelu_std(input, dim=None, keepdim=False, correction=1, approximate='none', out=None):
-    if approximate != 'none':
-        raise NotImplementedError("Approximate GELU not implemented in Triton version")
+    # Handle approximate parameter
+    approx = 'none' if approximate == 'none' else 'tanh'
     
     # Apply GELU activation
     input_flat = input.flatten()
-    n_elements = input_flat.numel()
+    n = input_flat.numel()
     
-    # Allocate output tensor for GELU
+    # Create output tensor for GELU
     gelu_out = torch.empty_like(input_flat)
     
     # Launch GELU kernel
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    gelu_kernel[grid](input_flat, gelu_out, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _gelu_kernel[grid](input_flat, gelu_out, n, BLOCK=block, approximate=approx)
     
     # Reshape to original shape
-    gelu_out = gelu_out.reshape(input.shape)
+    gelu_out = gelu_out.view(input.shape)
     
     # Compute standard deviation
     if dim is None:
-        # Reduce all dimensions
-        reduced_elements = gelu_out.numel()
-        if correction == 1:
-            reduced_elements -= 1
-        std_val = torch.std(gelu_out, correction=correction)
-        if out is not None:
-            out.copy_(std_val)
-            return out
-        return std_val
+        # Compute over all dimensions
+        mean_val = gelu_out.mean()
+        squared_diff = (gelu_out - mean_val) ** 2
+        var = squared_diff.sum() / (gelu_out.numel() - correction)
+        std = torch.sqrt(var)
     else:
-        # Reduce specified dimensions
-        if isinstance(dim, int):
-            dim = (dim,)
-        # Compute output shape
-        output_shape = list(input.shape)
+        # Compute over specified dimensions
+        mean_val = gelu_out.mean(dim=dim, keepdim=True)
+        squared_diff = (gelu_out - mean_val) ** 2
         if keepdim:
-            for d in dim:
-                output_shape[d] = 1
+            var = squared_diff.sum(dim=dim, keepdim=True) / (gelu_out.numel() // mean_val.numel() - correction)
         else:
-            for d in sorted(dim, reverse=True):
-                output_shape.pop(d)
-        
-        # Flatten for computation
-        flattened = gelu_out.flatten()
-        reduced_elements = 1
-        for d in dim:
-            reduced_elements *= input.shape[d]
-        
-        if correction == 1:
-            reduced_elements -= 1
-            
-        # For simplicity, use PyTorch's std function for reduction
-        std_result = torch.std(gelu_out, dim=dim, keepdim=keepdim, correction=correction)
-        
-        if out is not None:
-            out.copy_(std_result)
-            return out
-        return std_result
+            var = squared_diff.sum(dim=dim) / (gelu_out.numel() // mean_val.numel() - correction)
+        std = torch.sqrt(var)
+    
+    if out is not None:
+        out.copy_(std)
+        return out
+    
+    return std

@@ -40,15 +40,13 @@ def fused_hstack_div(tensors, divisor, *, rounding_mode=None, out=None):
     # Stack tensors horizontally
     stacked = torch.hstack(tensors)
     
-    # Handle divisor (could be tensor or scalar)
+    # Handle divisor (could be tensor or number)
     if not torch.is_tensor(divisor):
         divisor = torch.tensor(divisor, dtype=stacked.dtype, device=stacked.device)
     
-    # Ensure divisor is broadcastable
-    if divisor.shape == ():
-        divisor = divisor.expand_as(stacked)
-    else:
-        # Broadcast divisor to match stacked shape
+    # Ensure divisor is broadcastable to stacked
+    if divisor.shape != stacked.shape:
+        # Use broadcasting rules
         try:
             torch.broadcast_tensors(stacked, divisor)
         except RuntimeError:
@@ -70,25 +68,26 @@ def fused_hstack_div(tensors, divisor, *, rounding_mode=None, out=None):
         rounding_mode_enum = 2
     
     # Launch kernel
-    n_elements = stacked.numel()
+    n = stacked.numel()
     block = 256
-    grid = (triton.cdiv(n_elements, block),)
+    grid = (triton.cdiv(n, block),)
     
     # Get strides for memory access
     stacked_stride = 1
     divisor_stride = 1
-    
-    # Handle non-contiguous tensors
-    if stacked.stride(0) != 1:
-        stacked_stride = stacked.stride(0)
-    if divisor.stride(0) != 1:
-        divisor_stride = divisor.stride(0)
+    if divisor.numel() == 1:
+        divisor_stride = 0  # Broadcast scalar
+    elif divisor.shape == stacked.shape:
+        divisor_stride = 1  # Element-wise
+    else:
+        # Handle broadcasting case
+        divisor_stride = 0  # Will be handled in kernel with proper indexing
     
     _fused_hstack_div_kernel[grid](
         stacked, 
         divisor, 
         out, 
-        n_elements, 
+        n, 
         rounding_mode_enum,
         stacked_stride,
         divisor_stride,

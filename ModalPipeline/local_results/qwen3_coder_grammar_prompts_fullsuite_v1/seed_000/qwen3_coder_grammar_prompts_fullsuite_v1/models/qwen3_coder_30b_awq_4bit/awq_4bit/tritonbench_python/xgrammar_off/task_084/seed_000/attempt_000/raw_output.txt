@@ -4,39 +4,44 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _trunc_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    # Truncation for floating point: truncate towards zero
-    # For negative numbers, we need to be careful about the floor vs trunc behavior
-    # We can use the sign and abs to handle this properly
-    sign = tl.where(x >= 0, 1.0, -1.0)
-    abs_x = tl.abs(x)
-    truncated_abs = tl.floor(abs_x)
-    truncated = sign * truncated_abs
-    tl.store(out_ptr + offsets, truncated, mask=mask)
+def trunc_kernel(
+    input_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    output = tl.where(input >= 0, tl.floor(input), tl.ceil(input))
+    tl.store(output_ptr + offsets, output, mask=mask)
 
 def trunc(input, *, out=None):
     if out is None:
-        out = torch.empty_like(input)
+        out = torch.empty_like(input, dtype=input.dtype, device=input.device)
     else:
-        assert out.shape == input.shape, "Output tensor must have the same shape as input"
-        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input"
+        if out.shape != input.shape:
+            raise ValueError("Output tensor must have the same shape as input tensor")
+        if out.dtype != input.dtype:
+            raise ValueError("Output tensor must have the same dtype as input tensor")
+        if out.device != input.device:
+            raise ValueError("Output tensor must be on the same device as input tensor")
     
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    if input.numel() == 0:
+        return out
     
-    # Handle integer inputs by copying directly
-    if input.dtype in [torch.int32, torch.int64, torch.int16, torch.int8, torch.uint8]:
-        if out is None:
-            return input.clone()
-        else:
-            out.copy_(input)
-            return out
+    n_elements = input.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
     
-    _trunc_kernel[grid](input, out, n, BLOCK=block)
+    trunc_kernel[grid](
+        input_ptr=input,
+        output_ptr=out,
+        n_elements=n_elements,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
     return out
 ```

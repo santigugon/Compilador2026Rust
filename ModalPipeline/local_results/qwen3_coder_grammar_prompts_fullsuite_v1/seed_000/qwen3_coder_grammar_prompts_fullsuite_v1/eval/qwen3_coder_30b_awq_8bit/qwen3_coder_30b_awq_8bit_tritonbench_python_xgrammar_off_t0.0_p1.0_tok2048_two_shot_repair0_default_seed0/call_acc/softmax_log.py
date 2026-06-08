@@ -3,69 +3,76 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _softmax_log_kernel(x_ptr, out_ptr, dim_size: tl.constexpr, n_elements: tl.constexpr, stride_x: tl.constexpr, stride_out: tl.constexpr, BLOCK: tl.constexpr):
-    # Get the program ID for the dimension we're processing
-    pid = tl.program_id(0)
+def _softmax_log_kernel(x_ptr, out_ptr, dim_size: tl.constexpr, n_elements: tl.constexpr, 
+                       stride_x_row: tl.constexpr, stride_out_row: tl.constexpr, 
+                       stride_x_col: tl.constexpr, stride_out_col: tl.constexpr,
+                       BLOCK: tl.constexpr):
+    # Get the row index
+    row_idx = tl.program_id(0)
     
-    # Calculate the starting offset for this block
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    # Create pointers for the current row
+    x_row_ptr = x_ptr + row_idx * stride_x_row
+    out_row_ptr = out_ptr + row_idx * stride_out_row
+    
+    # Load data for the current row
+    offsets = tl.arange(0, BLOCK) * stride_x_col
     mask = offsets < n_elements
     
-    # Load input data
-    x = tl.load(x_ptr + offsets * stride_x, mask=mask, other=0.0)
+    # Load input values
+    x = tl.load(x_row_ptr + offsets, mask=mask, other=0.0)
     
     # Apply log
     x = tl.log(x)
     
-    # Apply softmax along the specified dimension
-    # First, find the maximum value for numerical stability
+    # Apply softmax
+    # Find max for numerical stability
     max_val = tl.max(x, axis=0)
     x = x - max_val
     
     # Compute exp and sum
-    exp_x = tl.exp(x)
-    sum_exp_x = tl.sum(exp_x, axis=0)
+    x_exp = tl.exp(x)
+    sum_exp = tl.sum(x_exp, axis=0)
     
     # Normalize
-    out = exp_x / sum_exp_x
+    x_softmax = x_exp / sum_exp
     
     # Store result
-    tl.store(out_ptr + offsets * stride_out, out, mask=mask)
+    tl.store(out_row_ptr + offsets, x_softmax, mask=mask)
 
 def softmax_log(input, dim=-1, dtype=None):
-    # Handle dtype casting if specified
+    # Handle dtype casting
     if dtype is not None:
         input = input.to(dtype)
     
-    # Ensure input is contiguous for easier handling
+    # Ensure input is contiguous
     input = input.contiguous()
     
-    # Get output tensor with same shape as input
+    # Get output tensor
     out = torch.empty_like(input)
     
-    # Get the size of the specified dimension
-    dim_size = input.size(dim)
-    
-    # Get total number of elements
+    # Get dimensions
+    shape = input.shape
+    dim_size = shape[dim]
     n_elements = input.numel()
     
-    # Calculate block size
+    # Calculate strides
+    stride_x_row = input.stride(dim) if dim >= 0 else input.stride(-1)
+    stride_out_row = out.stride(dim) if dim >= 0 else out.stride(-1)
+    stride_x_col = input.stride(0) if dim == -1 else input.stride(dim)
+    stride_out_col = out.stride(0) if dim == -1 else out.stride(dim)
+    
+    # Determine block size
     BLOCK = 256
     
-    # Calculate grid size
-    grid = (triton.cdiv(n_elements, BLOCK),)
-    
-    # Get strides for the input and output tensors
-    input_strides = input.stride()
-    output_strides = out.stride()
-    
-    # Get stride for the specified dimension
-    stride_x = input_strides[dim] if dim >= 0 else input_strides[input.dim() + dim]
-    stride_out = output_strides[dim] if dim >= 0 else output_strides[input.dim() + dim]
+    # Grid size
+    grid = (shape[0] if len(shape) > 0 else 1,)
     
     # Launch kernel
     _softmax_log_kernel[grid](
-        input, out, dim_size, n_elements, stride_x, stride_out, BLOCK=BLOCK
+        input, out, dim_size, n_elements,
+        stride_x_row, stride_out_row,
+        stride_x_col, stride_out_col,
+        BLOCK=BLOCK
     )
     
     return out
