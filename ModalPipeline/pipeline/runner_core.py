@@ -27,6 +27,68 @@ from pipeline.logging.artifacts import (
 from pipeline.serve.vllm_engine import VllmGenerator
 
 
+def tritonbench_op_filename(item: dict[str, Any]) -> str | None:
+    """Return the TritonBench filename for a dataset item when it can be inferred."""
+    for key in (
+        "filename",
+        "file_name",
+        "file",
+        "op_file",
+        "op_filename",
+        "op",
+        "op_name",
+        "function_name",
+        "entrypoint",
+        "entry_point",
+    ):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            name = Path(value.strip()).name
+            if name.endswith(".py"):
+                return name
+            return f"{name.split('.')[-1]}.py"
+
+    instruction = item.get("instruction")
+    if not isinstance(instruction, str):
+        return None
+
+    marker = "Wrapper Entry Information:"
+    _, sep, tail = instruction.partition(marker)
+    if not sep:
+        return None
+
+    signature = tail.strip().split("(", 1)[0].strip()
+    if not signature:
+        return None
+    return f"{signature.split('.')[-1]}.py"
+
+
+def build_tritonbench_item_summary(
+    *,
+    item: dict[str, Any],
+    has_code: bool,
+    output_profile: str,
+    eval_summary: dict[str, Any],
+    perf_ok: bool,
+) -> tuple[dict[str, Any], str | None]:
+    per_op = eval_summary.get("per_op", {})
+    op_filename = tritonbench_op_filename(item)
+    op_result = per_op.get(op_filename, {}) if op_filename else {}
+    op_passed = has_code and bool(op_result.get("call_acc_passed", False))
+    exe_passed = has_code and bool(op_result.get("exe_acc_passed", False))
+    summary = build_summary(
+        output_profile=output_profile,
+        gen_stage="ok" if has_code else "extract",
+        gen_labels=[],
+        eval_result={
+            "exe_acc_passed": exe_passed,
+            "perf_passed": perf_ok,
+        },
+        op_passed=op_passed,
+    )
+    return summary, op_filename
+
+
 def get_model_revision(hf_id: str) -> str | None:
     try:
         from huggingface_hub import HfApi
@@ -348,9 +410,6 @@ def run_condition_local(
         )
         writer.write_json(eval_out_dir / "eval_summary.json", eval_summary)
 
-        total = max(eval_summary.get("total_predictions", 1), 1)
-        call_rate = eval_summary["phase1_call_acc"]["passed"] / total
-        exe_rate = eval_summary["phase2_exec_acc"]["passed"] / total
         speedup = eval_summary.get("phase3_efficiency", {}).get(
             "speedup_vs_pytorch"
         )
@@ -359,7 +418,7 @@ def run_condition_local(
         )
         perf_ok = speedup is None or speedup >= min_speedup
 
-        for task_idx in range(len(items)):
+        for task_idx, item in enumerate(items):
             base_dir = writer.attempt_dir(
                 model["name"],
                 model.get("quantization", "unknown"),
@@ -374,17 +433,12 @@ def run_condition_local(
                 continue
             m = json.loads(metrics_path.read_text(encoding="utf-8"))
             has_code = bool(m.get("code_extracted"))
-            op_passed = has_code and call_rate > 0
-            exe_passed = has_code and exe_rate > 0
-            summary = build_summary(
+            summary, op_filename = build_tritonbench_item_summary(
+                item=item,
+                has_code=has_code,
                 output_profile=condition["output_profile"],
-                gen_stage="ok" if has_code else "extract",
-                gen_labels=[],
-                eval_result={
-                    "exe_acc_passed": exe_passed,
-                    "perf_passed": perf_ok,
-                },
-                op_passed=op_passed,
+                eval_summary=eval_summary,
+                perf_ok=perf_ok,
             )
             m.update(
                 {
@@ -395,6 +449,7 @@ def run_condition_local(
                     "failure_stage": summary["failure_stage"],
                     "failure_labels": summary["failure_labels"],
                     "speedup_vs_pytorch": speedup,
+                    "tritonbench_op_filename": op_filename,
                     "compile_duration_ms": eval_summary["phase1_call_acc"].get(
                         "duration_ms", 0
                     ),

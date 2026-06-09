@@ -1,6 +1,6 @@
 experiment_id: qwen3_coder_grammar_prompts_fullsuite_v1
 mode: full
-serve_quantized_first: true
+serve_quantized_first: false
 
 benchmark:
   harness: tritonbench4modal

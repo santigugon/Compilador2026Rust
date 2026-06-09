@@ -31,13 +31,13 @@ from pipeline.config_loader import (
     resolve_models,
 )
 
-# Run smaller quantized checkpoints before full BF16 (helps smoke/debugging).
+# Run the full-precision baseline first, then descend through quantized variants.
 _SERVE_ORDER = {
-    "awq_4bit": 0,
-    "gptq_4bit": 1,
-    "awq_8bit": 2,
-    "gptq_int8": 3,
-    "bf16_or_fp16": 4,
+    "bf16_or_fp16": 0,
+    "awq_8bit": 1,
+    "gptq_int8": 2,
+    "awq_4bit": 3,
+    "gptq_4bit": 4,
 }
 
 
@@ -51,7 +51,10 @@ def _model_for_run(model: dict, experiment: dict) -> dict:
 def _sort_models_for_serve(models: list[dict]) -> list[dict]:
     return sorted(
         models,
-        key=lambda m: _SERVE_ORDER.get(m.get("quantization", ""), 99),
+        key=lambda m: (
+            0 if m.get("is_baseline") else 1,
+            _SERVE_ORDER.get(m.get("quantization", ""), 99),
+        ),
     )
 
 
@@ -235,7 +238,7 @@ def main() -> None:
         names = set(args.models)
         models = [m for m in models if m["name"] in names]
 
-    if experiment.get("serve_quantized_first", True):
+    if not experiment.get("preserve_model_order", False):
         models = _sort_models_for_serve(models)
 
     conditions = expand_matrix(experiment)
@@ -270,7 +273,8 @@ def main() -> None:
     print(f"experiment_id={experiment_id} jobs={len(jobs)} models={len(models)}")
     for j in jobs:
         print(
-            f"  - {j['model']} / limit={j['benchmark_limit']} / {j['condition_id']}"
+            f"  - {j['model']} / gpu={j['gpu']} / "
+            f"limit={j['benchmark_limit']} / {j['condition_id']}"
         )
 
     if args.dry_run:

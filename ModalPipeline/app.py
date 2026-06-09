@@ -139,15 +139,27 @@ def run_generation_condition(
     checkpoint_dir = Path(RESULTS_MOUNT) / experiment["experiment_id"] / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / f"{out['condition_id']}.json"
+    eval_summary = out.get("eval_summary") or {}
+    total_predictions = int(eval_summary.get("total_predictions") or 0)
+    passed_predictions = int(
+        (eval_summary.get("phase2_exec_acc") or {}).get("passed") or 0
+    )
+    status = (
+        "completed_with_failures"
+        if total_predictions and passed_predictions < total_predictions
+        else "completed"
+    )
     checkpoint_path.write_text(
         json.dumps(
             {
-                "status": "completed",
+                "status": status,
                 "model_name": model_cfg["name"],
                 "condition_id": out["condition_id"],
                 "seed": condition.get("seed"),
                 "predictions_path": out.get("predictions_path"),
                 "attempt_count": out.get("attempt_count"),
+                "total_predictions": total_predictions,
+                "passed_predictions": passed_predictions,
             },
             indent=2,
         ),
