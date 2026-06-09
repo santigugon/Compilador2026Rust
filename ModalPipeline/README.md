@@ -7,7 +7,7 @@ Modal-based experiment runner for **Qwen3-Coder** checkpoints (BF16, AWQ, GPTQ) 
 ### PUSH SECRETS
 
 ```bash
-python scripts/sync_secrets_from_env.py
+python3 scripts/sync_secrets_from_env.py
 ```
 
 ```bash
@@ -16,8 +16,8 @@ source .venv/bin/activate
 
 ```bash
 modal run --detach run_experiment.py \
-  --config configs/qwen3_coder_experiment.yaml \
-  --concurrency 10
+  --config configs/qwen3_coder_grammar_prompts_fullsuite.yaml \
+  --concurrency 3
 ```
 
 ## Secrets (`.env` → Modal)

@@ -33,9 +33,9 @@ from pipeline.config_loader import (
 
 # Run the full-precision baseline first, then descend through quantized variants.
 _SERVE_ORDER = {
-    "bf16_or_fp16": 0,
+    "gptq_int8": 0,
     "awq_8bit": 1,
-    "gptq_int8": 2,
+    "bf16_or_fp16": 2,
     "awq_4bit": 3,
     "gptq_4bit": 4,
 }
