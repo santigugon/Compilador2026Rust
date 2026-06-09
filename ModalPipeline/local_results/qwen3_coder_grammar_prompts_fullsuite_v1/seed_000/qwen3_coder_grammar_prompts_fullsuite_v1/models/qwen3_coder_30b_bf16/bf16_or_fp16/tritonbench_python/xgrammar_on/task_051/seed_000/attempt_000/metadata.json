@@ -1,5 +1,5 @@
 {
-  "run_id": "0be2d1fd-b566-4a5e-9932-1299e79c4e8c",
+  "run_id": "048977c1-a54d-4d47-aafb-af000f853a57",
   "experiment_id": "qwen3_coder_grammar_prompts_fullsuite_v1",
   "model_name": "qwen3_coder_30b_bf16",
   "hf_model_id": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
@@ -10,7 +10,7 @@
     "temperature": 0.0,
     "top_p": 1.0,
     "max_output_tokens": 2048,
-    "prompt_variant": "one_shot",
+    "prompt_variant": "two_shot",
     "repair_budget": 0,
     "runtime_limit": {
       "name": "default",

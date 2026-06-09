@@ -1,0 +1,87 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def batch_norm_kernel(
+    input_ptr, 
+    output_ptr, 
+    mean_ptr, 
+    var_ptr, 
+    weight_ptr, 
+    bias_ptr,
+    N, 
+    C, 
+    H, 
+    W,
+    training,
+    momentum,
+    eps,
+    BLOCK_SIZE = 1024
+):
+    # Get the channel index for this thread
+    channel_idx = tl.program_id(0)
+    
+    # Load mean and variance for this channel
+    mean = tl.load(mean_ptr + channel_idx)
+    var = tl.load(var_ptr + channel_idx)
+    
+    # Load weight and bias if they exist
+    weight = tl.load(weight_ptr + channel_idx) if weight_ptr is not None else 1.0
+    bias = tl.load(bias_ptr + channel_idx) if bias_ptr is not None else 0.0
+    
+    # Calculate the inverse standard deviation
+    inv_std = 1.0 / tl.sqrt(var + eps)
+    
+    # Calculate the number of elements per channel
+    elements_per_channel = H * W
+    
+    # Process elements in chunks
+    for i in range(0, elements_per_channel, BLOCK_SIZE):
+        # Calculate the offset for this chunk
+        offset = i + tl.arange(0, BLOCK_SIZE)
+        
+        # Create mask for valid elements
+        mask = offset < elements_per_channel
+        
+        # Load input data
+        input_data = tl.load(input_ptr + channel_idx * elements_per_channel + offset, mask=mask)
+        
+        # Apply batch normalization
+        normalized = (input_data - mean) * inv_std
+        
+        # Apply scale and shift
+        output = normalized * weight + bias
+        
+        # Store output
+        tl.store(output_ptr + channel_idx * elements_per_channel + offset, output, mask=mask)
+
+def batch_norm(input, running_mean, running_var, weight=None, bias=None, training=False, momentum=0.1, eps=1e-05):
+    # Ensure input is contiguous
+    input = input.contiguous()
+    
+    # Get dimensions
+    N, C, H, W = input.shape
+    
+    # Create output tensor
+    output = torch.empty_like(input)
+    
+    # Launch kernel
+    grid = (C,)
+    batch_norm_kernel[grid](
+        input_ptr=input.data_ptr(),
+        output_ptr=output.data_ptr(),
+        mean_ptr=running_mean.data_ptr(),
+        var_ptr=running_var.data_ptr(),
+        weight_ptr=weight.data_ptr() if weight is not None else None,
+        bias_ptr=bias.data_ptr() if bias is not None else None,
+        N=N,
+        C=C,
+        H=H,
+        W=W,
+        training=training,
+        momentum=momentum,
+        eps=eps
+    )
+    
+    return output

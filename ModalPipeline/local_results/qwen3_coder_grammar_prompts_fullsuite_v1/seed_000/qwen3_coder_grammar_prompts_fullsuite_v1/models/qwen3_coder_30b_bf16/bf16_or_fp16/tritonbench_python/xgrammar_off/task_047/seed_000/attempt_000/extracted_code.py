@@ -1,0 +1,49 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def selu_kernel(
+    input_ptr,
+    output_ptr,
+    n_elements,
+    alpha: tl.constexpr,
+    scale: tl.constexpr,
+    inplace: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * 1024
+    offsets = block_start + tl.arange(0, 1024)
+    mask = offsets < n_elements
+    input = tl.load(input_ptr + offsets, mask=mask)
+    
+    # SELU: scale * (max(0, x) + min(0, alpha * (exp(x) - 1)))
+    exp_x = tl.exp(input)
+    selu_value = scale * (tl.maximum(0, input) + tl.minimum(0, alpha * (exp_x - 1.0)))
+    
+    if inplace:
+        tl.store(input_ptr + offsets, selu_value, mask=mask)
+    else:
+        tl.store(output_ptr + offsets, selu_value, mask=mask)
+
+def selu(input, inplace=False):
+    if inplace:
+        output = input
+    else:
+        output = torch.empty_like(input)
+    
+    # Constants for SELU: alpha ≈ 1.6733, scale ≈ 1.0507
+    alpha = 1.6732632423543772848170429916717
+    scale = 1.0507009873554804934193349852946
+    
+    n_elements = input.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, 1024),)
+    
+    selu_kernel[grid](input_ptr=input.data_ptr(), 
+                      output_ptr=output.data_ptr(), 
+                      n_elements=n_elements,
+                      alpha=alpha,
+                      scale=scale,
+                      inplace=inplace)
+    
+    return output

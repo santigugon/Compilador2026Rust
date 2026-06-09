@@ -3,65 +3,60 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def scaled_add_norm_kernel(y_ptr, x_ptr, out_ptr, n, alpha, BLOCK_SIZE: tl.constexpr):
+def _scaled_add_norm_kernel(y_ptr, x_ptr, out_ptr, n: tl.constexpr, alpha: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     
-    y = tl.load(y_ptr + offsets, mask=mask)
-    x = tl.load(x_ptr + offsets, mask=mask)
+    # Load y and x
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     
-    y_new = y + alpha * x
-    tl.store(y_ptr + offsets, y_new, mask=mask)
+    # Compute y += alpha * x
+    y = y + alpha * x
     
-    # Compute squared sum for 2-norm
-    y_sq = y_new * y_new
-    tl.store(out_ptr + offsets, y_sq, mask=mask)
+    # Store the updated y
+    tl.store(y_ptr + offsets, y, mask=mask)
+    
+    # Compute squared values for norm
+    y_squared = y * y
+    tl.store(out_ptr + offsets, y_squared, mask=mask)
 
 @triton.jit
-def reduce_sum_kernel(in_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
+def _reduce_sum_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     
-    vals = tl.load(in_ptr + offsets, mask=mask)
-    sum_val = tl.sum(vals, axis=0)
-    tl.store(out_ptr + pid, sum_val)
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Use atomic add for reduction
+    tl.atomic_add(out_ptr, tl.sum(x, axis=0))
 
-@triton.jit
-def sqrt_kernel(out_ptr, n, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n
-    
-    val = tl.load(out_ptr + offsets, mask=mask)
-    sqrt_val = tl.sqrt(val)
-    tl.store(out_ptr + offsets, sqrt_val, mask=mask)
 
 def scaled_add_norm(y, x, alpha):
-    assert y.shape == x.shape, "y and x must have the same shape"
-    assert len(y.shape) == 1, "y and x must be 1-dimensional"
+    # Ensure inputs are contiguous and of the same shape
+    y = y.contiguous()
+    x = x.contiguous()
     
-    n = y.shape[0]
-    BLOCK_SIZE = 1024
+    # Check shapes
+    assert y.shape == x.shape, "y and x must have the same shape"
     
     # Create output tensor for squared values
-    squared_y = torch.zeros_like(y)
+    y_squared = torch.empty_like(y)
     
-    # First kernel: compute y += alpha * x and store squared values
-    grid = (triton.cdiv(n, BLOCK_SIZE),)
-    scaled_add_norm_kernel[grid](y, x, squared_y, n, alpha, BLOCK_SIZE)
+    # Compute the scaled addition and squared values
+    n = y.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
     
-    # Second kernel: reduce sum of squared values
-    reduced_sum = torch.zeros(triton.cdiv(n, BLOCK_SIZE), dtype=torch.float32, device=y.device)
-    reduce_sum_kernel[grid](squared_y, reduced_sum, n, BLOCK_SIZE)
+    _scaled_add_norm_kernel[grid](y, x, y_squared, n, alpha, BLOCK=block)
     
-    # Third kernel: compute square root of the sum
-    final_result = torch.sum(reduced_sum)
-    result_tensor = torch.tensor([final_result], dtype=torch.float32, device=y.device)
-    sqrt_kernel[1](result_tensor, 1, BLOCK_SIZE)
+    # Compute sum of squares
+    sum_squared = torch.zeros(1, dtype=torch.float32, device=y.device)
+    _reduce_sum_kernel[grid](y_squared, sum_squared, n, BLOCK=block)
     
-    return result_tensor[0]
+    # Compute 2-norm
+    norm = torch.sqrt(sum_squared)
+    
+    return norm

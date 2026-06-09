@@ -1,0 +1,77 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_embedding_add_tanh_kernel(
+    indices_ptr, weight_ptr, other_ptr, output_ptr,
+    indices_size, weight_size, other_size,
+    padding_idx, max_norm, norm_type,
+    scale_grad_by_freq, sparse,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < indices_size
+    
+    indices = tl.load(indices_ptr + offsets, mask=mask)
+    
+    # Handle padding index
+    if padding_idx >= 0:
+        padding_mask = indices == padding_idx
+        indices = tl.where(padding_mask, 0, indices)
+    
+    # Embedding lookup
+    embedding_indices = indices
+    weight_ptr += embedding_indices[:, None] * weight_size[1]
+    
+    # Load embedding
+    embedding = tl.load(weight_ptr, mask=mask[:, None])
+    
+    # Add other tensor (broadcasting)
+    other = tl.load(other_ptr, mask=mask[:, None])
+    result = embedding + other
+    
+    # Apply tanh
+    result = tl.tanh(result)
+    
+    # Apply max_norm if specified
+    if max_norm > 0:
+        norms = tl.sqrt(tl.sum(result * result, axis=1, keep_dims=True))
+        scale = max_norm / (norms + 1e-8)
+        scale = tl.where(norms > max_norm, scale, 1.0)
+        result = result * scale
+    
+    # Store result
+    tl.store(output_ptr + offsets[:, None], result, mask=mask[:, None])
+
+def fused_embedding_add_tanh(
+    input_indices, weight, other, *, padding_idx=None, max_norm=None, norm_type=2.0, scale_grad_by_freq=False, sparse=False, out=None
+):
+    if out is None:
+        out = torch.empty(input_indices.shape + (weight.shape[1],), dtype=torch.float32, device=input_indices.device)
+    
+    if max_norm is None:
+        max_norm = 0.0
+    
+    if padding_idx is None:
+        padding_idx = -1
+    
+    # Ensure inputs are contiguous
+    input_indices = input_indices.contiguous()
+    weight = weight.contiguous()
+    other = other.contiguous()
+    out = out.contiguous()
+    
+    # Launch kernel
+    grid = (triton.cdiv(input_indices.numel(), 1024),)
+    fused_embedding_add_tanh_kernel[grid](
+        input_indices, weight, other, out,
+        input_indices.numel(), weight.shape, other.shape,
+        padding_idx, max_norm, norm_type,
+        scale_grad_by_freq, sparse,
+        BLOCK_SIZE=1024
+    )
+    
+    return out

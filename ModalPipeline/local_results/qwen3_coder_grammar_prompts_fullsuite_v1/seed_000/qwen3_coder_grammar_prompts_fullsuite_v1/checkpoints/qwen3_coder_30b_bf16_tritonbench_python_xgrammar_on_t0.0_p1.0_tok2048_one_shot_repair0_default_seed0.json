@@ -1,0 +1,10 @@
+{
+  "status": "completed_with_failures",
+  "model_name": "qwen3_coder_30b_bf16",
+  "condition_id": "qwen3_coder_30b_bf16_tritonbench_python_xgrammar_on_t0.0_p1.0_tok2048_one_shot_repair0_default_seed0",
+  "seed": 0,
+  "predictions_path": "/results/qwen3_coder_grammar_prompts_fullsuite_v1/predictions/qwen3_coder_30b_bf16_tritonbench_python_xgrammar_on_t0.0_p1.0_tok2048_one_shot_repair0_default_seed0.jsonl",
+  "attempt_count": 166,
+  "total_predictions": 166,
+  "passed_predictions": 28
+}

@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are an expert Triton programmer.\n\nGenerate ONLY a single valid Python module.\nNo explanations.\nNo prose.\nNo markdown outside the code block.\nNo tests.\nNo example calls.\n\nThe module must contain:\n- imports\n- Triton kernels\n- wrapper function\n\nThe wrapper function must exactly match the required signature.\n\nWrap the entire response in ONE ```python``` block.\n"
+  },
+  {
+    "role": "user",
+    "content": "You are an expert in Trion programming, capable of writing corresponding Triton kernels and wrapper functions based on functional descriptions and function parameters. Ensure that the wrapper function fully corresponds to the provided function information.\nFunctional Description: This function applies an affine transformation to the input tensor followed by grid sampling. It first generates a 2D flow field (sampling grid) based on the input affine matrix `theta` using `affine_grid`. Then it uses the generated grid to sample from the input image using `grid_sample`. It supports multiple interpolation modes (such as 'bilinear', 'nearest', and 'bicubic'), different padding modes ('zeros', 'border', 'reflection'), and has an option to align corners for transformation consistency.\nWrapper Entry Information: def grid_sample_with_affine(input: torch.Tensor, theta: torch.Tensor, size: torch.Size, mode: str = 'bilinear', padding_mode: str = 'zeros', align_corners: bool = False) -> torch.Tensor: Input tensor of shape (N, C, H_{in}, W_{in}) (4D). Affine transformation matrix of shape (N, 2, 3) for 2D transformations. Target output image size as a 4D size (N, C, H_{out}, W_{out}). Interpolation mode to calculate output values, 'bilinear', 'nearest', or 'bicubic'. Default is 'bilinear'. Defines how to handle grid values outside the input range. Options: 'zeros', 'border', 'reflection'. Default is 'zeros'. If True, aligns the grid to corner pixels for transformation consistency. Default is False.\nAfter generation, verify if the Triton wrapper aligns with the provided func_inputs. If not, regenerate."
+  }
+]

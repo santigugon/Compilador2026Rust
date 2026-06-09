@@ -1,0 +1,126 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_fractional_max_pool2d_kernel(
+    input_ptr, output_ptr, indices_ptr,
+    input_shape0, input_shape1, input_shape2, input_shape3,
+    output_shape0, output_shape1, output_shape2, output_shape3,
+    kernel_h, kernel_w,
+    return_indices,
+    BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_W: tl.constexpr
+):
+    # Get thread indices
+    batch_idx = tl.program_id(0)
+    channel_idx = tl.program_id(1)
+    out_h = tl.program_id(2)
+    out_w = tl.program_id(3)
+    
+    # Calculate input and output strides
+    input_batch_stride = input_shape1 * input_shape2 * input_shape3
+    input_channel_stride = input_shape2 * input_shape3
+    input_h_stride = input_shape3
+    input_w_stride = 1
+    
+    output_batch_stride = output_shape1 * output_shape2 * output_shape3
+    output_channel_stride = output_shape2 * output_shape3
+    output_h_stride = output_shape3
+    output_w_stride = 1
+    
+    # Calculate input region for this output position
+    # Simple fractional pooling: use kernel size to determine region
+    in_h_start = out_h * kernel_h
+    in_w_start = out_w * kernel_w
+    
+    # Ensure we don't go out of bounds
+    in_h_end = tl.minimum(in_h_start + kernel_h, input_shape2)
+    in_w_end = tl.minimum(in_w_start + kernel_w, input_shape3)
+    
+    # Initialize max value and index
+    max_val = tl.full([1], -float('inf'), dtype=tl.float32)
+    max_idx = tl.full([1], 0, dtype=tl.int32)
+    
+    # Iterate over the pooling region
+    for h in range(in_h_start, in_h_end):
+        for w in range(in_w_start, in_w_end):
+            # Calculate input index
+            input_idx = batch_idx * input_batch_stride + channel_idx * input_channel_stride + h * input_h_stride + w * input_w_stride
+            val = tl.load(input_ptr + input_idx)
+            
+            # Apply ReLU
+            val = tl.maximum(val, 0.0)
+            
+            # Update max
+            mask = val > max_val
+            max_val = tl.where(mask, val, max_val)
+            max_idx = tl.where(mask, h * input_shape3 + w, max_idx)
+    
+    # Calculate output index
+    output_idx = batch_idx * output_batch_stride + channel_idx * output_channel_stride + out_h * output_h_stride + out_w * output_w_stride
+    
+    # Store result
+    tl.store(output_ptr + output_idx, max_val)
+    
+    # Store indices if requested
+    if return_indices:
+        tl.store(indices_ptr + output_idx, max_idx)
+
+def fused_fractional_max_pool2d_with_relu(input: torch.Tensor, kernel_size, output_size=None, output_ratio=None, return_indices=False) -> torch.Tensor:
+    # Handle kernel size
+    if isinstance(kernel_size, int):
+        kernel_h = kernel_size
+        kernel_w = kernel_size
+    else:
+        kernel_h, kernel_w = kernel_size
+    
+    # Handle output size
+    if output_size is not None:
+        out_h, out_w = output_size
+    elif output_ratio is not None:
+        ratio_h, ratio_w = output_ratio
+        out_h = int(input.shape[2] * ratio_h)
+        out_w = int(input.shape[3] * ratio_w)
+    else:
+        # Default: use kernel size to determine output size
+        out_h = (input.shape[2] + kernel_h - 1) // kernel_h
+        out_w = (input.shape[3] + kernel_w - 1) // kernel_w
+    
+    # Create output tensor
+    output = torch.empty(input.shape[0], input.shape[1], out_h, out_w, device=input.device, dtype=torch.float32)
+    
+    # Create indices tensor if needed
+    indices = None
+    if return_indices:
+        indices = torch.empty(input.shape[0], input.shape[1], out_h, out_w, device=input.device, dtype=torch.int32)
+    
+    # Define block sizes
+    BLOCK_SIZE_H = 16
+    BLOCK_SIZE_W = 16
+    
+    # Launch kernel
+    grid = (
+        input.shape[0],  # batch
+        input.shape[1],  # channels
+        out_h,           # output height
+        out_w            # output width
+    )
+    
+    fused_fractional_max_pool2d_kernel[grid](
+        input,
+        output,
+        indices,
+        input.shape[0], input.shape[1], input.shape[2], input.shape[3],
+        output.shape[0], output.shape[1], output.shape[2], output.shape[3],
+        kernel_h, kernel_w,
+        return_indices,
+        BLOCK_SIZE_H=BLOCK_SIZE_H,
+        BLOCK_SIZE_W=BLOCK_SIZE_W
+    )
+    
+    if return_indices:
+        return output, indices
+    else:
+        return output
+```

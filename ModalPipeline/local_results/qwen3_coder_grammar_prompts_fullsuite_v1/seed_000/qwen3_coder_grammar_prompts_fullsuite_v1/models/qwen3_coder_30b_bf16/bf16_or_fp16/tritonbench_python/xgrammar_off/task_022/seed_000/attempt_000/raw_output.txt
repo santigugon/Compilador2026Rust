@@ -1,0 +1,110 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def log_softmax_linear_kernel(
+    input_ptr, weight_ptr, bias_ptr, output_ptr,
+    input_row_stride, weight_row_stride, weight_col_stride,
+    output_row_stride, output_col_stride,
+    n_cols, n_rows, n_out_features,
+    BLOCK_SIZE: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    DIM: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(n_rows, BLOCK_SIZE)
+    num_pid_n = tl.cdiv(n_out_features, BLOCK_SIZE)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    remaining = pid - first_pid_m
+    if remaining < GROUP_SIZE_M:
+        pid_m = first_pid_m + remaining
+    else:
+        pid_m = first_pid_m + remaining % GROUP_SIZE_M
+        pid_n = (remaining // GROUP_SIZE_M) + (group_id * num_pid_n)
+    
+    if pid_m >= num_pid_m or pid_n >= num_pid_n:
+        return
+    
+    input_row = pid_m * input_row_stride
+    weight_row = pid_n * weight_row_stride
+    output_row = pid_m * output_row_stride
+    
+    input_ptrs = input_ptr + input_row
+    weight_ptrs = weight_ptr + weight_row
+    output_ptrs = output_ptr + output_row
+    
+    # Compute linear transformation
+    accumulator = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    for i in range(0, n_cols, BLOCK_SIZE):
+        mask = (i + tl.arange(0, BLOCK_SIZE)) < n_cols
+        input_vals = tl.load(input_ptrs + i, mask=mask, other=0.0)
+        weight_vals = tl.load(weight_ptrs + i * weight_col_stride, mask=mask, other=0.0)
+        accumulator += input_vals * weight_vals
+    
+    # Add bias if present
+    if bias_ptr is not None:
+        bias_row = pid_n * output_col_stride
+        bias_ptrs = bias_ptr + bias_row
+        bias_vals = tl.load(bias_ptrs, mask=tl.arange(0, BLOCK_SIZE) < n_out_features, other=0.0)
+        accumulator += bias_vals
+    
+    # Apply log_softmax
+    accumulator = accumulator - tl.max(accumulator, axis=0)
+    exp_vals = tl.exp(accumulator)
+    sum_exp = tl.sum(exp_vals, axis=0)
+    log_softmax_vals = accumulator - tl.log(sum_exp)
+    
+    # Store result
+    tl.store(output_ptrs, log_softmax_vals, mask=tl.arange(0, BLOCK_SIZE) < n_out_features)
+
+def log_softmax_linear(input, weight, bias=None, dim=-1, dtype=None):
+    if dtype is not None:
+        input = input.to(dtype)
+        weight = weight.to(dtype)
+        if bias is not None:
+            bias = bias.to(dtype)
+    
+    # Ensure input is 2D for processing
+    input_shape = input.shape
+    if len(input_shape) == 1:
+        input = input.unsqueeze(0)
+    elif len(input_shape) > 2:
+        input = input.view(-1, input_shape[-1])
+    
+    # Prepare dimensions
+    n_rows = input.shape[0]
+    n_cols = input.shape[1]
+    n_out_features = weight.shape[0]
+    
+    # Create output tensor
+    output = torch.empty(n_rows, n_out_features, dtype=input.dtype, device=input.device)
+    
+    # Launch kernel
+    BLOCK_SIZE = 1024
+    GROUP_SIZE_M = 8
+    grid = (triton.cdiv(n_rows, BLOCK_SIZE), triton.cdiv(n_out_features, BLOCK_SIZE))
+    
+    # Handle bias pointer
+    bias_ptr = bias.data_ptr() if bias is not None else None
+    
+    log_softmax_linear_kernel[grid](
+        input.data_ptr(), weight.data_ptr(), bias_ptr,
+        output.data_ptr(),
+        input.stride(0), weight.stride(0), weight.stride(1),
+        output.stride(0), output.stride(1),
+        n_cols, n_rows, n_out_features,
+        BLOCK_SIZE=BLOCK_SIZE,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        DIM=dim
+    )
+    
+    # Reshape output if needed
+    if len(input_shape) > 2:
+        output = output.view(*input_shape[:-1], n_out_features)
+    
+    return output
+```

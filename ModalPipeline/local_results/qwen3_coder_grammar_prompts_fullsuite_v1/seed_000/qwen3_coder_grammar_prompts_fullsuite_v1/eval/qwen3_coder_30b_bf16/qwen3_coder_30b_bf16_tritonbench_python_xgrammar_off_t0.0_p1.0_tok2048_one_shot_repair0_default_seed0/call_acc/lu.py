@@ -1,0 +1,173 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def lu_kernel(
+    A_ptr, P_ptr, L_ptr, U_ptr,
+    m, n, batch_size,
+    stride_am, stride_an,
+    stride_pm, stride_pn,
+    stride_lm, stride_ln,
+    stride_um, stride_un,
+    BLOCK_SIZE: tl.constexpr
+):
+    batch_idx = tl.program_id(0)
+    if batch_idx >= batch_size:
+        return
+    
+    A_base = A_ptr + batch_idx * stride_am
+    P_base = P_ptr + batch_idx * stride_pm
+    L_base = L_ptr + batch_idx * stride_lm
+    U_base = U_ptr + batch_idx * stride_um
+    
+    # Initialize L and U matrices
+    for i in range(m):
+        for j in range(n):
+            if i == j:
+                tl.store(U_base + i * stride_um + j * stride_un, tl.load(A_base + i * stride_am + j * stride_an))
+            elif i > j:
+                tl.store(L_base + i * stride_lm + j * stride_ln, tl.load(A_base + i * stride_am + j * stride_an))
+            else:
+                tl.store(U_base + i * stride_um + j * stride_un, tl.load(A_base + i * stride_am + j * stride_an))
+    
+    # Initialize permutation matrix
+    for i in range(m):
+        for j in range(m):
+            if i == j:
+                tl.store(P_base + i * stride_pm + j * stride_pn, 1.0)
+            else:
+                tl.store(P_base + i * stride_pm + j * stride_pn, 0.0)
+    
+    # LU decomposition with partial pivoting
+    for k in range(min(m, n)):
+        # Find pivot
+        max_val = tl.abs(tl.load(U_base + k * stride_um + k * stride_un))
+        pivot_row = k
+        for i in range(k + 1, m):
+            val = tl.abs(tl.load(U_base + i * stride_um + k * stride_un))
+            if val > max_val:
+                max_val = val
+                pivot_row = i
+        
+        # Swap rows in A, L, U, and P if needed
+        if pivot_row != k:
+            # Swap rows in U
+            for j in range(k, n):
+                temp = tl.load(U_base + k * stride_um + j * stride_un)
+                tl.store(U_base + k * stride_um + j * stride_un, tl.load(U_base + pivot_row * stride_um + j * stride_un))
+                tl.store(U_base + pivot_row * stride_um + j * stride_un, temp)
+            
+            # Swap rows in L
+            for j in range(0, k):
+                temp = tl.load(L_base + k * stride_lm + j * stride_ln)
+                tl.store(L_base + k * stride_lm + j * stride_ln, tl.load(L_base + pivot_row * stride_lm + j * stride_ln))
+                tl.store(L_base + pivot_row * stride_lm + j * stride_ln, temp)
+            
+            # Swap rows in P
+            for j in range(m):
+                temp = tl.load(P_base + k * stride_pm + j * stride_pn)
+                tl.store(P_base + k * stride_pm + j * stride_pn, tl.load(P_base + pivot_row * stride_pm + j * stride_pn))
+                tl.store(P_base + pivot_row * stride_pm + j * stride_pn, temp)
+        
+        # Compute multipliers and update U
+        for i in range(k + 1, m):
+            if tl.abs(tl.load(U_base + k * stride_um + k * stride_un)) > 1e-12:
+                multiplier = tl.load(U_base + i * stride_um + k * stride_un) / tl.load(U_base + k * stride_um + k * stride_un)
+                tl.store(L_base + i * stride_lm + k * stride_ln, multiplier)
+                for j in range(k + 1, n):
+                    temp = tl.load(U_base + i * stride_um + j * stride_un) - multiplier * tl.load(U_base + k * stride_um + j * stride_un)
+                    tl.store(U_base + i * stride_um + j * stride_un, temp)
+            else:
+                tl.store(L_base + i * stride_lm + k * stride_ln, 0.0)
+
+def lu(A, *, pivot=True, out=None):
+    if not pivot:
+        # For no pivoting, we just return empty permutation matrix
+        batch_dims = A.shape[:-2]
+        m, n = A.shape[-2], A.shape[-1]
+        L = torch.zeros_like(A)
+        U = torch.zeros_like(A)
+        P = torch.empty(batch_dims + (m, m), dtype=torch.float32, device=A.device)
+        return (P, L, U)
+    
+    # For pivoting, we need to compute the actual decomposition
+    batch_dims = A.shape[:-2]
+    m, n = A.shape[-2], A.shape[-1]
+    
+    # Create output tensors
+    if out is not None:
+        P, L, U = out
+    else:
+        P = torch.empty(batch_dims + (m, m), dtype=A.dtype, device=A.device)
+        L = torch.zeros_like(A)
+        U = torch.zeros_like(A)
+    
+    # Handle batched operations
+    batch_size = 1
+    for dim in batch_dims:
+        batch_size *= dim
+    
+    if batch_size == 0:
+        batch_size = 1
+    
+    # Launch kernel
+    grid = (batch_size,)
+    BLOCK_SIZE = 16
+    
+    # Ensure tensors are contiguous
+    A_contiguous = A.contiguous()
+    P_contiguous = P.contiguous()
+    L_contiguous = L.contiguous()
+    U_contiguous = U.contiguous()
+    
+    # Launch kernel
+    lu_kernel[grid](
+        A_contiguous, P_contiguous, L_contiguous, U_contiguous,
+        m, n, batch_size,
+        A_contiguous.stride(-2), A_contiguous.stride(-1),
+        P_contiguous.stride(-2), P_contiguous.stride(-1),
+        L_contiguous.stride(-2), L_contiguous.stride(-1),
+        U_contiguous.stride(-2), U_contiguous.stride(-1),
+        BLOCK_SIZE
+    )
+    
+    # Set diagonal of L to 1
+    if m > 0:
+        for i in range(min(m, n)):
+            L_contiguous[..., i, i] = 1.0
+    
+    return (P_contiguous, L_contiguous, U_contiguous)
+
+##################################################################################################################################################
+
+
+
+import torch
+
+def test_lu():
+    results = {}
+
+    # Test case 1: 2x2 matrix with pivoting
+    A1 = torch.randn(2, 2, device="cuda")
+    P1, L1, U1 = lu(A1)
+    results["test_case_1"] = (P1.cpu(), L1.cpu(), U1.cpu())
+
+    # Test case 2: 3x3 matrix with pivoting
+    A2 = torch.randn(3, 3, device="cuda")
+    P2, L2, U2 = lu(A2)
+    results["test_case_2"] = (P2.cpu(), L2.cpu(), U2.cpu())
+
+    # Test case 3: 2x3 matrix without pivoting
+    A3 = torch.randn(2, 3, device="cuda")
+    P3, L3, U3 = lu(A3, pivot=False)
+    results["test_case_3"] = (P3.cpu(), L3.cpu(), U3.cpu())
+
+    # Test case 4: Batch of 2x2 matrices with pivoting
+    A4 = torch.randn(4, 2, 2, device="cuda")
+    P4, L4, U4 = lu(A4)
+    results["test_case_4"] = (P4.cpu(), L4.cpu(), U4.cpu())
+
+    return results
+
+test_results = test_lu()

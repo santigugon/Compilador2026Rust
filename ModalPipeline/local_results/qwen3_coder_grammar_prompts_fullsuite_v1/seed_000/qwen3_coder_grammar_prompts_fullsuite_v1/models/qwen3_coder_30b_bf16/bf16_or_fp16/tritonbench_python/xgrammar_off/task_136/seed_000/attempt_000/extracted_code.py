@@ -1,0 +1,65 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def softmax_kernel(
+    input_ptr,
+    output_ptr,
+    n_cols,
+    n_rows,
+    BLOCK_SIZE: tl.constexpr,
+    dtype: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    input_ptrs = input_ptr + row_idx * n_cols + col_offsets
+    output_ptrs = output_ptr + row_idx * n_cols + col_offsets
+    
+    # Load input data
+    mask = col_offsets < n_cols
+    input_vals = tl.load(input_ptrs, mask=mask, other=-float('inf'))
+    
+    # Apply softmax
+    max_val = tl.max(input_vals, axis=0)
+    exp_vals = tl.exp(input_vals - max_val)
+    sum_exp = tl.sum(exp_vals, axis=0)
+    softmax_vals = exp_vals / sum_exp
+    
+    # Store result
+    tl.store(output_ptrs, softmax_vals, mask=mask)
+
+def softmax(input, dim, dtype=None):
+    if dtype is not None:
+        input = input.to(dtype)
+    
+    # Ensure input is contiguous
+    input = input.contiguous()
+    
+    # Get input shape and compute total elements
+    shape = input.shape
+    n_rows = 1
+    n_cols = shape[dim]
+    
+    # Compute number of rows (product of all dimensions except the one we're softmaxing over)
+    for i, s in enumerate(shape):
+        if i != dim:
+            n_rows *= s
+    
+    # Create output tensor
+    output = torch.empty_like(input)
+    
+    # Launch kernel
+    BLOCK_SIZE = triton.next_power_of_2(n_cols)
+    grid = (n_rows,)
+    
+    softmax_kernel[grid](
+        input_ptr=input.data_ptr(),
+        output_ptr=output.data_ptr(),
+        n_cols=n_cols,
+        n_rows=n_rows,
+        BLOCK_SIZE=BLOCK_SIZE,
+        dtype=input.dtype
+    )
+    
+    return output

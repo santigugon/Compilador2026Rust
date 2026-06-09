@@ -1,0 +1,125 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def mean_kernel(
+    input_ptr, 
+    output_ptr, 
+    input_row_stride, 
+    output_row_stride, 
+    n_cols, 
+    n_rows, 
+    BLOCK_SIZE: tl.constexpr
+):
+    row_idx = tl.program_id(0)
+    if row_idx >= n_rows:
+        return
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    acc = tl.zeros((1,), dtype=tl.float32)
+    
+    # Load data and compute sum
+    for col_start in range(0, n_cols, BLOCK_SIZE):
+        col_offset = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = col_offset < n_cols
+        
+        # Load input data
+        input_data = tl.load(input_ptr + row_idx * input_row_stride + col_offset, mask=mask, other=0.0)
+        
+        # Accumulate sum
+        acc += tl.sum(input_data)
+    
+    # Compute mean
+    mean_val = acc / n_cols
+    
+    # Store result
+    tl.store(output_ptr + row_idx * output_row_stride, mean_val)
+
+def mean_triton(input, dim, keepdim=False, dtype=None, out=None):
+    if isinstance(dim, int):
+        dim = (dim,)
+    
+    # Handle negative dimensions
+    dim = tuple(d if d >= 0 else input.dim() + d for d in dim)
+    
+    # Validate dimensions
+    if not all(0 <= d < input.dim() for d in dim):
+        raise ValueError("Dimension out of range")
+    
+    # Handle dtype casting
+    if dtype is not None:
+        input = input.to(dtype)
+    
+    # Create output shape
+    output_shape = list(input.shape)
+    if keepdim:
+        for d in dim:
+            output_shape[d] = 1
+    else:
+        for d in sorted(dim, reverse=True):
+            output_shape.pop(d)
+    
+    # Create output tensor
+    if out is not None:
+        output = out
+        if output.shape != tuple(output_shape):
+            raise ValueError("Output tensor shape mismatch")
+    else:
+        output = torch.empty(output_shape, device=input.device, dtype=input.dtype)
+    
+    # Handle reduction over multiple dimensions
+    if len(dim) == 0:
+        return input.clone()
+    
+    # For simplicity, we'll handle single dimension reduction
+    if len(dim) == 1:
+        reduce_dim = dim[0]
+        if reduce_dim < 0:
+            reduce_dim += input.dim()
+        
+        # Get dimensions
+        n_rows = 1
+        n_cols = input.shape[reduce_dim]
+        for i in range(reduce_dim):
+            n_rows *= input.shape[i]
+        for i in range(reduce_dim + 1, input.dim()):
+            n_cols *= input.shape[i]
+        
+        # Create output tensor if needed
+        if out is None:
+            output = torch.empty(input.shape[:reduce_dim] + input.shape[reduce_dim+1:], 
+                               device=input.device, dtype=input.dtype)
+        
+        # Launch kernel
+        BLOCK_SIZE = 1024
+        grid = (n_rows,)
+        
+        mean_kernel[grid](
+            input_ptr=input.data_ptr(),
+            output_ptr=output.data_ptr(),
+            input_row_stride=input.stride(0) if input.dim() > 1 else 1,
+            output_row_stride=output.stride(0) if output.dim() > 0 else 1,
+            n_cols=n_cols,
+            n_rows=n_rows,
+            BLOCK_SIZE=BLOCK_SIZE
+        )
+    else:
+        # For multiple dimensions, we'll reduce one by one
+        # This is a simplified approach for demonstration
+        temp = input
+        sorted_dims = sorted(dim, reverse=True)
+        for d in sorted_dims:
+            temp = mean_triton(temp, d, keepdim=True)
+        
+        if not keepdim:
+            # Remove the reduced dimensions
+            output_shape = list(input.shape)
+            for d in sorted(dim, reverse=True):
+                output_shape.pop(d)
+            output = temp.view(output_shape)
+        else:
+            output = temp
+    
+    return output

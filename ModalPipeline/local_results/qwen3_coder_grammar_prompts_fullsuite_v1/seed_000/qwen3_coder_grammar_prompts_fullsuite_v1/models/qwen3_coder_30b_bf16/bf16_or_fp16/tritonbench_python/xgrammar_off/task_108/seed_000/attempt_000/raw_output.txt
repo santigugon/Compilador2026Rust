@@ -1,0 +1,162 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def affine_grid_kernel(
+    theta_ptr, 
+    grid_ptr, 
+    N, 
+    H_out, 
+    W_out, 
+    H_in, 
+    W_in,
+    BLOCK_SIZE: tl.constexpr
+):
+    # Compute global thread index
+    idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    
+    # Each thread handles one output pixel
+    batch_idx = idx // (H_out * W_out)
+    y_idx = (idx % (H_out * W_out)) // W_out
+    x_idx = (idx % (H_out * W_out)) % W_out
+    
+    # Bounds checking
+    mask = (batch_idx < N) & (y_idx < H_out) & (x_idx < W_out)
+    
+    # Get affine transformation parameters for this batch
+    theta_batch = theta_ptr + batch_idx * 6
+    a = tl.load(theta_batch + 0, mask=mask)
+    b = tl.load(theta_batch + 1, mask=mask)
+    c = tl.load(theta_batch + 2, mask=mask)
+    d = tl.load(theta_batch + 3, mask=mask)
+    e = tl.load(theta_batch + 4, mask=mask)
+    f = tl.load(theta_batch + 5, mask=mask)
+    
+    # Normalize coordinates to [-1, 1] range
+    x_norm = (x_idx.to(tl.float32) - (W_out - 1) / 2.0) / ((W_out - 1) / 2.0)
+    y_norm = (y_idx.to(tl.float32) - (H_out - 1) / 2.0) / ((H_out - 1) / 2.0)
+    
+    # Apply affine transformation
+    x_transformed = a * x_norm + b * y_norm + c
+    y_transformed = d * x_norm + e * y_norm + f
+    
+    # Store results
+    grid_x = x_transformed
+    grid_y = y_transformed
+    
+    # Store in grid tensor (N, H_out, W_out, 2)
+    grid_ptr_x = grid_ptr + batch_idx * H_out * W_out * 2 + y_idx * W_out * 2 + x_idx * 2
+    grid_ptr_y = grid_ptr_x + 1
+    
+    tl.store(grid_ptr_x, grid_x, mask=mask)
+    tl.store(grid_ptr_y, grid_y, mask=mask)
+
+@triton.jit
+def grid_sample_kernel(
+    input_ptr,
+    grid_ptr,
+    output_ptr,
+    N,
+    C,
+    H_out,
+    W_out,
+    H_in,
+    W_in,
+    mode: tl.constexpr,
+    padding_mode: tl.constexpr,
+    align_corners: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    # Compute global thread index
+    idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    
+    # Each thread handles one output pixel
+    batch_idx = idx // (C * H_out * W_out)
+    channel_idx = (idx % (C * H_out * W_out)) // (H_out * W_out)
+    y_idx = ((idx % (C * H_out * W_out)) % (H_out * W_out)) // W_out
+    x_idx = ((idx % (C * H_out * W_out)) % (H_out * W_out)) % W_out
+    
+    # Bounds checking
+    mask = (batch_idx < N) & (channel_idx < C) & (y_idx < H_out) & (x_idx < W_out)
+    
+    # Load grid coordinates
+    grid_ptr_base = grid_ptr + batch_idx * H_out * W_out * 2 + y_idx * W_out * 2 + x_idx * 2
+    grid_x = tl.load(grid_ptr_base, mask=mask)
+    grid_y = tl.load(grid_ptr_base + 1, mask=mask)
+    
+    # Convert grid coordinates to input image coordinates
+    if align_corners:
+        x_in = (grid_x + 1.0) / 2.0 * (W_in - 1)
+        y_in = (grid_y + 1.0) / 2.0 * (H_in - 1)
+    else:
+        x_in = (grid_x + 1.0) * (W_in - 1) / 2.0
+        y_in = (grid_y + 1.0) * (H_in - 1) / 2.0
+    
+    # Handle padding modes
+    if padding_mode == 0:  # zeros
+        valid_mask = (x_in >= 0) & (x_in < W_in) & (y_in >= 0) & (y_in < H_in)
+        x_in = tl.where(valid_mask, x_in, 0.0)
+        y_in = tl.where(valid_mask, y_in, 0.0)
+    elif padding_mode == 1:  # border
+        x_in = tl.clamp(x_in, 0.0, W_in - 1.0)
+        y_in = tl.clamp(y_in, 0.0, H_in - 1.0)
+    elif padding_mode == 2:  # reflection
+        x_in = tl.where(x_in < 0, -x_in, x_in)
+        y_in = tl.where(y_in < 0, -y_in, y_in)
+        x_in = tl.where(x_in >= W_in, 2 * W_in - 2 - x_in, x_in)
+        y_in = tl.where(y_in >= H_in, 2 * H_in - 2 - y_in, y_in)
+    
+    # Interpolation modes
+    if mode == 0:  # bilinear
+        x0 = tl.floor(x_in).to(tl.int32)
+        y0 = tl.floor(y_in).to(tl.int32)
+        x1 = x0 + 1
+        y1 = y0 + 1
+        
+        # Clamp coordinates
+        x0 = tl.clamp(x0, 0, W_in - 1)
+        x1 = tl.clamp(x1, 0, W_in - 1)
+        y0 = tl.clamp(y0, 0, H_in - 1)
+        y1 = tl.clamp(y1, 0, H_in - 1)
+        
+        # Compute weights
+        wx = x_in - x0.to(tl.float32)
+        wy = y_in - y0.to(tl.float32)
+        
+        # Load pixel values
+        input_ptr_base = input_ptr + batch_idx * C * H_in * W_in + channel_idx * H_in * W_in
+        p00 = tl.load(input_ptr_base + y0 * W_in + x0, mask=mask)
+        p01 = tl.load(input_ptr_base + y0 * W_in + x1, mask=mask)
+        p10 = tl.load(input_ptr_base + y1 * W_in + x0, mask=mask)
+        p11 = tl.load(input_ptr_base + y1 * W_in + x1, mask=mask)
+        
+        # Bilinear interpolation
+        val = (p00 * (1 - wx) * (1 - wy) + 
+               p01 * wx * (1 - wy) + 
+               p10 * (1 - wx) * wy + 
+               p11 * wx * wy)
+    elif mode == 1:  # nearest
+        x_nearest = tl.round(x_in).to(tl.int32)
+        y_nearest = tl.round(y_in).to(tl.int32)
+        x_nearest = tl.clamp(x_nearest, 0, W_in - 1)
+        y_nearest = tl.clamp(y_nearest, 0, H_in - 1)
+        input_ptr_base = input_ptr + batch_idx * C * H_in * W_in + channel_idx * H_in * W_in
+        val = tl.load(input_ptr_base + y_nearest * W_in + x_nearest, mask=mask)
+    else:  # bicubic
+        # Simplified bicubic (using bilinear for now)
+        x0 = tl.floor(x_in).to(tl.int32)
+        y0 = tl.floor(y_in).to(tl.int32)
+        x1 = x0 + 1
+        y1 = y0 + 1
+        x0 = tl.clamp(x0, 0, W_in - 1)
+        x1 = tl.clamp(x1, 0, W_in - 1)
+        y0 = tl.clamp(y0, 0, H_in - 1)
+        y1 = tl.clamp(y1, 0, H_in - 1)
+        wx = x_in - x0.to(tl.float32)
+        wy = y_in - y0.to(tl.float32)
+        input_ptr_base = input_ptr + batch_idx * C * H_in * W_in + channel_idx * H_in * W_in
+        p00 = tl.load(input_ptr_base + y0 * W_in + x0, mask=mask)
+        p01 = tl.load(input_ptr_base + y0 * W_in + x1, mask=mask)
+        p10 = tl.load(input_ptr_base + y1 * W_in + x0, mask=

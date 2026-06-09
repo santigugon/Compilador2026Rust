@@ -1,0 +1,72 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def permute_copy_kernel(
+    input_ptr, output_ptr,
+    input_strides, output_strides,
+    ndim, 
+    numel,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offset = pid * BLOCK_SIZE
+    indices = tl.arange(offset, offset + BLOCK_SIZE)
+    
+    mask = indices < numel
+    
+    # Compute linear index in input tensor
+    input_idx = tl.zeros((BLOCK_SIZE,), dtype=tl.int64)
+    temp_idx = indices
+    
+    for i in range(ndim - 1, -1, -1):
+        input_idx += (temp_idx % input_strides[i]) * output_strides[i]
+        temp_idx //= input_strides[i]
+    
+    # Load and store
+    vals = tl.load(input_ptr + input_idx, mask=mask)
+    tl.store(output_ptr + indices, vals, mask=mask)
+
+def torch_permute_copy(input, dims):
+    # Validate input
+    if not isinstance(input, torch.Tensor):
+        raise TypeError("input must be a torch.Tensor")
+    if not isinstance(dims, (tuple, list)):
+        raise TypeError("dims must be a tuple or list")
+    
+    # Validate dims
+    if len(dims) != input.dim():
+        raise ValueError("dims must have the same length as input dimensions")
+    
+    if sorted(dims) != list(range(input.dim())):
+        raise ValueError("dims must contain each dimension index exactly once")
+    
+    # Create output tensor with same dtype and device
+    output = torch.empty_like(input.permute(dims))
+    
+    # Get input and output strides
+    input_strides = list(input.stride())
+    output_strides = list(output.stride())
+    
+    # Convert to appropriate format for kernel
+    input_strides = [s for s in input_strides]
+    output_strides = [s for s in output_strides]
+    
+    # Prepare kernel launch parameters
+    numel = input.numel()
+    BLOCK_SIZE = 1024
+    grid_size = (numel + BLOCK_SIZE - 1) // BLOCK_SIZE
+    
+    # Launch kernel
+    permute_copy_kernel[grid_size](
+        input.data_ptr(),
+        output.data_ptr(),
+        input_strides,
+        output_strides,
+        input.dim(),
+        numel,
+        BLOCK_SIZE
+    )
+    
+    return output

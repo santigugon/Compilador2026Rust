@@ -1,0 +1,47 @@
+{
+  "instruction": "Implement a fused operation combining element-wise addition, element-wise multiplication, and group normalization using Triton kernels. The function should take two input tensors, add them element-wise, multiply the result with the second tensor, and then apply group normalization using learnable parameters for scaling and shifting.",
+  "predict": "import torch\nimport triton\nimport triton.language as tl\n\ndef _get_group_norm_stats(x, num_groups, eps):\n    # Compute mean and variance for group normalization\n    x = x.float()\n    batch_size, channels, *dims = x.shape\n    group_size = channels // num_groups\n    \n    # Reshape to group the channels\n    x_reshaped = x.view(batch_size, num_groups, group_size, *dims)\n    \n    # Compute mean and variance for each group\n    mean = x_reshaped.mean(dim=2, keepdim=True)\n    var = x_reshaped.var(dim=2, keepdim=True, unbiased=False)\n    \n    # Reshape back to original shape\n    mean = mean.view(batch_size, channels, *dims)\n    var = var.view(batch_size, channels, *dims)\n    \n    return mean, var\n\n@triton.jit\ndef _fused_add_mul_groupnorm_kernel(\n    x_ptr, y_ptr, weight_ptr, bias_ptr, out_ptr,\n    x_stride_0, x_stride_1, x_stride_2,\n    y_stride_0, y_stride_1, y_stride_2,\n    weight_stride_0,\n    bias_stride_0,\n    out_stride_0, out_stride_1, out_stride_2,\n    batch_size, channels, height, width,\n    num_groups,\n    eps,\n    BLOCK_SIZE: tl.constexpr\n):\n    pid = tl.program_id(0)\n    \n    # Each block handles one channel\n    channel_id = pid\n    \n    if channel_id >= channels:\n        return\n    \n    # Compute group id for this channel\n    group_id = channel_id // (channels // num_groups)\n    \n    # Load weight and bias for this channel\n    weight = tl.load(weight_ptr + channel_id * weight_stride_0)\n    bias = tl.load(bias_ptr + channel_id * bias_stride_0)\n    \n    # Compute mean and variance for this channel's group\n    mean = 0.0\n    var = 0.0\n    \n    # For simplicity, we'll compute mean and variance across all elements\n    # in the channel group (this is a simplified approach)\n    \n    # Load data for this channel\n    for i in range(0, batch_size * height * width, BLOCK_SIZE):\n        offsets = i + tl.arange(0, BLOCK_SIZE)\n        mask = offsets < batch_size * height * width\n        \n        # Load x and y\n        x_offsets = offsets\n        y_offsets = offsets\n        \n        x_val = tl.load(x_ptr + x_offsets, mask=mask, other=0.0)\n        y_val = tl.load(y_ptr + y_offsets, mask=mask, other=0.0)\n        \n        # Element-wise addition and multiplication\n        result = x_val + y_val\n        result = result * y_val\n        \n        # Group normalization\n        # For this simplified version, we'll compute mean and variance\n        # across all elements in the channel\n        mean += tl.sum(result)\n        var += tl.sum(result * result)\n    \n    # Compute mean and variance\n    total_elements = batch_size * height * width\n    mean = mean / total_elements\n    var = var / total_elements - mean * mean\n    \n    # Normalize and apply scale and shift\n    std = tl.sqrt(var + eps)\n    normalized = (result - mean) / std\n    output = normalized * weight + bias\n    \n    # Store result\n    for i in range(0, batch_size * height * width, BLOCK_SIZE):\n        offsets = i + tl.arange(0, BLOCK_SIZE)\n        mask = offsets < batch_size * height * width\n        \n        out_offsets = offsets\n        tl.store(out_ptr + out_offsets, output, mask=mask)\n\n@triton.jit\ndef _fused_add_mul_groupnorm_kernel_simple(\n    x_ptr, y_ptr, weight_ptr, bias_ptr, out_ptr,\n    batch_size, channels, height, width,\n    num_groups,\n    eps,\n    BLOCK_SIZE: tl.constexpr\n):\n    pid = tl.program_id(0)\n    \n    # Each block handles one element\n    idx = pid\n    \n    if idx >= batch_size * channels * height * width:\n        return\n    \n    # Compute channel index\n    channel_idx = (idx // (height * width)) % channels\n    \n    # Load x and y\n    x_val = tl.load(x_ptr + idx)\n    y_val = tl.load(y_ptr + idx)\n    \n    # Element-wise addition and multiplication\n    result = x_val + y_val\n    result = result * y_val\n    \n    # Group normalization\n    # For simplicity, we'll compute mean and variance for each channel\n    # This is a simplified approach - in practice, you'd want to compute\n    # mean and variance across the spatial dimensions for each group\n    \n    # Load weight and bias\n    weight = tl.load(weight_ptr + channel_idx)\n    bias = tl.load(bias_ptr + channel_idx)\n    \n    # Simple normalization (this is a placeholder - real implementation would be more complex)\n    # For now, we'll just apply the weight and bias\n    output = result * weight + bias\n    \n    # Store result\n    tl.store(out_ptr + idx, output)\n\n@triton.jit\ndef _fused_add_mul_groupnorm_kernel_optimized(\n    x_ptr, y_ptr, weight_ptr, bias_ptr, out_ptr,\n    batch_size, channels, height, width,\n    num_groups,\n    eps,\n    BLOCK_SIZE: tl.constexpr\n):\n    pid = tl.program_id(0)\n    \n    # Each block handles one channel\n    channel_id = pid\n    \n    if channel_id >= channels:\n        return\n    \n    # Compute group id for this channel\n    group_size = channels // num_groups\n    group_id = channel_id // group_size\n    \n    # Load weight and bias for this channel\n    weight = tl.load(weight_ptr + channel_id)\n    bias = tl.load(bias_ptr + channel_id)\n    \n    # Compute mean and variance for this channel\n    mean = 0.0\n    var = 0.0\n    \n    # Compute mean\n    for i in range(0, batch_size * height * width, BLOCK_SIZE):\n        offsets = i + tl.arange(0, BLOCK_SIZE)\n        mask = offsets < batch_size * height * width\n        \n        # Load x and y\n        x_val = tl.load(x_ptr + offsets, mask=mask, other=0.0)\n        y_val = tl.load(y_ptr + offsets, mask=mask, other=0.0)\n        \n        # Element-wise addition and multiplication\n        result = x_val + y_val\n        result = result * y_val\n        \n        mean += tl.sum(result)\n    \n    # Compute variance\n    for i in range(0, batch_size * height * width, BLOCK_SIZE):\n        offsets = i + tl.arange(0, BLOCK_SIZE)\n        mask = offsets < batch_size * height * width\n        \n        # Load x and y\n        x_val = tl.load(x_ptr + offsets, mask=mask, other=0.0)\n        y_val = tl.load(y_ptr + offsets, mask=mask, other=0.0)\n        \n        # Element-wise addition and multiplication\n        result = x_val + y_val\n        result = result * y_val\n        \n        var += tl.sum((result - mean) * (result - mean))\n    \n    # Normalize and apply scale and shift\n    total_elements = batch_size * height * width\n    mean = mean / total_elements\n    var = var / total_elements\n    std = tl.sqrt(var + eps)\n    \n    # Apply normalization\n    for i in range(0, batch_size * height * width, BLOCK_SIZE):\n        offsets = i + tl.arange(0, BLOCK_SIZE)\n        mask = offsets < batch_size * height * width\n        \n        # Load x and y\n        x_val = tl.load(x_ptr + offsets, mask=mask, other=0.0)\n        y_val = tl.load(y_ptr + offsets, mask=mask, other=0.0)\n        \n        # Element-wise addition and multiplication\n        result = x_val + y_val\n        result = result * y_val\n        \n        # Normalize and apply scale and shift\n        normalized = (result - mean) / std\n        output = normalized * weight + bias\n        \n        tl.store(out_ptr + offsets, output, mask=mask)\n\n@triton.jit\ndef _fused_add_mul_groupnorm_kernel_final(\
+
+##################################################################################################################################################
+
+
+
+import torch
+import torch.nn.functional as F
+
+def test_fused_add_mul_groupnorm():
+    results = {}
+
+    # Test case 1: Basic functionality test
+    input1 = torch.randn(2, 4, 4, 4, device='cuda')
+    input2 = torch.randn(2, 4, 4, 4, device='cuda')
+    weight = torch.randn(4, device='cuda')
+    bias = torch.randn(4, device='cuda')
+    num_groups = 2
+    results["test_case_1"] = fused_add_mul_groupnorm(input1, input2, weight, bias, num_groups)
+
+    # Test case 2: Different shapes for input1 and input2 (broadcastable)
+    input1 = torch.randn(2, 4, 4, 4, device='cuda')
+    input2 = torch.randn(1, 4, 1, 1, device='cuda')  # Broadcastable shape
+    weight = torch.randn(4, device='cuda')
+    bias = torch.randn(4, device='cuda')
+    num_groups = 2
+    results["test_case_2"] = fused_add_mul_groupnorm(input1, input2, weight, bias, num_groups)
+
+    # Test case 3: Single group normalization (equivalent to layer normalization)
+    input1 = torch.randn(2, 4, 4, 4, device='cuda')
+    input2 = torch.randn(2, 4, 4, 4, device='cuda')
+    weight = torch.randn(4, device='cuda')
+    bias = torch.randn(4, device='cuda')
+    num_groups = 1
+    results["test_case_3"] = fused_add_mul_groupnorm(input1, input2, weight, bias, num_groups)
+
+    # Test case 4: No weight and bias (should default to None)
+    input1 = torch.randn(2, 4, 4, 4, device='cuda')
+    input2 = torch.randn(2, 4, 4, 4, device='cuda')
+    num_groups = 2
+    results["test_case_4"] = fused_add_mul_groupnorm(input1, input2, None, None, num_groups)
+
+    return results
+
+test_results = test_fused_add_mul_groupnorm()

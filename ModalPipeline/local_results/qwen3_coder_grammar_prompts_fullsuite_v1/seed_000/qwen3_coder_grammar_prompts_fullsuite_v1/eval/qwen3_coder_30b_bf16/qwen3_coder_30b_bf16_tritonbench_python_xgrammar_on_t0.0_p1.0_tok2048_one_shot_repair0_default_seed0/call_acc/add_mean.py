@@ -1,0 +1,62 @@
+import torch
+import triton
+import triton.language as tl
+
+def add_mean(input, other, dim=None, alpha=1, keepdim=False, dtype=None, out=None):
+    if dtype is not None:
+        input = input.to(dtype)
+        other = other.to(dtype)
+    
+    # Handle scalar other
+    if not isinstance(other, torch.Tensor):
+        other = torch.tensor(other, dtype=input.dtype, device=input.device)
+    
+    # Broadcast tensors
+    input, other = torch.broadcast_tensors(input, other)
+    
+    # Compute input + alpha * other
+    result = input + alpha * other
+    
+    # Compute mean
+    if dim is None:
+        # Reduce all dimensions
+        output = torch.mean(result)
+    else:
+        output = torch.mean(result, dim=dim, keepdim=keepdim)
+    
+    if out is not None:
+        out.copy_(output)
+        return out
+    return output
+##################################################################################################################################################
+
+
+
+import torch
+
+def test_add_mean():
+    results = {}
+
+    # Test case 1: Basic addition and mean with default alpha
+    input1 = torch.tensor([1.0, 2.0, 3.0], device='cuda')
+    other1 = torch.tensor([0.5, 0.5, 0.5], device='cuda')
+    results["test_case_1"] = add_mean(input1, other1)
+
+    # Test case 2: Addition with scalar other and non-default alpha
+    input2 = torch.tensor([1.0, 2.0, 3.0], device='cuda')
+    other2 = 0.5
+    results["test_case_2"] = add_mean(input2, other2, alpha=2)
+
+    # Test case 3: Addition with mean along a specific dimension
+    input3 = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device='cuda')
+    other3 = torch.tensor([[0.5, 0.5], [0.5, 0.5]], device='cuda')
+    results["test_case_3"] = add_mean(input3, other3, dim=0)
+
+    # Test case 4: Addition with mean and keepdim=True
+    input4 = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device='cuda')
+    other4 = torch.tensor([[0.5, 0.5], [0.5, 0.5]], device='cuda')
+    results["test_case_4"] = add_mean(input4, other4, dim=1, keepdim=True)
+
+    return results
+
+test_results = test_add_mean()

@@ -1,0 +1,87 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def broadcast_kernel(
+    input_ptr, 
+    output_ptr, 
+    input_size, 
+    output_size, 
+    stride_in, 
+    stride_out,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offset = pid * BLOCK_SIZE
+    indices = offset + tl.arange(0, BLOCK_SIZE)
+    
+    mask = indices < output_size
+    input_indices = indices % input_size
+    input_val = tl.load(input_ptr + input_indices * stride_in, mask=mask)
+    tl.store(output_ptr + indices * stride_out, input_val, mask=mask)
+
+def broadcast_tensors(*tensors):
+    if len(tensors) == 0:
+        return []
+    
+    # Get the maximum shape after broadcasting
+    shapes = [t.shape for t in tensors]
+    max_ndim = max(len(shape) for shape in shapes)
+    
+    # Pad shapes to have same number of dimensions
+    padded_shapes = []
+    for shape in shapes:
+        padded_shape = [1] * (max_ndim - len(shape)) + list(shape)
+        padded_shapes.append(padded_shape)
+    
+    # Compute broadcasted shape
+    broadcasted_shape = []
+    for dim in range(max_ndim):
+        dim_sizes = [padded_shapes[i][dim] for i in range(len(padded_shapes))]
+        max_size = max(dim_sizes)
+        # Check if broadcasting is valid
+        for size in dim_sizes:
+            if size != 1 and size != max_size:
+                raise ValueError("Cannot broadcast tensors")
+        broadcasted_shape.append(max_size)
+    
+    # Create output tensors with broadcasted shape
+    output_tensors = []
+    for i, tensor in enumerate(tensors):
+        # Create output tensor with broadcasted shape
+        output_tensor = torch.empty(broadcasted_shape, dtype=tensor.dtype, device=tensor.device)
+        output_tensors.append(output_tensor)
+    
+    # Launch kernels for each tensor
+    for i, (tensor, output_tensor) in enumerate(zip(tensors, output_tensors)):
+        if tensor.numel() == 0:
+            continue
+            
+        # Compute strides for input and output
+        input_strides = list(tensor.stride())
+        output_strides = list(output_tensor.stride())
+        
+        # Pad strides to match max_ndim
+        input_strides = [1] * (max_ndim - len(input_strides)) + input_strides
+        output_strides = [1] * (max_ndim - len(output_strides)) + output_strides
+        
+        # Compute total elements
+        total_elements = output_tensor.numel()
+        
+        # Launch kernel
+        if total_elements > 0:
+            grid_size = triton.cdiv(total_elements, 1024)
+            broadcast_kernel[grid_size](
+                tensor.data_ptr(),
+                output_tensor.data_ptr(),
+                tensor.numel(),
+                total_elements,
+                input_strides[-1],
+                output_strides[-1],
+                BLOCK_SIZE=1024
+            )
+    
+    return output_tensors
+```

@@ -1,0 +1,4 @@
+{
+  "instruction": "Implement a Triton-based solution for solving a triangular system Ax = b and then adding a scaled vector alpha * y to the solution x. The function should handle triangular matrices and support broadcasting for the vector y.",
+  "predict": "import torch\nimport triton\nimport triton.language as tl\n\ndef solve_and_add_scaled_vector(A: torch.Tensor, b: torch.Tensor, y: torch.Tensor, alpha: float) -> torch.Tensor:\n    # Check if A is upper triangular\n    if not torch.triu(A).equal(A):\n        raise ValueError(\"Matrix A must be upper triangular\")\n    \n    # Solve triangular system Ax = b\n    x = torch.linalg.solve_triangular(A, b, upper=True)\n    \n    # Add scaled vector alpha * y to solution x\n    result = x + alpha * y\n    \n    return result"
+}

@@ -1,0 +1,104 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_hardsigmoid_batch_norm_kernel(
+    x_ptr, 
+    running_mean_ptr, 
+    running_var_ptr, 
+    weight_ptr, 
+    bias_ptr,
+    output_ptr,
+    N,
+    C,
+    training,
+    momentum,
+    eps,
+    inplace,
+    BLOCK_SIZE: tl.constexpr
+):
+    # Get the row index
+    row_idx = tl.program_id(0)
+    
+    # Load running mean and variance for this channel
+    mean = tl.load(running_mean_ptr + row_idx * BLOCK_SIZE)
+    var = tl.load(running_var_ptr + row_idx * BLOCK_SIZE)
+    
+    # Load input data for this row
+    x_row = tl.load(x_ptr + row_idx * N + tl.arange(0, BLOCK_SIZE))
+    
+    # Normalize
+    x_norm = (x_row - mean) / tl.sqrt(var + eps)
+    
+    # Apply weight and bias if provided
+    if weight_ptr is not None and bias_ptr is not None:
+        weight = tl.load(weight_ptr + row_idx * BLOCK_SIZE)
+        bias = tl.load(bias_ptr + row_idx * BLOCK_SIZE)
+        x_norm = x_norm * weight + bias
+    
+    # Apply Hardsigmoid
+    hardsigmoid = tl.where(x_norm >= 3.0, 1.0, tl.where(x_norm <= -3.0, 0.0, (x_norm + 3.0) / 6.0))
+    
+    # Update running statistics if training
+    if training:
+        # Compute new mean and variance
+        new_mean = (1 - momentum) * mean + momentum * tl.sum(x_row) / N
+        new_var = (1 - momentum) * var + momentum * tl.sum((x_row - mean) ** 2) / N
+        
+        # Store updated statistics
+        tl.store(running_mean_ptr + row_idx * BLOCK_SIZE, new_mean)
+        tl.store(running_var_ptr + row_idx * BLOCK_SIZE, new_var)
+    
+    # Store output
+    if inplace:
+        tl.store(x_ptr + row_idx * N + tl.arange(0, BLOCK_SIZE), hardsigmoid)
+    else:
+        tl.store(output_ptr + row_idx * N + tl.arange(0, BLOCK_SIZE), hardsigmoid)
+
+def fused_hardsigmoid_batch_norm(
+    x: torch.Tensor,
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    weight: torch.Tensor = None,
+    bias: torch.Tensor = None,
+    training: bool = False,
+    momentum: float = 0.1,
+    eps: float = 1e-5,
+    inplace: bool = False
+) -> torch.Tensor:
+    # Ensure input is contiguous
+    x = x.contiguous()
+    
+    # Get dimensions
+    N, C = x.shape[0], x.shape[1]
+    
+    # Create output tensor if not inplace
+    if not inplace:
+        output = torch.empty_like(x)
+    else:
+        output = x
+    
+    # Launch kernel
+    grid = (C,)
+    BLOCK_SIZE = 1024
+    
+    fused_hardsigmoid_batch_norm_kernel[grid](
+        x_ptr=x.data_ptr(),
+        running_mean_ptr=running_mean.data_ptr(),
+        running_var_ptr=running_var.data_ptr(),
+        weight_ptr=weight.data_ptr() if weight is not None else None,
+        bias_ptr=bias.data_ptr() if bias is not None else None,
+        output_ptr=output.data_ptr(),
+        N=N,
+        C=C,
+        training=training,
+        momentum=momentum,
+        eps=eps,
+        inplace=inplace,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return output
+```

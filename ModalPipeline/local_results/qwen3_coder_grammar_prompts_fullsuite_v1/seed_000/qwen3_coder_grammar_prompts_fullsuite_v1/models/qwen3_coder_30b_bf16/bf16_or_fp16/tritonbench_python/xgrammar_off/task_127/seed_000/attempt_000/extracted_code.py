@@ -1,0 +1,90 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _det_kernel(A_ptr, out_ptr, n, batch_size, stride_a_batch, stride_a_row, stride_a_col, stride_out_batch, BLOCK_SIZE: tl.constexpr):
+    batch_idx = tl.program_id(0)
+    if batch_idx >= batch_size:
+        return
+    
+    # Load matrix A for this batch
+    A = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
+    for i in range(BLOCK_SIZE):
+        for j in range(BLOCK_SIZE):
+            a_idx = batch_idx * stride_a_batch + i * stride_a_row + j * stride_a_col
+            A[i, j] = tl.load(A_ptr + a_idx)
+    
+    # Compute determinant using LU decomposition
+    det = 1.0
+    for k in range(BLOCK_SIZE):
+        # Find pivot
+        pivot_idx = k
+        pivot_val = tl.abs(A[k, k])
+        for i in range(k + 1, BLOCK_SIZE):
+            abs_val = tl.abs(A[i, k])
+            if abs_val > pivot_val:
+                pivot_val = abs_val
+                pivot_idx = i
+        
+        # Swap rows if needed
+        if pivot_idx != k:
+            for j in range(BLOCK_SIZE):
+                A[k, j], A[pivot_idx, j] = A[pivot_idx, j], A[k, j]
+            det = -det
+        
+        # Check for zero pivot
+        if tl.abs(A[k, k]) < 1e-12:
+            det = 0.0
+            break
+        
+        det *= A[k, k]
+        
+        # Eliminate column
+        for i in range(k + 1, BLOCK_SIZE):
+            factor = A[i, k] / A[k, k]
+            for j in range(k + 1, BLOCK_SIZE):
+                A[i, j] -= factor * A[k, j]
+    
+    # Store result
+    out_idx = batch_idx * stride_out_batch
+    tl.store(out_ptr + out_idx, det)
+
+def linalg_det(A, *, out=None):
+    if A.dim() < 2:
+        raise ValueError("Input tensor must have at least 2 dimensions")
+    
+    *batch_dims, n, m = A.shape
+    if n != m:
+        raise ValueError("Input tensor must be square")
+    
+    batch_size = 1
+    for dim in batch_dims:
+        batch_size *= dim
+    
+    if out is None:
+        out = torch.empty(batch_dims, dtype=A.dtype, device=A.device)
+    
+    if batch_size == 0:
+        return out
+    
+    # Determine block size based on matrix size
+    BLOCK_SIZE = min(32, n)
+    
+    # Create grid
+    grid = (batch_size, 1, 1)
+    
+    # Launch kernel
+    _det_kernel[grid](
+        A,
+        out,
+        n,
+        batch_size,
+        A.stride(0) if len(A.shape) > 2 else 0,
+        A.stride(-2) if len(A.shape) > 2 else 0,
+        A.stride(-1) if len(A.shape) > 2 else 0,
+        out.stride(0) if len(out.shape) > 0 else 0,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return out

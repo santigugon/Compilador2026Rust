@@ -1,0 +1,103 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _qr_decomposition_kernel(A, R, Q, n, num_blocks, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    block_size = BLOCK_SIZE
+    num_blocks = num_blocks
+    
+    # Initialize R and Q
+    for i in range(block_size):
+        for j in range(block_size):
+            if i <= j:
+                R[i, j] = A[i, j]
+            else:
+                R[i, j] = 0.0
+                Q[i, j] = 0.0
+    
+    # Set diagonal of Q to 1
+    for i in range(block_size):
+        Q[i, i] = 1.0
+    
+    # QR decomposition using Givens rotations
+    for k in range(block_size):
+        # Compute norm of column k
+        norm = 0.0
+        for i in range(k, block_size):
+            norm += R[i, k] * R[i, k]
+        norm = tl.sqrt(norm)
+        
+        # Skip if norm is zero
+        if norm == 0.0:
+            continue
+            
+        # Compute cosine and sine
+        c = R[k, k] / norm
+        s = -R[k + 1, k] / norm
+        
+        # Apply Givens rotation to R
+        for j in range(k, block_size):
+            temp1 = R[k, j]
+            temp2 = R[k + 1, j]
+            R[k, j] = c * temp1 - s * temp2
+            R[k + 1, j] = s * temp1 + c * temp2
+            
+        # Apply Givens rotation to Q
+        for i in range(block_size):
+            temp1 = Q[i, k]
+            temp2 = Q[i, k + 1]
+            Q[i, k] = c * temp1 - s * temp2
+            Q[i, k + 1] = s * temp1 + c * temp2
+
+@triton.jit
+def _determinant_kernel(R, det, n, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    block_size = BLOCK_SIZE
+    
+    # Compute determinant as product of diagonal elements
+    det_val = 1.0
+    for i in range(block_size):
+        det_val *= R[i, i]
+    
+    # Store result
+    det[0] = det_val
+
+def determinant_via_qr(A, *, mode='reduced', out=None):
+    if mode != 'reduced':
+        raise ValueError("Only 'reduced' mode is supported")
+    
+    if A.dim() != 2 or A.size(0) != A.size(1):
+        raise ValueError("Input must be a square matrix")
+    
+    n = A.size(0)
+    if n == 0:
+        raise ValueError("Input matrix must have non-zero dimensions")
+    
+    # Allocate output tensor
+    if out is None:
+        out = torch.empty(1, dtype=torch.float64, device=A.device)
+    else:
+        if out.numel() != 1:
+            raise ValueError("Output tensor must have exactly one element")
+    
+    # Prepare tensors for Triton kernel
+    A = A.contiguous()
+    R = torch.empty_like(A, dtype=torch.float64)
+    Q = torch.empty_like(A, dtype=torch.float64)
+    
+    # Launch kernel
+    BLOCK_SIZE = 32
+    num_blocks = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
+    
+    # Create a grid of blocks
+    grid = (num_blocks, 1, 1)
+    
+    # Launch QR decomposition kernel
+    _qr_decomposition_kernel[grid](A, R, Q, n, num_blocks, BLOCK_SIZE=BLOCK_SIZE)
+    
+    # Launch determinant kernel
+    _determinant_kernel[1, 1, 1](R, out, n, BLOCK_SIZE=BLOCK_SIZE)
+    
+    return out[0]

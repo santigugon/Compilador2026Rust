@@ -1,0 +1,125 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def conv2d_kernel(
+    input_ptr, weight_ptr, bias_ptr, output_ptr,
+    batch_size, in_channels, out_channels, iH, iW, oH, oW,
+    kH, kW, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w,
+    groups, in_channels_per_group, out_channels_per_group,
+    input_batch_stride, input_channel_stride, input_h_stride, input_w_stride,
+    weight_batch_stride, weight_channel_stride, weight_h_stride, weight_w_stride,
+    bias_batch_stride, output_batch_stride, output_channel_stride, output_h_stride, output_w_stride,
+    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
+):
+    pid = tl.program_id(axis=0)
+    num_pid_n = tl.cdiv(oW, BLOCK_SIZE_N)
+    num_pid_m = tl.cdiv(oH, BLOCK_SIZE_M)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    
+    output_m = tl.minimum(offs_m, oH - 1)
+    output_n = tl.minimum(offs_n, oW - 1)
+    
+    for g in range(groups):
+        input_offset = g * in_channels_per_group * iH * iW
+        weight_offset = g * out_channels_per_group * in_channels_per_group * kH * kW
+        output_offset = g * out_channels_per_group * oH * oW
+        
+        for oc in range(out_channels_per_group):
+            output_channel_offset = output_offset + oc * oH * oW
+            bias_val = 0.0
+            if bias_ptr is not None:
+                bias_val = tl.load(bias_ptr + g * out_channels_per_group + oc)
+            
+            for ih in range(0, iH, stride_h):
+                for iw in range(0, iW, stride_w):
+                    acc = 0.0
+                    for kh in range(kH):
+                        for kw in range(kW):
+                            ih_k = ih + kh * dilation_h
+                            iw_k = iw + kw * dilation_w
+                            if ih_k >= pad_h and ih_k < iH + pad_h and iw_k >= pad_w and iw_k < iW + pad_w:
+                                ih_k -= pad_h
+                                iw_k -= pad_w
+                                if ih_k >= 0 and ih_k < iH and iw_k >= 0 and iw_k < iW:
+                                    input_val = tl.load(input_ptr + input_offset + 
+                                                       (ih_k * iW + iw_k) * input_w_stride)
+                                    weight_val = tl.load(weight_ptr + weight_offset + 
+                                                        (oc * in_channels_per_group + 0) * (kH * kW) + 
+                                                        (kh * kW + kw))
+                                    acc += input_val * weight_val
+                    output_idx = output_channel_offset + (ih // stride_h) * oW + (iw // stride_w)
+                    tl.store(output_ptr + output_idx, acc + bias_val)
+
+def conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+    if isinstance(stride, int):
+        stride = (stride, stride)
+    if isinstance(padding, int):
+        padding = (padding, padding)
+    if isinstance(dilation, int):
+        dilation = (dilation, dilation)
+    
+    batch_size, in_channels, iH, iW = input.shape
+    out_channels, _, kH, kW = weight.shape
+    
+    pad_h, pad_w = padding
+    stride_h, stride_w = stride
+    dilation_h, dilation_w = dilation
+    
+    out_h = (iH + 2 * pad_h - (dilation_h * (kH - 1) + 1)) // stride_h + 1
+    out_w = (iW + 2 * pad_w - (dilation_w * (kW - 1) + 1)) // stride_w + 1
+    
+    output = torch.empty((batch_size, out_channels, out_h, out_w), device=input.device, dtype=input.dtype)
+    
+    in_channels_per_group = in_channels // groups
+    out_channels_per_group = out_channels // groups
+    
+    BLOCK_SIZE_M = 16
+    BLOCK_SIZE_N = 16
+    BLOCK_SIZE_K = 32
+    
+    num_warps = 4
+    
+    grid = (triton.cdiv(out_h, BLOCK_SIZE_M) * triton.cdiv(out_w, BLOCK_SIZE_N),)
+    
+    input_ptr = input.data_ptr()
+    weight_ptr = weight.data_ptr()
+    bias_ptr = bias.data_ptr() if bias is not None else None
+    output_ptr = output.data_ptr()
+    
+    input_batch_stride = in_channels * iH * iW
+    input_channel_stride = iH * iW
+    input_h_stride = iW
+    input_w_stride = 1
+    
+    weight_batch_stride = out_channels_per_group * in_channels_per_group * kH * kW
+    weight_channel_stride = in_channels_per_group * kH * kW
+    weight_h_stride = kW
+    weight_w_stride = 1
+    
+    bias_batch_stride = out_channels_per_group
+    
+    output_batch_stride = out_channels * out_h * out_w
+    output_channel_stride = out_h * out_w
+    output_h_stride = out_w
+    output_w_stride = 1
+    
+    conv2d_kernel[grid](
+        input_ptr, weight_ptr, bias_ptr, output_ptr,
+        batch_size, in_channels, out_channels, iH, iW, out_h, out_w,
+        kH, kW, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w,
+        groups, in_channels_per_group, out_channels_per_group,
+        input_batch_stride, input_channel_stride, input_h_stride, input_w_stride,
+        weight_batch_stride, weight_channel_stride, weight_h_stride, weight_w_stride,
+        bias_batch_stride, output_batch_stride, output_channel_stride, output_h_stride, output_w_stride,
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
+        num_warps=num_warps
+    )
+    
+    return output

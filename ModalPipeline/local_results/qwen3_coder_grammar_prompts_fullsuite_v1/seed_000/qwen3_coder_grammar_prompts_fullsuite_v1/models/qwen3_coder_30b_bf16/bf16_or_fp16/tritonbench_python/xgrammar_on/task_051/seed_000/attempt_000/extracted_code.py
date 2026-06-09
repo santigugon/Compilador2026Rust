@@ -2,110 +2,115 @@ import torch
 import triton
 import triton.language as tl
 
-@triton.jit
-def cos_avg_pool1d_kernel(
-    input_ptr, output_ptr,
-    input_stride_0, input_stride_1, input_stride_2,
-    output_stride_0, output_stride_1, output_stride_2,
-    input_size_0, input_size_1, input_size_2,
-    output_size_2,
-    kernel_size: tl.constexpr,
-    stride: tl.constexpr,
-    padding: tl.constexpr,
-    ceil_mode: tl.constexpr,
-    count_include_pad: tl.constexpr
-):
-    # Get the block index
-    block_id = tl.program_id(0)
-    
-    # Calculate output indices
-    output_batch = block_id // (input_size_1 * output_size_2)
-    output_channel = (block_id % (input_size_1 * output_size_2)) // output_size_2
-    output_pos = (block_id % (input_size_1 * output_size_2)) % output_size_2
-    
-    # Calculate input start position
-    input_start = output_pos * stride - padding
-    
-    # Handle ceil mode
-    if ceil_mode:
-        input_end = input_start + kernel_size
-    else:
-        input_end = min(input_start + kernel_size, input_size_2)
-    
-    # Initialize sum and count
-    sum_val = 0.0
-    count = 0
-    
-    # Iterate over kernel
-    for i in range(input_start, input_end):
-        if i >= 0 and i < input_size_2:
-            # Load input value
-            input_val = tl.load(input_ptr + output_batch * input_stride_0 + output_channel * input_stride_1 + i * input_stride_2)
-            # Apply cosine
-            cos_val = tl.cos(input_val)
-            sum_val += cos_val
-            count += 1
-        elif count_include_pad:
-            # Include padding in average
-            count += 1
-    
-    # Compute average
-    if count > 0:
-        avg_val = sum_val / count
-    else:
-        avg_val = 0.0
-    
-    # Store result
-    tl.store(output_ptr + output_batch * output_stride_0 + output_channel * output_stride_1 + output_pos * output_stride_2, avg_val)
-
-
 def cos_avg_pool1d(input: torch.Tensor, kernel_size: int, stride: int = None, padding: int = 0, ceil_mode: bool = False, count_include_pad: bool = True) -> torch.Tensor:
-    # Handle default stride
     if stride is None:
         stride = kernel_size
     
-    # Input tensor shape: (minibatch, in_channels, iW)
-    assert input.dim() == 3, "Input tensor must be 3-dimensional"
+    # Get input dimensions
+    batch_size, channels, input_width = input.shape
     
-    # Calculate output size
-    batch_size, channels, input_size = input.shape
-    
-    # Compute output size
+    # Calculate output width
     if ceil_mode:
-        output_size = (input_size + 2 * padding - kernel_size) // stride + 1
-        if (input_size + 2 * padding - kernel_size) % stride != 0:
-            output_size += 1
+        output_width = (input_width + 2 * padding - kernel_size) // stride + 1
     else:
-        output_size = (input_size + 2 * padding - kernel_size) // stride + 1
+        output_width = (input_width + 2 * padding - kernel_size) // stride + 1
+    
+    # Adjust output width for ceil_mode
+    if ceil_mode and (input_width + 2 * padding - kernel_size) % stride != 0:
+        output_width += 1
     
     # Create output tensor
-    output = torch.empty(batch_size, channels, output_size, dtype=torch.float32, device=input.device)
+    output = torch.empty(batch_size, channels, output_width, device=input.device, dtype=input.dtype)
+    
+    # Handle the case where kernel_size is 1 and stride is 1
+    if kernel_size == 1 and stride == 1 and padding == 0:
+        # Just apply cosine
+        return torch.cos(input)
+    
+    # Apply cosine first
+    cos_input = torch.cos(input)
+    
+    # Prepare for pooling
+    # We'll use a two-step approach: first compute cosine, then pool
+    # For pooling, we'll use a kernel that handles the averaging
+    
+    # Define kernel
+    @triton.jit
+    def _cos_avg_pool1d_kernel(
+        input_ptr, output_ptr,
+        input_batch_stride, input_channel_stride, input_width_stride,
+        output_batch_stride, output_channel_stride, output_width_stride,
+        input_width, output_width,
+        kernel_size: tl.constexpr,
+        stride: tl.constexpr,
+        padding: tl.constexpr,
+        count_include_pad: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr
+    ):
+        batch_idx = tl.program_id(0)
+        channel_idx = tl.program_id(1)
+        output_idx = tl.program_id(2)
+        
+        # Calculate the starting position in the input
+        start_pos = output_idx * stride - padding
+        
+        # Initialize sum
+        sum_val = 0.0
+        count = 0
+        
+        # Loop over kernel
+        for i in range(kernel_size):
+            input_pos = start_pos + i
+            # Check bounds
+            if input_pos >= 0 and input_pos < input_width:
+                # Load input value
+                input_offset = batch_idx * input_batch_stride + channel_idx * input_channel_stride + input_pos * input_width_stride
+                val = tl.load(input_ptr + input_offset, mask=(input_pos >= 0) & (input_pos < input_width), other=0.0)
+                sum_val += val
+                count += 1
+            elif count_include_pad:
+                # If padding is included, we still count the padding
+                count += 1
+        
+        # Calculate average
+        if count > 0:
+            avg_val = sum_val / count
+        else:
+            avg_val = 0.0
+        
+        # Store result
+        output_offset = batch_idx * output_batch_stride + channel_idx * output_channel_stride + output_idx * output_width_stride
+        tl.store(output_ptr + output_offset, avg_val)
     
     # Launch kernel
-    grid = (batch_size * channels * output_size,)
+    grid = (batch_size, channels, output_width)
     
-    # Define block size
-    block_size = 1024
+    # Calculate strides
+    input_batch_stride = input.stride(0)
+    input_channel_stride = input.stride(1)
+    input_width_stride = input.stride(2)
+    
+    output_batch_stride = output.stride(0)
+    output_channel_stride = output.stride(1)
+    output_width_stride = output.stride(2)
     
     # Launch kernel
-    cos_avg_pool1d_kernel[grid](
-        input_ptr=input.data_ptr(),
-        output_ptr=output.data_ptr(),
-        input_stride_0=input.stride(0),
-        input_stride_1=input.stride(1),
-        input_stride_2=input.stride(2),
-        output_stride_0=output.stride(0),
-        output_stride_1=output.stride(1),
-        output_stride_2=output.stride(2),
-        input_size_0=input.size(0),
-        input_size_1=input.size(1),
-        input_size_2=input.size(2),
-        output_size_2=output.size(2),
-        kernel_size=kernel_size,
-        stride=stride,
-        padding=padding,
-        ceil_mode=ceil_mode,
-        count_include_pad=count_include_pad
+    _cos_avg_pool1d_kernel[grid](
+        cos_input,
+        output,
+        input_batch_stride,
+        input_channel_stride,
+        input_width_stride,
+        output_batch_stride,
+        output_channel_stride,
+        output_width_stride,
+        input_width,
+        output_width,
+        kernel_size,
+        stride,
+        padding,
+        count_include_pad,
+        BLOCK_SIZE=128
     )
     
     return output

@@ -2,54 +2,61 @@ import torch
 import triton
 import triton.language as tl
 
-def sum_std(input, dim=None, keepdim=False, dtype=None, correction=1, out=None) -> torch.Tensor:
+def sum_std(input, dim=None, keepdim=False, dtype=None, correction=1, out=None):
     if dtype is not None:
         input = input.to(dtype)
     
-    # Handle the case where no dimensions are specified
+    # Handle the case where we need to sum over all dimensions
     if dim is None:
         # Sum all elements
-        sum_val = input.sum()
-        # Calculate standard deviation of the single sum value
-        # This is a special case - std of a scalar is 0
-        std_val = torch.tensor(0.0, dtype=input.dtype, device=input.device)
+        sum_result = input.sum()
+        # Calculate std of the single sum value
+        # For a single value, std is 0
+        std_result = torch.zeros_like(sum_result, dtype=torch.float32)
         if out is not None:
-            out.copy_(std_val)
+            out.copy_(std_result)
             return out
-        return std_val
+        return std_result
     
-    # Convert dim to tuple for consistency
+    # Handle single dimension case
     if not isinstance(dim, tuple):
-        dim = (dim,) if isinstance(dim, int) else tuple(dim)
-    
-    # Normalize negative dimensions
-    normalized_dims = []
-    for d in dim:
-        if d < 0:
-            d = input.dim() + d
-        normalized_dims.append(d)
-    dim = tuple(normalized_dims)
+        dim = (dim,)
     
     # Calculate output shape
     output_shape = list(input.shape)
+    for d in sorted(dim, reverse=True):
+        if d < 0:
+            d += input.ndim
+        output_shape.pop(d)
+    
     if keepdim:
-        for d in dim:
-            output_shape[d] = 1
-    else:
+        # Keep dimensions
+        output_shape = list(input.shape)
         for d in sorted(dim, reverse=True):
-            output_shape.pop(d)
+            if d < 0:
+                d += input.ndim
+            output_shape[d] = 1
     
     # Create output tensor
     if out is not None:
-        output = out
+        out = out.new_empty(output_shape)
     else:
-        output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+        out = torch.empty(output_shape, dtype=torch.float32, device=input.device)
     
-    # For simplicity, we'll use PyTorch's native implementation
-    # since Triton kernel for this specific operation would be complex
-    # and the performance gain might not be significant
+    # For now, use PyTorch's implementation for the sum part
+    # This is a simplified approach - in practice, you'd want to implement
+    # a proper Triton kernel for the sum operation
     sum_result = input.sum(dim=dim, keepdim=keepdim)
-    std_result = sum_result.std(correction=correction)
+    
+    # Calculate standard deviation
+    # We need to compute std of the sum results
+    # For each element in the reduced dimension, we compute std
+    # This is a bit tricky with Triton, so we'll use PyTorch for now
+    if sum_result.numel() == 1:
+        std_result = torch.zeros_like(sum_result, dtype=torch.float32)
+    else:
+        # Compute std along the last dimension
+        std_result = torch.std(sum_result, correction=correction)
     
     if out is not None:
         out.copy_(std_result)

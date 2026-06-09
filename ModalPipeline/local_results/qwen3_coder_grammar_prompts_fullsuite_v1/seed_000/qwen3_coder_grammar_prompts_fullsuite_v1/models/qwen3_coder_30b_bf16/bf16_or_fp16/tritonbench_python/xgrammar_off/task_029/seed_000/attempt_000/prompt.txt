@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are an expert Triton programmer.\n\nGenerate ONLY a single valid Python module.\nNo explanations.\nNo prose.\nNo markdown outside the code block.\nNo tests.\nNo example calls.\n\nThe module must contain:\n- imports\n- Triton kernels\n- wrapper function\n\nThe wrapper function must exactly match the required signature.\n\nWrap the entire response in ONE ```python``` block.\n"
+  },
+  {
+    "role": "user",
+    "content": "You are an expert in Trion programming, capable of writing corresponding Triton kernels and wrapper functions based on functional descriptions and function parameters. Ensure that the wrapper function fully corresponds to the provided function information.\nFunctional Description: Fills the elements of the self tensor with a specified value by selecting the indices in the order given in the index tensor. The operation is performed along a specified dimension.\nWrapper Entry Information: index_fill_(dim, index, value) -> Tensor\n\nArgs:\n    dim (int): dimension along which to index\n    index (LongTensor): indices of :attr:`self` tensor to fill in\n    value (float): the value to fill with\n\nExample::\n    >>> x = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.float)\n    >>> index = torch.tensor([0, 2])\n    >>> x.index_fill_(1, index, -1)\n    tensor([[-1.,  2., -1.],\n            [-1.,  5., -1.],\n            [-1.,  8., -1.]])\nAfter generation, verify if the Triton wrapper aligns with the provided func_inputs. If not, regenerate."
+  }
+]

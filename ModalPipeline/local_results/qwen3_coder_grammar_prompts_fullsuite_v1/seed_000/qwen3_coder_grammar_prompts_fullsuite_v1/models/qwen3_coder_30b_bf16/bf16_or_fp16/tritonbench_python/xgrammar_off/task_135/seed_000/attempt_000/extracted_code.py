@@ -1,0 +1,74 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def mul_kernel(
+    input_ptr, other_ptr, output_ptr,
+    input_size, other_size, output_size,
+    dtype_input, dtype_other, dtype_output,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < output_size
+    
+    # Load input and other values
+    input_val = tl.load(input_ptr + offsets, mask=mask)
+    other_val = tl.load(other_ptr + offsets, mask=mask)
+    
+    # Perform multiplication
+    result = input_val * other_val
+    
+    # Store result
+    tl.store(output_ptr + offsets, result, mask=mask)
+
+def mul(input, other, *, out=None):
+    # Convert inputs to tensors if they aren't already
+    if not isinstance(input, torch.Tensor):
+        input = torch.tensor(input)
+    if not isinstance(other, torch.Tensor):
+        other = torch.tensor(other)
+    
+    # Determine output shape through broadcasting
+    output_shape = torch.broadcast_shapes(input.shape, other.shape)
+    
+    # Determine output dtype through type promotion
+    output_dtype = torch.result_type(input, other)
+    
+    # Create output tensor
+    if out is None:
+        out = torch.empty(output_shape, dtype=output_dtype, device=input.device)
+    else:
+        if out.shape != output_shape or out.dtype != output_dtype:
+            raise ValueError("Output tensor has incorrect shape or dtype")
+    
+    # Handle device placement
+    if input.device != other.device:
+        raise ValueError("Input tensors must be on the same device")
+    if input.device != out.device:
+        raise ValueError("Output tensor must be on the same device as input tensors")
+    
+    # Prepare for kernel launch
+    input_size = input.numel()
+    other_size = other.numel()
+    output_size = out.numel()
+    
+    # Ensure tensors are contiguous
+    input = input.contiguous()
+    other = other.contiguous()
+    out = out.contiguous()
+    
+    # Launch kernel
+    if output_size > 0:
+        BLOCK_SIZE = 1024
+        grid_size = (output_size + BLOCK_SIZE - 1) // BLOCK_SIZE
+        mul_kernel[grid_size](
+            input.data_ptr(), other.data_ptr(), out.data_ptr(),
+            input_size, other_size, output_size,
+            input.dtype, other.dtype, out.dtype,
+            BLOCK_SIZE
+        )
+    
+    return out

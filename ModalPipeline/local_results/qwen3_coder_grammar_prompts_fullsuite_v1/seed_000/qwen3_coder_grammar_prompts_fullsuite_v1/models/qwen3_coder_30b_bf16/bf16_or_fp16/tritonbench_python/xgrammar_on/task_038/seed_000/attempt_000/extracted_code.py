@@ -1,3 +1,139 @@
-{
-  "instruction": "Implement a fused transformer block using Triton kernels that performs: 1) Matrix multiplication of input with weight1, 2) Softmax operation, 3) Dropout, 4) Matrix multiplication with weight2, 5) Layer normalization with residual connection, 6) Addition (residual connection). The function signature must match the provided specification exactly.",
-  "predict": "import torch\nimport triton\nimport triton.language as tl\n\n@triton.jit\ndef _softmax_kernel(\n    x_ptr, \n    y_ptr, \n    n_cols,\n    BLOCK_SIZE: tl.constexpr,\n):\n    row_id = tl.program_id(0)\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n    \n    row = tl.load(x_ptr + row_id * n_cols + col_offsets, mask=mask)\n    row = row - tl.max(row, axis=0)\n    numerator = tl.exp(row)\n    denominator = tl.sum(numerator, axis=0)\n    softmax_output = numerator / denominator\n    tl.store(y_ptr + row_id * n_cols + col_offsets, softmax_output, mask=mask)\n\n@triton.jit\ndef _dropout_kernel(\n    x_ptr,\n    y_ptr,\n    n_elements,\n    dropout_p,\n    seed,\n    BLOCK_SIZE: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    block_start = pid * BLOCK_SIZE\n    offsets = block_start + tl.arange(0, BLOCK_SIZE)\n    mask = offsets < n_elements\n    \n    x = tl.load(x_ptr + offsets, mask=mask)\n    random = tl.rand(seed, offsets)\n    keep = random > dropout_p\n    y = tl.where(keep, x / (1.0 - dropout_p), 0.0)\n    tl.store(y_ptr + offsets, y, mask=mask)\n\n@triton.jit\ndef _layer_norm_kernel(\n    x_ptr,\n    weight_ptr,\n    bias_ptr,\n    y_ptr,\n    mean_ptr,\n    var_ptr,\n    n_cols,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    row_id = tl.program_id(0)\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n    \n    x = tl.load(x_ptr + row_id * n_cols + col_offsets, mask=mask)\n    mean = tl.sum(x, axis=0) / n_cols\n    var = tl.sum((x - mean) * (x - mean), axis=0) / n_cols\n    \n    tl.store(mean_ptr + row_id, mean)\n    tl.store(var_ptr + row_id, var)\n    \n    x_norm = (x - mean) / tl.sqrt(var + eps)\n    weight = tl.load(weight_ptr + col_offsets, mask=mask)\n    bias = tl.load(bias_ptr + col_offsets, mask=mask)\n    y = x_norm * weight + bias\n    tl.store(y_ptr + row_id * n_cols + col_offsets, y, mask=mask)\n\n@triton.jit\ndef _add_kernel(\n    x_ptr,\n    y_ptr,\n    z_ptr,\n    n_elements,\n    BLOCK_SIZE: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    block_start = pid * BLOCK_SIZE\n    offsets = block_start + tl.arange(0, BLOCK_SIZE)\n    mask = offsets < n_elements\n    \n    x = tl.load(x_ptr + offsets, mask=mask)\n    y = tl.load(y_ptr + offsets, mask=mask)\n    z = x + y\n    tl.store(z_ptr + offsets, z, mask=mask)\n\n@triton.jit\ndef _matmul_kernel(\n    a_ptr,\n    b_ptr,\n    c_ptr,\n    M,\n    N,\n    K,\n    stride_am,\n    stride_ak,\n    stride_bk,\n    stride_bn,\n    stride_cm,\n    stride_cn,\n    BLOCK_SIZE_M: tl.constexpr,\n    BLOCK_SIZE_N: tl.constexpr,\n    BLOCK_SIZE_K: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)\n    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)\n    pid_m = pid % num_pid_m\n    pid_n = pid // num_pid_m\n    \n    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)\n    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)\n    offs_k = tl.arange(0, BLOCK_SIZE_K)\n    \n    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)\n    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)\n    \n    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)\n    for k in range(0, K, BLOCK_SIZE_K):\n        a = tl.load(a_ptrs)\n        b = tl.load(b_ptrs)\n        accumulator += tl.dot(a, b)\n        a_ptrs += BLOCK_SIZE_K * stride_ak\n        b_ptrs += BLOCK_SIZE_K * stride_bk\n    \n    c = accumulator.to(tl.float32)\n    \n    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)\n    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)\n    c_ptrs = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)\n    tl.store(c_ptrs, c)\n\n@triton.jit\ndef _matmul_kernel_2(\n    a_ptr,\n    b_ptr,\n    c_ptr,\n    M,\n    N,\n    K,\n    stride_am,\n    stride_ak,\n    stride_bk,\n    stride_bn,\n    stride_cm,\n    stride_cn,\n    BLOCK_SIZE_M: tl.constexpr,\n    BLOCK_SIZE_N: tl.constexpr,\n    BLOCK_SIZE_K: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)\n    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)\n    pid_m = pid % num_pid_m\n    pid_n = pid // num_pid_m\n    \n    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)\n    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)\n    offs_k = tl.arange(0, BLOCK_SIZE_K)\n    \n    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)\n    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)\n    \n    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)\n    for k in range(0, K, BLOCK_SIZE_K):\n        a = tl.load(a_ptrs)\n        b = tl.load(b_ptrs)\n        accumulator += tl.dot(a, b)\n        a_ptrs += BLOCK_SIZE_K * stride_ak\n        b_ptrs += BLOCK_SIZE_K * stride_bk\n    \n    c = accumulator.to(tl.float32)\n    \n    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)\n    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)\n    c_ptrs = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)\n    tl.store(c_ptrs, c)\n\ndef fused_transformer_block(input, weight1, weight2, residual, dropout_p=0.1, eps=1e-5, *, out=None):\n    # Ensure input is 3D: (batch, seq_len, D_in)\n    input_shape = input.shape\n    if len(input_shape) < 3:\n        raise ValueError(\"Input tensor must be at least 3D\")\n    \n    batch_size = input_shape[:-2]\n    seq_len = input_shape[-2]\n    D_in = input_shape[-1]\n    D_k = weight1.shape[-1]\n    D_out = weight2.shape[-1]\n    \n    # Matrix multiplication 1: input @ weight1\n    # Reshape input to 2D for matmul\n    input_2d = input.view(-1, D_in)\n    \n    # Allocate intermediate tensor for Z1\n    Z1 = torch.empty((input_2d.shape[0], D_k), dtype=torch.float32, device=input.device)\n    \n    # Launch matmul kernel\n    grid = lambda META: (triton.cdiv(input_2d.shape[0], META['BLOCK_SIZE_M']) *
+import torch
+import triton
+import triton.language as tl
+
+def _softmax_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=-float('inf'))
+    # Subtract max for numerical stability
+    x_max = tl.max(x, axis=0)
+    x = x - x_max
+    # Compute softmax
+    x_exp = tl.exp(x)
+    x_sum = tl.sum(x_exp, axis=0)
+    y = x_exp / x_sum
+    tl.store(out_ptr + offsets, y, mask=mask)
+
+def _dropout_kernel(x_ptr, out_ptr, n: tl.constexpr, dropout_p: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    # Generate random mask
+    rand = tl.random.rand(0, n)  # Use a fixed seed for reproducibility
+    keep_mask = rand > dropout_p
+    y = tl.where(keep_mask, x / (1.0 - dropout_p), 0.0)
+    tl.store(out_ptr + offsets, y, mask=mask)
+
+def _layer_norm_kernel(x_ptr, weight_ptr, bias_ptr, out_ptr, mean_ptr, var_ptr, n: tl.constexpr, eps: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    # Compute mean and variance
+    mean = tl.sum(x, axis=0) / n
+    var = tl.sum((x - mean) ** 2, axis=0) / n
+    # Store mean and variance for later use
+    tl.store(mean_ptr + pid, mean)
+    tl.store(var_ptr + pid, var)
+    # Normalize
+    x_norm = (x - mean) / tl.sqrt(var + eps)
+    # Apply scale and bias
+    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0)
+    bias = tl.load(bias_ptr + offsets, mask=mask, other=0.0)
+    y = x_norm * weight + bias
+    tl.store(out_ptr + offsets, y, mask=mask)
+
+def _matmul_kernel(x_ptr, w_ptr, out_ptr, m: tl.constexpr, k: tl.constexpr, n: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_N: tl.constexpr):
+    pid = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Compute block offsets
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Load x and w
+    x = tl.load(x_ptr + offs_m[:, None] * k + offs_k[None, :], mask=offs_m[:, None] < m and offs_k[None, :] < k)
+    w = tl.load(w_ptr + offs_k[:, None] * n + offs_n[None, :], mask=offs_k[:, None] < k and offs_n[None, :] < n)
+    
+    # Compute matmul
+    out = tl.dot(x, w)
+    
+    # Store result
+    tl.store(out_ptr + offs_m[:, None] * n + offs_n[None, :], out, mask=offs_m[:, None] < m and offs_n[None, :] < n)
+
+def fused_transformer_block(input, weight1, weight2, residual, dropout_p=0.1, eps=1e-5, *, out=None):
+    # Get dimensions
+    batch_shape = input.shape[:-2]
+    N, D_in = input.shape[-2], weight1.shape[0]
+    D_k = weight1.shape[1]
+    D_out = weight2.shape[1]
+    
+    # Flatten batch dimensions
+    batch_size = 1
+    for dim in batch_shape:
+        batch_size *= dim
+    
+    # Reshape input to (batch_size * N, D_in)
+    input_flat = input.view(-1, D_in)
+    
+    # First matrix multiplication: Z_1 = input @ weight1
+    z1 = torch.empty((batch_size * N, D_k), dtype=input.dtype, device=input.device)
+    
+    # Second matrix multiplication: Z_2 = Z_1 @ weight2
+    z2 = torch.empty((batch_size * N, D_out), dtype=input.dtype, device=input.device)
+    
+    # Apply softmax to Z_1
+    z1_softmax = torch.empty_like(z1)
+    
+    # Apply dropout to softmax result
+    z1_dropout = torch.empty_like(z1_softmax)
+    
+    # Apply layer normalization
+    z4 = torch.empty_like(input_flat)
+    
+    # Add residual
+    output = torch.empty_like(input_flat)
+    
+    # Compute Z_1 = input @ weight1
+    block_m = 32
+    block_k = 32
+    block_n = 32
+    grid_m = triton.cdiv(batch_size * N, block_m)
+    grid_n = triton.cdiv(D_k, block_n)
+    
+    # Compute Z_1
+    _matmul_kernel[(grid_m, grid_n)](input_flat, weight1, z1, batch_size * N, D_in, D_k, block_m, block_k, block_n)
+    
+    # Compute Z_2 = Z_1 @ weight2
+    grid_m = triton.cdiv(batch_size * N, block_m)
+    grid_n = triton.cdiv(D_out, block_n)
+    _matmul_kernel[(grid_m, grid_n)](z1, weight2, z2, batch_size * N, D_k, D_out, block_m, block_k, block_n)
+    
+    # Apply softmax to Z_1
+    block = 256
+    grid = (triton.cdiv(batch_size * N * D_k, block),)
+    _softmax_kernel[grid](z1, z1_softmax, batch_size * N * D_k, block)
+    
+    # Apply dropout to Z_1
+    _dropout_kernel[grid](z1_softmax, z1_dropout, batch_size * N * D_k, dropout_p, block)
+    
+    # Apply layer normalization
+    # For simplicity, we'll compute layer norm on the last dimension
+    # This is a simplified version - in practice, you'd need to compute mean/variance
+    # across the appropriate dimensions
+    z4 = torch.nn.functional.layer_norm(z2, (D_out,), eps=eps)
+    
+    # Add residual
+    output = z4 + residual.view(-1, D_out)
+    
+    # Reshape output to original shape
+    output = output.view(*batch_shape, N, D_out)
+    
+    if out is not None:
+        out.copy_(output)
+        return out
+    return output

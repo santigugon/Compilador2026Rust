@@ -1,0 +1,74 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def logspace_kernel(
+    start_ptr, end_ptr, out_ptr, 
+    start_val, end_val, base_val, steps,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < steps
+    
+    # Generate linearly spaced indices
+    indices = tl.cast(offsets, tl.float32)
+    # Linear interpolation between start and end
+    linear_vals = start_val + (end_val - start_val) * indices / (steps - 1)
+    # Apply logarithmic transformation
+    out_vals = tl.power(base_val, linear_vals)
+    tl.store(out_ptr + offsets, out_vals, mask=mask)
+
+def logspace(start, end, steps, base=10.0, *, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False):
+    if device is None:
+        device = torch.get_default_device()
+    
+    if dtype is None:
+        if isinstance(start, torch.Tensor):
+            dtype = torch.get_default_dtype() if start.is_floating_point() else torch.int64
+        else:
+            dtype = torch.get_default_dtype()
+    
+    if out is None:
+        out = torch.empty(steps, dtype=dtype, device=device, layout=layout, requires_grad=requires_grad)
+    else:
+        if out.shape != (steps,):
+            raise ValueError(f"Output tensor must have shape ({steps},), got {out.shape}")
+        if out.dtype != dtype:
+            raise ValueError(f"Output tensor must have dtype {dtype}, got {out.dtype}")
+        if out.device != device:
+            raise ValueError(f"Output tensor must be on device {device}, got {out.device}")
+    
+    if isinstance(start, torch.Tensor):
+        start_val = start.item()
+    else:
+        start_val = start
+    
+    if isinstance(end, torch.Tensor):
+        end_val = end.item()
+    else:
+        end_val = end
+    
+    if isinstance(base, torch.Tensor):
+        base_val = base.item()
+    else:
+        base_val = base
+    
+    if steps <= 0:
+        return out
+    
+    # Launch kernel
+    BLOCK_SIZE = 1024
+    grid_size = (steps + BLOCK_SIZE - 1) // BLOCK_SIZE
+    
+    logspace_kernel[grid_size](
+        start_ptr=None, end_ptr=None, out_ptr=out.data_ptr(),
+        start_val=start_val, end_val=end_val, base_val=base_val, steps=steps,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return out
+```

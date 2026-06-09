@@ -1,0 +1,54 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def rand_kernel(output_ptr, n_elements, seed, offset):
+    pid = tl.program_id(0)
+    block_start = pid * 1024
+    offsets = block_start + tl.arange(0, 1024)
+    mask = offsets < n_elements
+    # Simple linear congruential generator
+    state = seed + offsets + offset
+    state = (state * 1103515245 + 12345) & 0x7fffffff
+    rand_vals = state / 2147483648.0
+    tl.store(output_ptr + offsets, rand_vals, mask=mask)
+
+def rand(*size, generator=None, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False, pin_memory=False):
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    
+    # Handle size as a sequence of integers
+    if len(size) == 1 and isinstance(size[0], (list, tuple)):
+        shape = size[0]
+    else:
+        shape = size
+    
+    # Create output tensor
+    if out is not None:
+        output = out
+    else:
+        output = torch.empty(shape, dtype=dtype, device=device, layout=layout, requires_grad=requires_grad)
+    
+    # Calculate total elements
+    total_elements = output.numel()
+    
+    # Set up kernel launch parameters
+    grid = (triton.cdiv(total_elements, 1024),)
+    
+    # Generate seed and offset
+    if generator is not None:
+        seed = generator.seed()
+        offset = generator._state
+    else:
+        seed = torch.seed()
+        offset = 0
+    
+    # Launch kernel
+    rand_kernel[grid](output.data_ptr(), total_elements, seed, offset)
+    
+    return output
+```

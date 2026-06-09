@@ -1,0 +1,133 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _bitwise_and_binomial_kernel(
+    input_ptr, other_ptr, total_count_ptr, probs_ptr, logits_ptr,
+    output_ptr, 
+    n_elements,
+    total_count_is_scalar: tl.constexpr,
+    probs_is_scalar: tl.constexpr,
+    logits_is_scalar: tl.constexpr,
+    HAS_PROBS: tl.constexpr,
+    HAS_LOGITS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr = 1024
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Load input data
+    input_vals = tl.load(input_ptr + offsets, mask=mask)
+    other_vals = tl.load(other_ptr + offsets, mask=mask)
+    
+    # Compute bitwise AND
+    and_result = input_vals & other_vals
+    
+    # Load total_count
+    if total_count_is_scalar:
+        total_count = tl.load(total_count_ptr)
+    else:
+        total_count = tl.load(total_count_ptr + offsets, mask=mask)
+    
+    # Load probs or logits
+    if HAS_PROBS:
+        if probs_is_scalar:
+            probs = tl.load(probs_ptr)
+        else:
+            probs = tl.load(probs_ptr + offsets, mask=mask)
+    elif HAS_LOGITS:
+        if logits_is_scalar:
+            logits = tl.load(logits_ptr)
+        else:
+            logits = tl.load(logits_ptr + offsets, mask=mask)
+    
+    # Compute binomial samples
+    if HAS_PROBS:
+        # Convert probs to float32 for sampling
+        probs = probs.to(tl.float32)
+        # Sample binomial distribution
+        samples = tl.random.binomial(total_count, probs, offsets)
+    elif HAS_LOGITS:
+        # Convert logits to probs
+        probs = tl.sigmoid(logits)
+        # Sample binomial distribution
+        samples = tl.random.binomial(total_count, probs, offsets)
+    
+    # Store result
+    tl.store(output_ptr + offsets, samples, mask=mask)
+
+def bitwise_and_binomial(input: torch.Tensor, other: torch.Tensor, total_count: torch.Tensor, probs: torch.Tensor = None, logits: torch.Tensor = None) -> torch.Tensor:
+    # Validate inputs
+    if probs is None and logits is None:
+        raise ValueError("Either probs or logits must be provided")
+    if probs is not None and logits is not None:
+        raise ValueError("Only one of probs or logits should be provided")
+    
+    # Ensure all tensors are on the same device and have compatible shapes
+    device = input.device
+    if other.device != device:
+        other = other.to(device)
+    if total_count.device != device:
+        total_count = total_count.to(device)
+    if probs is not None and probs.device != device:
+        probs = probs.to(device)
+    if logits is not None and logits.device != device:
+        logits = logits.to(device)
+    
+    # Ensure all tensors are contiguous
+    input = input.contiguous()
+    other = other.contiguous()
+    total_count = total_count.contiguous()
+    if probs is not None:
+        probs = probs.contiguous()
+    if logits is not None:
+        logits = logits.contiguous()
+    
+    # Flatten tensors to 1D for kernel processing
+    input_flat = input.view(-1)
+    other_flat = other.view(-1)
+    total_count_flat = total_count.view(-1)
+    if probs is not None:
+        probs_flat = probs.view(-1)
+    if logits is not None:
+        logits_flat = logits.view(-1)
+    
+    # Determine if scalars
+    total_count_is_scalar = total_count.numel() == 1
+    probs_is_scalar = probs is not None and probs.numel() == 1
+    logits_is_scalar = logits is not None and logits.numel() == 1
+    
+    # Determine output size
+    output_size = input_flat.numel()
+    
+    # Create output tensor
+    output = torch.empty(output_size, dtype=torch.int32, device=device)
+    
+    # Launch kernel
+    grid = (triton.cdiv(output_size, 1024),)
+    
+    HAS_PROBS = probs is not None
+    HAS_LOGITS = logits is not None
+    
+    _bitwise_and_binomial_kernel[grid](
+        input_flat,
+        other_flat,
+        total_count_flat,
+        probs_flat if HAS_PROBS else None,
+        logits_flat if HAS_LOGITS else None,
+        output,
+        output_size,
+        total_count_is_scalar,
+        probs_is_scalar,
+        logits_is_scalar,
+        HAS_PROBS,
+        HAS_LOGITS
+    )
+    
+    # Reshape output to match input shape
+    return output.view(input.shape)
+```

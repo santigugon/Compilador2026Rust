@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are an expert Triton programmer.\n\nGenerate ONLY a single valid Python module.\nNo explanations.\nNo prose.\nNo markdown outside the code block.\nNo tests.\nNo example calls.\n\nThe module must contain:\n- imports\n- Triton kernels\n- wrapper function\n\nThe wrapper function must exactly match the required signature.\n\nWrap the entire response in ONE ```python``` block.\n"
+  },
+  {
+    "role": "user",
+    "content": "You are an expert in Trion programming, capable of writing corresponding Triton kernels and wrapper functions based on functional descriptions and function parameters. Ensure that the wrapper function fully corresponds to the provided function information.\nFunctional Description: Computes the LU decomposition with partial pivoting of a matrix. If pivot=True, returns a permutation matrix P, a lower triangular matrix L, and an upper triangular matrix U such that A = PLU. If pivot=False and A is on GPU, computes the LU decomposition without pivoting, returning empty P, L and U such that A = LU. Supports float, double, cfloat, and cdouble dtypes, as well as batches of matrices. Outputs have the same batch dimensions as input.\nWrapper Entry Information: lu(A, *, pivot=True, out=None) -> (Tensor, Tensor, Tensor) Args: A (Tensor): tensor of shape `(*, m, n)` where `*` is zero or more batch dimensions. pivot (bool, optional): Controls whether to compute the LU decomposition with partial pivoting or no pivoting. Default: `True`. Keyword args: out (tuple, optional): output tuple of three tensors. Ignored if `None`. Default: `None`.\nAfter generation, verify if the Triton wrapper aligns with the provided func_inputs. If not, regenerate."
+  }
+]

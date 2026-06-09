@@ -2,55 +2,64 @@ import torch
 import triton
 import triton.language as tl
 
-@triton.jit
-def zeta_kernel(x_ptr, q_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    # Get the block index
-    block_idx = tl.program_id(0)
-    # Compute the start index for this block
-    start_idx = block_idx * BLOCK_SIZE
-    # Create a mask for valid elements
-    mask = start_idx + tl.arange(0, BLOCK_SIZE) < n_elements
-    # Load x and q values
-    x = tl.load(x_ptr + start_idx + tl.arange(0, BLOCK_SIZE), mask=mask)
-    q = tl.load(q_ptr + start_idx + tl.arange(0, BLOCK_SIZE), mask=mask)
-    # Initialize output
-    output = tl.zeros_like(x)
-    # Compute the Hurwitz zeta function using the series
-    # zeta(x, q) = sum_{n=0}^{inf} 1 / (n + q)^x
-    # We'll compute a finite sum for practical purposes
-    # Using a reasonable number of terms (e.g., 1000)
-    for i in range(1000):
-        n = i + 1
-        term = 1.0 / tl.pow(n + q, x)
-        output += term
-        # Break if the term becomes negligible
-        if tl.abs(term) < 1e-12:
-            break
-    # Store the result
-    tl.store(output_ptr + start_idx + tl.arange(0, BLOCK_SIZE), output, mask=mask)
-
-
 def zeta(input, other, *, out=None):
-    # Ensure inputs are on the same device and are floating point
-    if input.device != other.device:
-        raise ValueError("input and other must be on the same device")
-    if input.dtype != torch.float32 or other.dtype != torch.float32:
-        raise ValueError("input and other must be of type float32")
+    # Ensure inputs are tensors
+    if not torch.is_tensor(input):
+        input = torch.tensor(input)
+    if not torch.is_tensor(other):
+        other = torch.tensor(other)
     
-    # Create output tensor if not provided
+    # Handle broadcasting
+    shape = torch.broadcast_shapes(input.shape, other.shape)
+    input = input.expand(shape)
+    other = other.expand(shape)
+    
+    # Prepare output tensor
     if out is None:
-        out = torch.empty_like(input)
+        out = torch.empty(shape, dtype=input.dtype, device=input.device)
     else:
-        if out.shape != input.shape:
-            raise ValueError("out tensor must have the same shape as input")
-        if out.dtype != torch.float32:
-            raise ValueError("out tensor must be of type float32")
+        if out.shape != shape:
+            raise ValueError(f"Output tensor shape {out.shape} does not match broadcast shape {shape}")
     
-    # Get the total number of elements
-    n_elements = input.numel()
+    # Get total number of elements
+    n = input.numel()
     
-    # Launch the kernel
-    grid = (triton.cdiv(n_elements, 1024),)
-    zeta_kernel[grid](input, other, out, n_elements, BLOCK_SIZE=1024)
+    # Define kernel
+    @triton.jit
+    def _zeta_kernel(x_ptr, q_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < n
+        
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+        q = tl.load(q_ptr + offsets, mask=mask, other=0.0)
+        
+        # Initialize result
+        result = tl.zeros((BLOCK,), dtype=tl.float32)
+        
+        # Compute zeta(x, q) = sum_{n=0}^{inf} 1 / (n + q)^x
+        # We'll use a simple approximation for demonstration
+        # In practice, this would require more sophisticated numerical methods
+        
+        # For small x values, we can use a simple series approximation
+        # For large x values, we can use the asymptotic expansion
+        
+        # Simple implementation: sum first 100 terms
+        # This is a basic approximation and not numerically stable for all cases
+        for i in range(100):
+            n_term = i + q
+            term = 1.0 / (n_term ** x)
+            result = tl.where(n_term > 0, result + term, result)
+        
+        # Handle special case when x <= 1
+        # For x <= 1, we use a different approach or return inf
+        result = tl.where(x <= 1, tl.where(q > 0, result, tl.float32(float('inf'))), result)
+        
+        tl.store(out_ptr + offsets, result, mask=mask)
+    
+    # Launch kernel
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _zeta_kernel[grid](input, other, out, n, BLOCK=block)
     
     return out

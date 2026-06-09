@@ -1,0 +1,24 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def scaled_add_norm_kernel(y_ptr, x_ptr, alpha, n, y_out_ptr):
+    pid = tl.program_id(0)
+    block_size = tl.cdiv(n, tl.num_programs(0))
+    offset = pid * block_size
+    y_block = tl.load(y_ptr + offset, mask=offset + tl.arange(0, block_size) < n)
+    x_block = tl.load(x_ptr + offset, mask=offset + tl.arange(0, block_size) < n)
+    y_block = y_block + alpha * x_block
+    tl.store(y_ptr + offset, y_block, mask=offset + tl.arange(0, block_size) < n)
+    tl.store(y_out_ptr + pid, tl.sum(y_block * y_block))
+
+def scaled_add_norm(y, x, alpha):
+    assert y.shape == x.shape, "y and x must have the same shape"
+    assert y.dtype == x.dtype, "y and x must have the same dtype"
+    n = y.numel()
+    y = y.clone()
+    y_out = torch.zeros(tl.cdiv(n, 1024), dtype=torch.float32, device=y.device)
+    grid = (tl.cdiv(n, 1024),)
+    scaled_add_norm_kernel[grid](y, x, alpha, n, y_out)
+    return torch.sqrt(y_out.sum())

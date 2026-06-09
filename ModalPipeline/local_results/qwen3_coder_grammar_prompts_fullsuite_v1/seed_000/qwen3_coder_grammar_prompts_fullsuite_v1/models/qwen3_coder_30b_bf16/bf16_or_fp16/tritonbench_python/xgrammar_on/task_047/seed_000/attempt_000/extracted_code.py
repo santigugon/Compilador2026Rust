@@ -2,37 +2,29 @@ import torch
 import triton
 import triton.language as tl
 
+ALPHA = 1.6732632423543772848170429916717
+SCALE = 1.0507009873554804934193349852946
+
 @triton.jit
-def selu_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    """Applies SELU activation function: scale * (max(0, x) + min(0, alpha * (exp(x) - 1)))"""
-    # Compute the block index
-    block_idx = tl.program_id(0)
-    # Compute the starting element index for this block
-    start_idx = block_idx * BLOCK_SIZE
-    # Create a mask for valid elements
-    mask = start_idx + tl.arange(0, BLOCK_SIZE) < n_elements
-    # Load data
-    x = tl.load(x_ptr + start_idx + tl.arange(0, BLOCK_SIZE), mask=mask)
-    # SELU constants
-    alpha = 1.6733
-    scale = 1.0507
+def _selu_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     # Compute SELU: scale * (max(0, x) + min(0, alpha * (exp(x) - 1)))
     exp_x = tl.exp(x)
-    selu_x = scale * (tl.maximum(0, x) + tl.minimum(0, alpha * (exp_x - 1.0)))
-    # Store result
-    tl.store(output_ptr + start_idx + tl.arange(0, BLOCK_SIZE), selu_x, mask=mask)
+    selu = SCALE * (tl.maximum(0, x) + tl.minimum(0, ALPHA * (exp_x - 1.0)))
+    tl.store(out_ptr + offsets, selu, mask=mask)
 
 def selu(input, inplace=False):
     if inplace:
-        output = input
+        out = input
     else:
-        output = torch.empty_like(input)
+        out = torch.empty_like(input)
     
-    # Get the number of elements
-    n_elements = input.numel()
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
     
-    # Launch the kernel
-    grid = (triton.cdiv(n_elements, 1024),)
-    selu_kernel[grid](input, output, n_elements, BLOCK_SIZE=1024)
-    
-    return output
+    _selu_kernel[grid](input, out, n, BLOCK=block)
+    return out

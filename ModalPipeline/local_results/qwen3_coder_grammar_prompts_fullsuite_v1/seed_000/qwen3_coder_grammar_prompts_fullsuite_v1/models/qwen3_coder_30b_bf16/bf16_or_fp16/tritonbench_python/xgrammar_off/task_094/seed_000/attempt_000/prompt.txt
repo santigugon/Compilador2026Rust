@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are an expert Triton programmer.\n\nGenerate ONLY a single valid Python module.\nNo explanations.\nNo prose.\nNo markdown outside the code block.\nNo tests.\nNo example calls.\n\nThe module must contain:\n- imports\n- Triton kernels\n- wrapper function\n\nThe wrapper function must exactly match the required signature.\n\nWrap the entire response in ONE ```python``` block.\n"
+  },
+  {
+    "role": "user",
+    "content": "You are an expert in Trion programming, capable of writing corresponding Triton kernels and wrapper functions based on functional descriptions and function parameters. Ensure that the wrapper function fully corresponds to the provided function information.\nFunctional Description: Applies a linear transformation followed by a sigmoid activation and dropout. This function sequentially applies a linear transformation to the input tensor, a sigmoid activation to scale the values between 0 and 1, and randomly zeroes some elements of the tensor with a specified probability during dropout.\nWrapper Entry Information: def dropout_sigmoid_linear(input: torch.Tensor, weight: torch.Tensor, bias=None, p=0.5, training=True, inplace=False) -> torch.Tensor: Input tensor of shape :math:`(*, \\text{in\\_features})`. Weight tensor of shape :math:`(\\text{out\\_features}, \\text{in\\_features})`. Bias tensor of shape :math:`(\\text{out\\_features})`. Default is `None`. Probability of an element to be zeroed in dropout. Default: 0.5 If `True`, applies dropout during training. Default: `True` If `True`, performs the operation in-place. Default: `False`\nAfter generation, verify if the Triton wrapper aligns with the provided func_inputs. If not, regenerate."
+  }
+]

@@ -1,0 +1,47 @@
+{
+  "instruction": "def leaky_relu_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, negative_slope=0.01, inplace=False) -> Tensor",
+  "predict": "import torch\nimport triton\nimport triton.language as tl\n\ndef _conv2d_kernel(input_ptr, weight_ptr, bias_ptr, output_ptr, \n                   input_shape, weight_shape, output_shape,\n                   stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w, groups,\n                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):\n    \n    batch_size, in_channels, in_h, in_w = input_shape\n    out_channels, _, kernel_h, kernel_w = weight_shape\n    out_h, out_w = output_shape[2], output_shape[3]\n    \n    pid = tl.program_id(0)\n    pid_n = tl.program_id(1)\n    \n    # Compute output indices\n    batch_idx = pid // (out_h * out_w)\n    remaining = pid % (out_h * out_w)\n    out_h_idx = remaining // out_w\n    out_w_idx = remaining % out_w\n    \n    # Shared memory for input tile\n    input_tile = tl.shared_ptr(input_ptr + batch_idx * in_channels * in_h * in_w, \n                               shape=(BLOCK_M, BLOCK_K), \n                               strides=(in_w * in_h, 1))\n    \n    # Shared memory for weight tile\n    weight_tile = tl.shared_ptr(weight_ptr, \n                                shape=(BLOCK_M, BLOCK_K), \n                                strides=(kernel_h * kernel_w, 1))\n    \n    # Initialize accumulator\n    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n    \n    # Loop over the kernel\n    for k in range(0, in_channels * kernel_h * kernel_w, BLOCK_K):\n        # Load input tile\n        input_offsets = (out_h_idx * stride_h - padding_h + (k // (in_channels * kernel_w)) * dilation_h) * in_w + \\\n                        (out_w_idx * stride_w - padding_w + (k % (in_channels * kernel_w)) * dilation_w)\n        \n        # Load weight tile\n        weight_offsets = k\n        \n        # Perform convolution\n        for i in range(BLOCK_M):\n            for j in range(BLOCK_N):\n                if i < out_channels and j < BLOCK_K:\n                    acc[i, j] += input_tile[i, j] * weight_tile[i, j]\n    \n    # Apply bias\n    if bias_ptr is not None:\n        for i in range(BLOCK_M):\n            if i < out_channels:\n                acc[i, 0] += tl.load(bias_ptr + i)\n    \n    # Apply Leaky ReLU\n    for i in range(BLOCK_M):\n        for j in range(BLOCK_N):\n            if i < out_channels and j < BLOCK_K:\n                if acc[i, j] < 0:\n                    acc[i, j] = acc[i, j] * 0.01\n    \n    # Store result\n    output_offsets = batch_idx * out_channels * out_h * out_w + \\\n                     out_h_idx * out_w * out_channels + \\\n                     out_w_idx * out_channels + \\\n                     pid_n\n    \n    for i in range(BLOCK_M):\n        for j in range(BLOCK_N):\n            if i < out_channels and j < BLOCK_K:\n                tl.store(output_ptr + output_offsets + i * out_h * out_w + j, acc[i, j])\n\n@triton.jit\ndef _leaky_relu_kernel(x_ptr, out_ptr, n: tl.constexpr, negative_slope: tl.constexpr, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    offsets = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offsets < n\n    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)\n    y = tl.where(x < 0, x * negative_slope, x)\n    tl.store(out_ptr + offsets, y, mask=mask)\n\n@triton.jit\ndef _conv2d_single_kernel(input_ptr, weight_ptr, bias_ptr, output_ptr,\n                          batch_size, in_channels, out_channels,\n                          in_h, in_w, out_h, out_w,\n                          kernel_h, kernel_w,\n                          stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w, groups,\n                          BLOCK_SIZE: tl.constexpr):\n    \n    pid = tl.program_id(0)\n    batch_idx = pid // (out_h * out_w)\n    remaining = pid % (out_h * out_w)\n    out_h_idx = remaining // out_w\n    out_w_idx = remaining % out_w\n    \n    # Initialize accumulator\n    acc = tl.zeros((out_channels,), dtype=tl.float32)\n    \n    # Perform convolution\n    for kh in range(kernel_h):\n        for kw in range(kernel_w):\n            for ic in range(in_channels):\n                # Calculate input position\n                ih = out_h_idx * stride_h - padding_h + kh * dilation_h\n                iw = out_w_idx * stride_w - padding_w + kw * dilation_w\n                \n                # Check bounds\n                if ih >= 0 and ih < in_h and iw >= 0 and iw < in_w:\n                    input_val = tl.load(input_ptr + batch_idx * in_channels * in_h * in_w + \n                                       ic * in_h * in_w + ih * in_w + iw)\n                    \n                    # Load weight\n                    weight_val = tl.load(weight_ptr + ic * kernel_h * kernel_w + kh * kernel_w + kw)\n                    \n                    # Accumulate\n                    acc += input_val * weight_val\n    \n    # Apply bias\n    if bias_ptr is not None:\n        for oc in range(out_channels):\n            acc[oc] += tl.load(bias_ptr + oc)\n    \n    # Apply Leaky ReLU\n    for oc in range(out_channels):\n        if acc[oc] < 0:\n            acc[oc] = acc[oc] * 0.01\n    \n    # Store result\n    for oc in range(out_channels):\n        tl.store(output_ptr + batch_idx * out_channels * out_h * out_w + \n                 oc * out_h * out_w + out_h_idx * out_w + out_w_idx, acc[oc])\n\n\ndef leaky_relu_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, negative_slope=0.01, inplace=False):\n    # Handle scalar stride and padding\n    if not isinstance(stride, (tuple, list)):\n        stride = (stride, stride)\n    if not isinstance(padding, (tuple, list)):\n        padding = (padding, padding)\n    if not isinstance(dilation, (tuple, list)):\n        dilation = (dilation, dilation)\n    \n    stride_h, stride_w = stride\n    padding_h, padding_w = padding\n    dilation_h, dilation_w = dilation\n    \n    # Get input dimensions\n    batch_size, in_channels, in_h, in_w = input.shape\n    out_channels, _, kernel_h, kernel_w = weight.shape\n    \n    # Calculate output dimensions\n    out_h = (in_h + 2 * padding_h - (dilation_h * (kernel_h - 1) + 1)) // stride_h + 1\n    out_w = (in_w + 2 * padding_w - (dilation_w * (kernel_w - 1) + 1)) // stride_w + 1\n    \n    # Create output tensor\n    output = torch.empty((batch_size, out_channels, out_h, out_w), dtype=input.dtype, device=input.device)\n    \n    # Handle groups\n    if groups > 1:\n        # For grouped convolution, we need to handle each group separately\n        # This is a simplified implementation\n        for g in range(groups):\n            start_in_ch = g * (in_channels // groups)\n            end_in_ch = (g + 1) * (in_channels // groups)\n            start_out_ch = g * (out_channels // groups)\n            end_out_ch = (g + 1) * (out_channels // groups)\n            \n            # Extract group data\n            input_group = input[:, start_in_ch:end_in_ch, :, :]\n            weight_group = weight[start_out_ch:end_out_ch, :, :, :]\n            bias_group = bias[start_out_ch:end_out_ch] if bias is not None else None\n            \n            # Apply convolution and Leaky ReLU\n            conv_output = torch.nn.functional.conv2d(input_group, weight_group, bias_group, \n                                                    stride=stride, padding=padding, dilation=dilation, groups=1)\n            \n            # Apply Leaky ReLU\n            output[:, start_out_ch:end_out_ch, :, :] = torch.nn
+
+##################################################################################################################################################
+
+
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+
+# def leaky_relu_conv2d(input: Tensor, weight: Tensor, bias: Tensor=None, stride: int=1, padding: int=0, dilation: int=1, groups: int=1, negative_slope: float=0.01, inplace: bool=False) -> Tensor:
+#     conv_output = F.conv2d(input, weight, bias, stride, padding, dilation, groups)
+#     output = F.leaky_relu(conv_output, negative_slope, inplace)
+#     return output
+
+def test_leaky_relu_conv2d():
+    results = {}
+    
+    # Test case 1: Basic test with default parameters
+    input = torch.randn(1, 3, 32, 32, device='cuda')
+    weight = torch.randn(6, 3, 3, 3, device='cuda')
+    bias = torch.randn(6, device='cuda')
+    results["test_case_1"] = leaky_relu_conv2d(input, weight, bias)
+    
+    # Test case 2: Test with stride and padding
+    input = torch.randn(1, 3, 32, 32, device='cuda')
+    weight = torch.randn(6, 3, 3, 3, device='cuda')
+    bias = torch.randn(6, device='cuda')
+    results["test_case_2"] = leaky_relu_conv2d(input, weight, bias, stride=2, padding=1)
+    
+    # Test case 3: Test with dilation and groups
+    input = torch.randn(1, 6, 32, 32, device='cuda')
+    weight = torch.randn(6, 1, 3, 3, device='cuda')
+    bias = torch.randn(6, device='cuda')
+    results["test_case_3"] = leaky_relu_conv2d(input, weight, bias, dilation=2, groups=6)
+    
+    # Test case 4: Test with negative_slope and inplace
+    input = torch.randn(1, 3, 32, 32, device='cuda')
+    weight = torch.randn(6, 3, 3, 3, device='cuda')
+    bias = torch.randn(6, device='cuda')
+    results["test_case_4"] = leaky_relu_conv2d(input, weight, bias, negative_slope=0.1, inplace=True)
+    
+    return results
+
+test_results = test_leaky_relu_conv2d()

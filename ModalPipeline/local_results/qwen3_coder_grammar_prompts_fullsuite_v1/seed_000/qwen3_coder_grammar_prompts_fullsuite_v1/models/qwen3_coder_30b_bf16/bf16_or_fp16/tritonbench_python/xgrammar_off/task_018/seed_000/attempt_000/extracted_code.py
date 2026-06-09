@@ -1,0 +1,87 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def argmax_kernel(
+    input_ptr, output_ptr, 
+    input_strides, output_strides,
+    dim_size, num_elements,
+    BLOCK_SIZE: tl.constexpr,
+    keepdim: tl.constexpr,
+    dim: tl.constexpr
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_elements
+    
+    input_data = tl.load(input_ptr + offsets, mask=mask)
+    max_val = tl.full([BLOCK_SIZE], -float('inf'), dtype=tl.float32)
+    max_idx = tl.full([BLOCK_SIZE], 0, dtype=tl.int64)
+    
+    for i in range(0, dim_size, BLOCK_SIZE):
+        current_offsets = offsets + i
+        current_mask = current_offsets < num_elements
+        current_data = tl.load(input_ptr + current_offsets, mask=current_mask)
+        
+        # Update max values and indices
+        new_max = tl.maximum(max_val, current_data)
+        new_idx = tl.where(current_data > max_val, current_offsets, max_idx)
+        
+        max_val = new_max
+        max_idx = new_idx
+    
+    # Store result
+    tl.store(output_ptr + pid, max_idx[0])
+
+def argmax(input, dim, keepdim=False):
+    if dim is None:
+        # Flatten the input tensor
+        input_flat = input.flatten()
+        # Create output tensor
+        output = torch.empty((), dtype=torch.long, device=input.device)
+        # Launch kernel
+        num_elements = input_flat.numel()
+        BLOCK_SIZE = 1024
+        grid = (triton.cdiv(num_elements, BLOCK_SIZE),)
+        argmax_kernel[grid](
+            input_flat, output,
+            input_flat.stride(0), 0,
+            num_elements, num_elements,
+            BLOCK_SIZE=BLOCK_SIZE,
+            keepdim=keepdim,
+            dim=-1
+        )
+        return output
+    else:
+        # Handle specific dimension
+        input_shape = input.shape
+        output_shape = list(input_shape)
+        if keepdim:
+            output_shape[dim] = 1
+        else:
+            output_shape.pop(dim)
+        
+        output = torch.empty(output_shape, dtype=torch.long, device=input.device)
+        
+        # Calculate strides
+        input_strides = input.stride()
+        output_strides = output.stride() if output_shape else [0]
+        
+        # Launch kernel for the specific dimension
+        dim_size = input_shape[dim]
+        num_elements = input.numel()
+        BLOCK_SIZE = 1024
+        grid = (triton.cdiv(num_elements, BLOCK_SIZE),)
+        
+        argmax_kernel[grid](
+            input, output,
+            input_strides, output_strides,
+            dim_size, num_elements,
+            BLOCK_SIZE=BLOCK_SIZE,
+            keepdim=keepdim,
+            dim=dim
+        )
+        
+        return output

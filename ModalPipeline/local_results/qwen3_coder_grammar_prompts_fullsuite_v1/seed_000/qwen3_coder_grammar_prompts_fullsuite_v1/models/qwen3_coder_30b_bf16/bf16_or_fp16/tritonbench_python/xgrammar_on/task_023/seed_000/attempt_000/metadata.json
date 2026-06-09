@@ -1,5 +1,5 @@
 {
-  "run_id": "114ea588-8076-49a1-b523-b1090e43b4e9",
+  "run_id": "048977c1-a54d-4d47-aafb-af000f853a57",
   "experiment_id": "qwen3_coder_grammar_prompts_fullsuite_v1",
   "model_name": "qwen3_coder_30b_bf16",
   "hf_model_id": "Qwen/Qwen3-Coder-30B-A3B-Instruct",

@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are an expert Triton programmer.\n\nGenerate ONLY a single valid Python module.\nNo explanations.\nNo prose.\nNo markdown outside the code block.\nNo tests.\nNo example calls.\n\nThe module must contain:\n- imports\n- Triton kernels\n- wrapper function\n\nThe wrapper function must exactly match the required signature.\n\nWrap the entire response in ONE ```python``` block.\n"
+  },
+  {
+    "role": "user",
+    "content": "You are an expert in Trion programming, capable of writing corresponding Triton kernels and wrapper functions based on functional descriptions and function parameters. Ensure that the wrapper function fully corresponds to the provided function information.\nFunctional Description: Matrix product of two tensors. The behavior depends on the dimensionality of the tensors: 1D tensors return a dot product; 2D tensors return a matrix-matrix product; 1D and 2D tensors return a matrix-vector product; N-dimensional tensors (N > 2) return a batched matrix multiply with broadcasting support. Sparse layouts are supported for 2D matrix-matrix products. TensorFloat32 is supported. On certain ROCm devices, float16 inputs use different precision for backward. The 1D dot product version does not support an out parameter.\nWrapper Entry Information: matmul(input, other, *, out=None) -> Tensor\nArguments:\n    input (Tensor): the first tensor to be multiplied\n    other (Tensor): the second tensor to be multiplied\nKeyword args:\n    out (Tensor, optional): the output tensor.\nAfter generation, verify if the Triton wrapper aligns with the provided func_inputs. If not, regenerate."
+  }
+]

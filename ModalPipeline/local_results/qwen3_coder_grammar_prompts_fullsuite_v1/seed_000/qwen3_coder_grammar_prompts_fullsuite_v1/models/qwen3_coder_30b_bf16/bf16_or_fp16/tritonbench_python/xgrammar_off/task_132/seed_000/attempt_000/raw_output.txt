@@ -1,0 +1,52 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def mul_sub_kernel(
+    input_ptr, other_mul_ptr, other_sub_ptr, output_ptr,
+    input_size, other_mul_size, other_sub_size,
+    alpha,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < input_size
+    
+    input = tl.load(input_ptr + offsets, mask=mask)
+    other_mul = tl.load(other_mul_ptr + offsets, mask=mask)
+    other_sub = tl.load(other_sub_ptr + offsets, mask=mask)
+    
+    result = input * other_mul - alpha * other_sub
+    tl.store(output_ptr + offsets, result, mask=mask)
+
+def mul_sub(input, other_mul, other_sub, alpha=1, out=None):
+    if out is None:
+        out = torch.empty_like(input)
+    
+    input_size = input.numel()
+    other_mul_size = other_mul.numel()
+    other_sub_size = other_sub.numel()
+    
+    if input_size != other_mul_size or input_size != other_sub_size:
+        raise ValueError("All tensors must have the same size")
+    
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(input_size, BLOCK_SIZE),)
+    
+    mul_sub_kernel[grid](
+        input.data_ptr(),
+        other_mul.data_ptr(),
+        other_sub.data_ptr(),
+        out.data_ptr(),
+        input_size,
+        other_mul_size,
+        other_sub_size,
+        alpha,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return out
+```

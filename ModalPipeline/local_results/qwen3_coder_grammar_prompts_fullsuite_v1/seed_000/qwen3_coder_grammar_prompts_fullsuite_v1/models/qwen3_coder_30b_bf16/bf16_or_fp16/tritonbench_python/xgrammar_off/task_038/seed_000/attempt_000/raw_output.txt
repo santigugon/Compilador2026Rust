@@ -1,0 +1,105 @@
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fused_transformer_block_kernel(
+    input_ptr, weight1_ptr, weight2_ptr, residual_ptr, output_ptr,
+    dropout_p, eps,
+    input_row_stride, weight1_row_stride, weight2_row_stride, residual_row_stride, output_row_stride,
+    N, D_in, D_k, D_out,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_D_IN: tl.constexpr,
+    BLOCK_SIZE_D_K: tl.constexpr,
+    BLOCK_SIZE_D_OUT: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    pid_row = pid // tl.cdiv(N, BLOCK_SIZE_N)
+    pid_col = pid % tl.cdiv(N, BLOCK_SIZE_N)
+    
+    # Load input
+    input_block_ptr = tl.make_block_ptr(
+        input_ptr, shape=(N, D_in), strides=(input_row_stride, 1),
+        offsets=(pid_row * BLOCK_SIZE_N, 0), block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_D_IN), order=(1, 0)
+    )
+    input = tl.load(input_block_ptr, boundary_check=(0, 1))
+    
+    # First matmul: input @ weight1
+    weight1_block_ptr = tl.make_block_ptr(
+        weight1_ptr, shape=(D_in, D_k), strides=(weight1_row_stride, 1),
+        offsets=(0, 0), block_shape=(BLOCK_SIZE_D_IN, BLOCK_SIZE_D_K), order=(1, 0)
+    )
+    z1 = tl.dot(input, tl.load(weight1_block_ptr, boundary_check=(0, 1)))
+    
+    # Softmax
+    z1_max = tl.max(z1, axis=1, keepdims=True)
+    z1_exp = tl.exp(z1 - z1_max)
+    z1_sum = tl.sum(z1_exp, axis=1, keepdims=True)
+    z1_softmax = z1_exp / z1_sum
+    
+    # Dropout
+    dropout_mask = tl.rand(0, z1_softmax.shape[0], z1_softmax.shape[1]) > dropout_p
+    z1_dropout = z1_softmax * dropout_mask / (1.0 - dropout_p)
+    
+    # Second matmul: z1_dropout @ weight2
+    weight2_block_ptr = tl.make_block_ptr(
+        weight2_ptr, shape=(D_k, D_out), strides=(weight2_row_stride, 1),
+        offsets=(0, 0), block_shape=(BLOCK_SIZE_D_K, BLOCK_SIZE_D_OUT), order=(1, 0)
+    )
+    z2 = tl.dot(z1_dropout, tl.load(weight2_block_ptr, boundary_check=(0, 1)))
+    
+    # Add residual
+    residual_block_ptr = tl.make_block_ptr(
+        residual_ptr, shape=(N, D_out), strides=(residual_row_stride, 1),
+        offsets=(pid_row * BLOCK_SIZE_N, 0), block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_D_OUT), order=(1, 0)
+    )
+    z3 = z2 + tl.load(residual_block_ptr, boundary_check=(0, 1))
+    
+    # Layer normalization
+    z3_mean = tl.sum(z3, axis=1, keepdims=True) / D_out
+    z3_var = tl.sum((z3 - z3_mean) ** 2, axis=1, keepdims=True) / D_out
+    z3_norm = (z3 - z3_mean) / tl.sqrt(z3_var + eps)
+    
+    # Store output
+    output_block_ptr = tl.make_block_ptr(
+        output_ptr, shape=(N, D_out), strides=(output_row_stride, 1),
+        offsets=(pid_row * BLOCK_SIZE_N, 0), block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_D_OUT), order=(1, 0)
+    )
+    tl.store(output_block_ptr, z3_norm, boundary_check=(0, 1))
+
+def fused_transformer_block(input, weight1, weight2, residual, dropout_p=0.1, eps=1e-5, *, out=None):
+    if out is None:
+        out = torch.empty_like(input)
+    
+    # Ensure inputs are contiguous
+    input = input.contiguous()
+    weight1 = weight1.contiguous()
+    weight2 = weight2.contiguous()
+    residual = residual.contiguous()
+    out = out.contiguous()
+    
+    # Get dimensions
+    N, D_in = input.shape[-2], input.shape[-1]
+    D_k = weight1.shape[-1]
+    D_out = weight2.shape[-1]
+    
+    # Ensure residual is broadcastable
+    if residual.shape[-2:] != (N, D_out):
+        residual = residual.expand(input.shape[:-1] + (N, D_out))
+    
+    # Launch kernel
+    grid = (triton.cdiv(N, 128) * triton.cdiv(D_out, 128),)
+    _fused_transformer_block_kernel[grid](
+        input, weight1, weight2, residual, out,
+        dropout_p, eps,
+        input.stride(-2), weight1.stride(-2), weight2.stride(-2), residual.stride(-2), out.stride(-2),
+        N, D_in, D_k, D_out,
+        BLOCK_SIZE_N=128,
+        BLOCK_SIZE_D_IN=128,
+        BLOCK_SIZE_D_K=128,
+        BLOCK_SIZE_D_OUT=128,
+    )
+    
+    return out
+```

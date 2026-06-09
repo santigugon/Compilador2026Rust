@@ -1,0 +1,68 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def symmetric_mm_and_abs_sum_kernel(
+    A_ptr, C_ptr, out_ptr,
+    n, m,
+    alpha, beta,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr
+):
+    pid = tl.program_id(0)
+    pid_m = pid // tl.cdiv(n, BLOCK_SIZE_M)
+    pid_n = pid % tl.cdiv(n, BLOCK_SIZE_N)
+    
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    
+    mask_m = offs_m < n
+    mask_n = offs_n < n
+    
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    for k in range(0, m, BLOCK_SIZE_M):
+        a_ptrs = A_ptr + (offs_m[:, None] * m + k + tl.arange(0, BLOCK_SIZE_M)[None, :])
+        b_ptrs = A_ptr + (k + tl.arange(0, BLOCK_SIZE_M)[:, None] * m + offs_n[None, :])
+        
+        a = tl.load(a_ptrs, mask=(mask_m[:, None] & (k + tl.arange(0, BLOCK_SIZE_M)[None, :] < m)))
+        b = tl.load(b_ptrs, mask=((k + tl.arange(0, BLOCK_SIZE_M)[:, None] < m) & mask_n[None, :]))
+        
+        acc += tl.dot(a, b)
+    
+    acc = acc * alpha
+    
+    c_ptrs = C_ptr + (offs_m[:, None] * n + offs_n[None, :])
+    c = tl.load(c_ptrs, mask=(mask_m[:, None] & mask_n[None, :]))
+    acc = acc + c * beta
+    
+    tl.store(c_ptrs, acc, mask=(mask_m[:, None] & mask_n[None, :]))
+    
+    # Compute sum of absolute values
+    acc_abs = tl.abs(acc)
+    sum_abs = tl.sum(acc_abs)
+    tl.atomic_add(out_ptr, sum_abs)
+
+def symmetric_mm_and_abs_sum(A: torch.Tensor, C: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
+    assert A.dim() == 2
+    assert C.dim() == 2
+    assert A.shape[0] == C.shape[0] and A.shape[1] == C.shape[1]
+    
+    n, m = A.shape
+    out = torch.zeros(1, dtype=torch.float32, device=A.device)
+    
+    BLOCK_SIZE_M = 16
+    BLOCK_SIZE_N = 16
+    
+    grid = (triton.cdiv(n, BLOCK_SIZE_M) * triton.cdiv(n, BLOCK_SIZE_N),)
+    
+    symmetric_mm_and_abs_sum_kernel[grid](
+        A.data_ptr(), C.data_ptr(), out.data_ptr(),
+        n, m,
+        alpha, beta,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N
+    )
+    
+    return out
