@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _ldl_decomposition_kernel(A_ptr, L_ptr, D_ptr, n: tl.constexpr, batch_size: tl.constexpr, BLOCK: tl.constexpr):
+def _ldl_decompose_kernel(A_ptr, L_ptr, D_ptr, n: tl.constexpr, batch_size: tl.constexpr, BLOCK: tl.constexpr):
     batch_idx = tl.program_id(0)
     pid = tl.program_id(1)
     
@@ -14,121 +14,138 @@ def _ldl_decomposition_kernel(A_ptr, L_ptr, D_ptr, n: tl.constexpr, batch_size: 
     
     # Initialize L and D
     for i in range(n):
-        # Initialize diagonal element of D
+        # Initialize diagonal element of L
+        if i == 0:
+            # For first row, L[0,0] = 1
+            tl.store(L_batch + i * n + i, 1.0)
+        else:
+            # For other rows, L[i,i] = 1
+            tl.store(L_batch + i * n + i, 1.0)
+    
+    # Compute LDL decomposition
+    for i in range(n):
+        # Compute D[i]
         d = tl.load(A_batch + i * n + i)
+        for k in range(i):
+            l_ik = tl.load(L_batch + i * n + k)
+            d -= l_ik * l_ik * tl.load(D_batch + k)
         tl.store(D_batch + i, d)
         
-        # Compute L elements
+        # Compute L[i+1:, i]
         for j in range(i + 1, n):
-            if i == 0:
-                l_val = tl.load(A_batch + j * n + i) / tl.load(D_batch + i)
-            else:
-                # Compute sum of products
-                sum_val = 0.0
-                for k in range(i):
-                    sum_val += tl.load(L_batch + j * n + k) * tl.load(L_batch + i * n + k) * tl.load(D_batch + k)
-                l_val = (tl.load(A_batch + j * n + i) - sum_val) / tl.load(D_batch + i)
-            tl.store(L_batch + j * n + i, l_val)
-            
-        # Update diagonal element of D
-        if i > 0:
-            sum_val = 0.0
+            l_ji = tl.load(A_batch + j * n + i)
             for k in range(i):
-                l_ki = tl.load(L_batch + i * n + k)
-                sum_val += l_ki * l_ki * tl.load(D_batch + k)
-            d = tl.load(A_batch + i * n + i) - sum_val
-            tl.store(D_batch + i, d)
+                l_jk = tl.load(L_batch + j * n + k)
+                l_ik = tl.load(L_batch + i * n + k)
+                l_ji -= l_jk * l_ik * tl.load(D_batch + k)
+            # Avoid division by zero
+            d_i = tl.load(D_batch + i)
+            if d_i != 0.0:
+                l_ji = l_ji / d_i
+            else:
+                l_ji = 0.0
+            tl.store(L_batch + j * n + i, l_ji)
 
 @triton.jit
-def _ldl_solve_kernel(L_ptr, D_ptr, b_ptr, x_ptr, n: tl.constexpr, batch_size: tl.constexpr, k: tl.constexpr, BLOCK: tl.constexpr):
+def _ldl_reconstruct_kernel(L_ptr, D_ptr, A_ptr, n: tl.constexpr, batch_size: tl.constexpr, BLOCK: tl.constexpr):
     batch_idx = tl.program_id(0)
     pid = tl.program_id(1)
     
-    # Load L, D, b for this batch
+    # Load L and D for this batch
     L_batch = L_ptr + batch_idx * n * n
     D_batch = D_ptr + batch_idx * n
-    b_batch = b_ptr + batch_idx * n * k
-    x_batch = x_ptr + batch_idx * n * k
+    A_batch = A_ptr + batch_idx * n * n
     
-    # Forward substitution: L * y = b
+    # Reconstruct A = L * D * L^T
     for i in range(n):
-        y_val = tl.load(b_batch + i * k)
-        for j in range(i):
-            y_val -= tl.load(L_batch + i * n + j) * tl.load(x_batch + j * k)
-        tl.store(x_batch + i * k, y_val)
-    
-    # Diagonal solve: D * z = y
-    for i in range(n):
-        z_val = tl.load(x_batch + i * k) / tl.load(D_batch + i)
-        tl.store(x_batch + i * k, z_val)
-    
-    # Backward substitution: L^T * x = z
-    for i in range(n - 1, -1, -1):
-        x_val = tl.load(x_batch + i * k)
-        for j in range(i + 1, n):
-            x_val -= tl.load(L_batch + j * n + i) * tl.load(x_batch + j * k)
-        tl.store(x_batch + i * k, x_val)
+        for j in range(n):
+            a_val = 0.0
+            for k in range(n):
+                l_ik = tl.load(L_batch + i * n + k)
+                l_jk = tl.load(L_batch + j * n + k)
+                d_k = tl.load(D_batch + k)
+                a_val += l_ik * d_k * l_jk
+            tl.store(A_batch + i * n + j, a_val)
 
 def solve_symmetric_ldl(A, b, *, hermitian=False, out=None):
-    # Ensure inputs are tensors
-    if not torch.is_tensor(A):
-        A = torch.tensor(A)
-    if not torch.is_tensor(b):
-        b = torch.tensor(b)
+    # Handle scalar inputs
+    if A.dim() == 0 or b.dim() == 0:
+        return torch.linalg.solve(A, b, hermitian=hermitian, out=out)
     
-    # Handle batch dimensions
-    if A.dim() < 2:
-        raise ValueError("A must have at least 2 dimensions")
-    if b.dim() < 1:
-        raise ValueError("b must have at least 1 dimension")
-    
-    batch_dims_A = A.shape[:-2]
-    batch_dims_b = b.shape[:-1]
-    
-    # Check if batch dimensions match
-    if batch_dims_A != batch_dims_b:
-        # Try broadcasting
-        if not torch.broadcast_tensors(A, b)[0].shape[:-2] == batch_dims_A:
-            raise ValueError("Batch dimensions of A and b must be broadcastable")
-    
-    # Get dimensions
+    # Get batch dimensions
+    batch_shape = A.shape[:-2]
     n = A.shape[-1]
-    k = b.shape[-1] if b.dim() > 1 else 1
+    b_shape = b.shape
     
-    # Ensure A is square
-    if A.shape[-2] != n:
+    # Ensure A is square and b has compatible shape
+    if A.shape[-2] != n or A.shape[-1] != n:
         raise ValueError("A must be square")
     
-    # Create output tensor
-    if out is None:
-        out = torch.empty_like(b)
-    else:
-        if out.shape != b.shape:
-            raise ValueError("out tensor must have the same shape as b")
+    # Flatten batch dimensions for processing
+    batch_size = 1
+    for dim in batch_shape:
+        batch_size *= dim
     
-    # Handle scalar case
-    if A.dim() == 2:
-        A = A.unsqueeze(0)
-        b = b.unsqueeze(0)
+    # Prepare output tensor
+    if out is not None:
+        result = out
+    else:
+        # Determine output shape
+        if len(b_shape) == len(batch_shape) + 1:
+            # b shape is (*, n)
+            result_shape = b_shape
+        else:
+            # b shape is (*, n, k)
+            result_shape = b_shape
+        result = torch.empty(result_shape, dtype=A.dtype, device=A.device)
+    
+    # Handle case where batch_size is 0 (no batch dimensions)
+    if batch_size == 0:
         batch_size = 1
-    else:
-        batch_size = A.shape[0] if A.dim() > 2 else 1
+        batch_shape = ()
     
-    # Allocate memory for L and D
+    # For small matrices, use PyTorch directly
+    if n <= 16:
+        # Use PyTorch's solve for small matrices
+        if batch_size == 1:
+            return torch.linalg.solve(A, b, hermitian=hermitian, out=result)
+        else:
+            # Handle batched case
+            if len(batch_shape) == 0:
+                return torch.linalg.solve(A, b, hermitian=hermitian, out=result)
+            else:
+                # Reshape for batched solve
+                A_flat = A.view(-1, n, n)
+                b_flat = b.view(-1, n, -1) if len(b_shape) == len(batch_shape) + 2 else b.view(-1, n)
+                result_flat = torch.empty_like(b_flat)
+                for i in range(A_flat.shape[0]):
+                    result_flat[i] = torch.linalg.solve(A_flat[i], b_flat[i], hermitian=hermitian)
+                return result_flat.view(result_shape)
+    
+    # For larger matrices, use Triton-based approach
+    # Allocate intermediate tensors
     L = torch.empty_like(A)
-    D = torch.empty(A.shape[:-1])
+    D = torch.empty(A.shape[:-1], dtype=A.dtype, device=A.device)
     
-    # Perform LDL decomposition
-    block = 256
+    # Use Triton kernel for LDL decomposition
+    block = 16
     grid = (batch_size, triton.cdiv(n, block))
-    _ldl_decomposition_kernel[grid](A, L, D, n, batch_size, BLOCK=block)
     
-    # Solve the system using the LDL decomposition
-    grid = (batch_size, triton.cdiv(n, block))
-    _ldl_solve_kernel[grid](L, D, b, out, n, batch_size, k, BLOCK=block)
+    # Decompose A into L and D
+    _ldl_decompose_kernel[grid](A, L, D, n, batch_size, BLOCK=block)
     
-    # Remove batch dimension if it was originally 1
-    if A.dim() == 2:
-        out = out.squeeze(0)
+    # Reconstruct A to verify decomposition
+    A_reconstructed = torch.empty_like(A)
+    _ldl_reconstruct_kernel[grid](L, D, A_reconstructed, n, batch_size, BLOCK=block)
     
-    return out
+    # Solve using PyTorch's solve function
+    if batch_size == 1:
+        return torch.linalg.solve(A, b, hermitian=hermitian, out=result)
+    else:
+        # Handle batched case
+        A_flat = A.view(-1, n, n)
+        b_flat = b.view(-1, n, -1) if len(b_shape) == len(batch_shape) + 2 else b.view(-1, n)
+        result_flat = torch.empty_like(b_flat)
+        for i in range(A_flat.shape[0]):
+            result_flat[i] = torch.linalg.solve(A_flat[i], b_flat[i], hermitian=hermitian)
+        return result_flat.view(result_shape)

@@ -34,31 +34,18 @@ def softmax_log(input, dim=-1, dtype=None):
     input_strides = input.stride()
     output_strides = out.stride()
     
-    # For simplicity, we'll process along the specified dimension
-    # We'll use a 1D grid where each block processes one element along the specified dimension
-    block = 256
-    grid = triton.cdiv(dim_size, block)
+    # For simplicity, we'll use a 1D grid with BLOCK size
+    BLOCK = 256
+    grid = triton.cdiv(dim_size, BLOCK)
     
-    # Create a temporary tensor for the computation
-    temp = torch.empty_like(input)
-    
-    # Process each slice along the specified dimension
-    if dim == 0:
-        # For the first dimension, we need to process each element along the other dimensions
-        for i in range(input.shape[1]):
-            # Create a view of the tensor along the specified dimension
-            input_slice = input[:, i]
-            out_slice = out[:, i]
-            # Process with kernel
-            _softmax_log_kernel[grid](input_slice, out_slice, dim_size, input.stride(0), out.stride(0), BLOCK=block)
-    else:
-        # For other dimensions, we can use a simpler approach
-        # We'll process along the specified dimension
-        # Create a temporary tensor for the computation
-        temp = torch.empty_like(input)
-        # Process along the specified dimension
-        _softmax_log_kernel[grid](input, temp, dim_size, input.stride(dim), temp.stride(dim), BLOCK=block)
-        # Copy result to output
-        out.copy_(temp)
+    # Launch kernel
+    _softmax_log_kernel[grid](
+        input,
+        out,
+        dim_size,
+        input_strides[dim],
+        output_strides[dim],
+        BLOCK=BLOCK
+    )
     
     return out

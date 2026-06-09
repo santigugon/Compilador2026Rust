@@ -17,10 +17,10 @@ def _argmax_kernel(x_ptr, out_ptr, n: tl.constexpr, dim_size: tl.constexpr, stri
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=-float('inf'))
+    
     # For argmax, we need to find the maximum value and its index
     # This is a simplified version that works for the flattened case
-    # In practice, a more complex reduction would be needed for proper argmax
-    # But for this implementation, we'll compute argmax in a simple way
+    # In a real implementation, we'd need to handle the dimension properly
     max_val = tl.max(x)
     max_idx = tl.argmin(tl.where(x == max_val, 0, 1))
     tl.store(out_ptr, max_idx, mask=mask)
@@ -35,13 +35,13 @@ def sigmoid_argmax(input, dim=None, keepdim=False):
     
     # Compute argmax
     if dim is None:
-        # Flatten the tensor and find argmax
-        flat_sigmoid = sigmoid_input.flatten()
-        argmax_idx = torch.argmax(flat_sigmoid)
+        # Flatten and find argmax over all elements
+        flat_input = sigmoid_input.flatten()
+        result = torch.argmax(flat_input)
         if keepdim:
-            return argmax_idx.view(1)
-        return argmax_idx
+            result = result.view(1)
     else:
         # Find argmax along specified dimension
-        argmax_result = torch.argmax(sigmoid_input, dim=dim, keepdim=keepdim)
-        return argmax_result
+        result = torch.argmax(sigmoid_input, dim=dim, keepdim=keepdim)
+    
+    return result

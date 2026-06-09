@@ -10,28 +10,38 @@ def _digamma_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     
     # For x <= 0, return -inf
-    # For x > 0, compute digamma using asymptotic expansion
-    # digamma(x) = log(x) - 1/(2x) - 1/(12x^2) + 1/(120x^4) - 1/(252x^6) + ...
-    
-    # Handle special case where x <= 0
     result = tl.where(x <= 0, -tl.inf, 0.0)
     
-    # For positive x, compute the series expansion
-    # We'll use a simplified version for better numerical stability
-    # digamma(x) ≈ log(x) - 1/(2x) - 1/(12x^2) + 1/(120x^4) - 1/(252x^6)
-    x_positive = tl.where(x > 0, x, 1.0)  # Avoid division by zero
+    # For positive x, compute digamma using asymptotic expansion
+    # digamma(x) = log(x) - 1/(2x) - 1/(12x^2) + 1/(120x^4) - 1/(252x^6) + ...
+    # We'll use a simpler approximation for better numerical stability
+    x_positive = tl.where(x > 0, x, 1.0)  # Avoid log(0)
     
-    # Compute the series expansion
+    # Use the asymptotic expansion for large x
+    large_x = x_positive > 1000.0
     log_x = tl.log(x_positive)
-    term1 = 1.0 / (2.0 * x_positive)
-    term2 = 1.0 / (12.0 * x_positive * x_positive)
-    term3 = 1.0 / (120.0 * x_positive * x_positive * x_positive * x_positive)
-    term4 = 1.0 / (252.0 * x_positive * x_positive * x_positive * x_positive * x_positive * x_positive)
     
-    series = log_x - term1 - term2 + term3 - term4
+    # For large x: digamma(x) ≈ log(x) - 1/(2x) - 1/(12x^2) + 1/(120x^4) - 1/(252x^6)
+    x_sq = x_positive * x_positive
+    x_inv = 1.0 / x_positive
+    x_inv_sq = x_inv * x_inv
     
-    # Combine results
-    result = tl.where(x > 0, series, -tl.inf)
+    asymptotic = log_x - 0.5 * x_inv - (1.0/12.0) * x_inv_sq
+    asymptotic += (1.0/120.0) * x_inv_sq * x_inv_sq
+    asymptotic -= (1.0/252.0) * x_inv_sq * x_inv_sq * x_inv
+    
+    # For small x, use recurrence relation: digamma(x+1) = digamma(x) + 1/x
+    # We'll compute for x in [0,1] using the recurrence relation
+    # But for simplicity, we'll use a direct approximation for small x
+    small_x = x_positive <= 1.0
+    small_approx = log_x - 1.0/x_positive
+    
+    # Combine the approximations
+    final_result = tl.where(large_x, asymptotic, 
+                           tl.where(small_x, small_approx, log_x - 0.5 * x_inv - (1.0/12.0) * x_inv_sq))
+    
+    # Combine with the negative infinity for non-positive values
+    result = tl.where(x <= 0, -tl.inf, final_result)
     
     tl.store(out_ptr + offsets, result, mask=mask)
 
@@ -39,8 +49,8 @@ def digamma(input, *, out=None):
     if out is None:
         out = torch.empty_like(input)
     else:
-        if out.shape != input.shape:
-            raise ValueError("Output tensor must have the same shape as input tensor")
+        assert out.shape == input.shape, "Output shape must match input shape"
+        assert out.dtype == input.dtype, "Output dtype must match input dtype"
     
     n = input.numel()
     block = 256

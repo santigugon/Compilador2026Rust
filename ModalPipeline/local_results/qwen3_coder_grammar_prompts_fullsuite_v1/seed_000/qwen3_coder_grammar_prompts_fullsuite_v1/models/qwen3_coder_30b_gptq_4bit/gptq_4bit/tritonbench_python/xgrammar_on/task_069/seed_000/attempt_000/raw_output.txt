@@ -1,0 +1,4 @@
+{
+  "instruction": "Implement a fused operation consisting of a linear transformation followed by ReLU activation and layer normalization on the input tensor.",
+  "predict": "import torch\nimport triton\nimport triton.language as tl\n\ndef fused_layer_norm_relu_linear(input, weight, bias=None, normalized_shape=None, eps=1e-5, elementwise_affine=True):\n    # Handle default values\n    if normalized_shape is None:\n        normalized_shape = weight.shape[0]\n    if not isinstance(normalized_shape, (list, tuple)):\n        normalized_shape = [normalized_shape]\n    \n    # Compute linear transformation\n    linear_out = torch.nn.functional.linear(input, weight, bias)\n    \n    # Apply ReLU\n    relu_out = torch.nn.functional.relu(linear_out)\n    \n    # Apply layer normalization\n    out = torch.nn.functional.layer_norm(relu_out, normalized_shape, eps=eps, elementwise_affine=elementwise_affine)\n    \n    return out"
+}

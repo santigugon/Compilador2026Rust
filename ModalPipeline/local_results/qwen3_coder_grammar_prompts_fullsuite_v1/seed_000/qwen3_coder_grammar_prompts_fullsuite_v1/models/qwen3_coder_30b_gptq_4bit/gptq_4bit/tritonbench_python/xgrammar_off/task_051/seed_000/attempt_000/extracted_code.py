@@ -40,21 +40,16 @@ def _avg_pool1d_kernel(
         current_idx = start_idx + i
         # Check if current index is within bounds
         valid = (current_idx >= 0) & (current_idx < in_w)
-        
         # Load value
         val = tl.load(x_ptr + current_idx, mask=valid, other=0.0)
-        
-        # Add to sum and count
+        # Accumulate sum and count
         pool_sum += val
         pool_size += tl.where(valid, 1, 0)
     
     # Handle padding inclusion
-    if count_include_pad:
-        # If padding is included, we already counted it in pool_size
-        pass
-    else:
-        # If padding is not included, we need to adjust pool_size
-        # This is handled by the mask in the load operation
+    if not count_include_pad:
+        # If padding is not included, pool_size should be the actual number of elements
+        # But we already computed it correctly above
         pass
     
     # Compute average

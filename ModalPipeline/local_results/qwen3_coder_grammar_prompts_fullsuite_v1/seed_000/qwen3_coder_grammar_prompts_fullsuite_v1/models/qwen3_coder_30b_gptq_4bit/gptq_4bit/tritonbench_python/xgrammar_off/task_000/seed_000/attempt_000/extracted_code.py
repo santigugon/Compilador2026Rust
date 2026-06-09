@@ -3,163 +3,94 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _bmm_rmsnorm_gelu_dropout_sub_kernel(
-    input1_ptr, input2_ptr, other_ptr, out_ptr,
-    n_elements, B, N, M, P,
-    normalized_shape,
-    dropout_p,
-    training,
-    eps,
-    BLOCK: tl.constexpr
-):
+def _rmsnorm_kernel(x_ptr, weight_ptr, out_ptr, n: tl.constexpr, eps: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n_elements
-    
-    # Load input tensors
-    input1 = tl.load(input1_ptr + offsets, mask=mask, other=0.0)
-    input2 = tl.load(input2_ptr + offsets, mask=mask, other=0.0)
-    other = tl.load(other_ptr + offsets, mask=mask, other=0.0)
-    
-    # Perform batch matrix multiplication
-    # Reshape to get batch indices
-    batch_idx = offsets // (N * M)
-    m_idx = (offsets % (N * M)) // N
-    n_idx = offsets % (N * M) % N
-    
-    # For simplicity, we'll compute the full BMM in a single kernel
-    # This is a simplified version - in practice, you'd want to use
-    # a more efficient BMM implementation
-    
-    # Compute output for each element
-    # This is a placeholder for actual BMM computation
-    # In a real implementation, you'd compute the matrix multiplication
-    # and then proceed with RMS norm, GELU, dropout, and subtraction
-    
-    # For now, we'll simulate the computation
-    # In a real implementation, you'd compute:
-    # result = torch.bmm(input1, input2)
-    # Then apply RMS norm, GELU, dropout, and subtract other
-    
-    # Placeholder computation
-    result = input1 * input2 - other
-    
-    # Apply RMS normalization
-    # This is a simplified version - in practice, you'd compute
-    # the RMS over the normalized_shape dimension
-    
-    # Apply GELU activation
-    gelu_result = 0.5 * result * (1 + tl.tanh(0.7978845608 * (result + 0.044715 * result * result * result)))
-    
-    # Apply dropout
-    if training:
-        # Generate random mask
-        rand = tl.random.rand(1)  # Simplified random generation
-        dropout_mask = rand > dropout_p
-        gelu_result = tl.where(dropout_mask, gelu_result / (1.0 - dropout_p), 0.0)
-    
-    # Store result
-    tl.store(out_ptr + offsets, gelu_result, mask=mask)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0)
+    mean = tl.sum(x * x, axis=0) / n
+    inv_std = tl.rsqrt(mean + eps)
+    y = x * inv_std * weight
+    tl.store(out_ptr + offsets, y, mask=mask)
 
-def fused_bmm_rmsnorm_gelu_dropout_sub(
-    input1, input2, other, normalized_shape, dropout_p=0.5, training=True, approximate='none', eps=1e-5, *, out=None
-):
-    # Validate inputs
-    assert input1.shape == (input1.shape[0], input1.shape[1], input2.shape[2]), "Input shapes are not compatible for BMM"
-    
-    B, N, M = input1.shape
-    _, _, P = input2.shape
-    
-    # Check if other is broadcastable to (B, N, P)
-    if other.shape != (B, N, P):
-        # Try to broadcast
-        try:
-            other = other.expand(B, N, P)
-        except RuntimeError:
-            raise ValueError("other tensor is not broadcastable to (B, N, P)")
-    
-    # Create output tensor
-    if out is None:
-        out = torch.empty_like(input1)
-    
-    # Flatten tensors for kernel execution
-    input1_flat = input1.view(-1)
-    input2_flat = input2.view(-1)
-    other_flat = other.view(-1)
-    out_flat = out.view(-1)
-    
-    # Compute total elements
-    n_elements = input1_flat.numel()
-    
-    # Define block size
-    BLOCK = 256
-    
-    # Launch kernel
-    grid = (triton.cdiv(n_elements, BLOCK),)
-    
-    # For simplicity, we'll use a single kernel approach
-    # In a real implementation, you'd want to separate the operations
-    # and use more efficient kernels for each step
-    
-    # This is a simplified implementation
-    # A full implementation would require:
-    # 1. BMM kernel
-    # 2. RMS normalization kernel
-    # 3. GELU kernel
-    # 4. Dropout kernel
-    # 5. Subtraction kernel
-    
-    # For now, we'll implement a simplified version that does all operations
-    # in one kernel for demonstration purposes
-    
-    # Compute BMM manually for demonstration
-    # In practice, you'd use a proper BMM kernel
-    
-    # Create intermediate tensor for BMM result
-    bmm_result = torch.empty(B, N, P, dtype=input1.dtype, device=input1.device)
-    
+@triton.jit
+def _gelu_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    # GELU approximation using tanh
+    y = 0.5 * x * (1.0 + tl.tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
+    tl.store(out_ptr + offsets, y, mask=mask)
+
+@triton.jit
+def _dropout_kernel(x_ptr, out_ptr, mask_ptr, n: tl.constexpr, dropout_p: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    # Generate random mask
+    rand = tl.random.rand(0)  # This is a placeholder for actual random generation
+    # In practice, you'd use a proper random number generator
+    # For now, we'll use a simple approach
+    keep_prob = 1.0 - dropout_p
+    # For simplicity, we'll assume a fixed pattern
+    # In real implementation, you'd generate proper random mask
+    # Here we'll just scale the values
+    y = x * keep_prob
+    tl.store(out_ptr + offsets, y, mask=mask)
+
+def fused_bmm_rmsnorm_gelu_dropout_sub(input1, input2, other, normalized_shape, dropout_p=0.5, training=True, approximate='none', eps=1e-5, *, out=None):
     # Perform batch matrix multiplication
-    for i in range(B):
-        bmm_result[i] = torch.mm(input1[i], input2[i])
+    bmm_out = torch.bmm(input1, input2)
     
-    # Apply RMS normalization
-    # Compute RMS over the last dimension
+    # Flatten for RMS normalization
+    batch_size, n, p = bmm_out.shape
+    flattened = bmm_out.view(-1, p)
+    
+    # Initialize weight tensor for RMS normalization
     if isinstance(normalized_shape, int):
         normalized_shape = [normalized_shape]
+    weight = torch.ones(normalized_shape, dtype=torch.float32, device=input1.device)
     
-    # Compute RMS normalization
-    # This is a simplified version
-    # In practice, you'd compute the mean of squares over the normalized_shape
-    # and then apply the normalization
+    # Apply RMS normalization
+    rmsnorm_out = torch.empty_like(flattened)
+    n_elements = flattened.numel()
+    block = 256
+    grid = (triton.cdiv(n_elements, block),)
     
-    # For simplicity, we'll compute RMS normalization manually
-    # This is not efficient but demonstrates the concept
+    # Apply RMS normalization
+    _rmsnorm_kernel[grid](flattened, weight, rmsnorm_out, n_elements, eps, BLOCK=block)
     
-    # Compute mean of squares for normalization
-    # We'll compute it over the last dimension P
-    mean_square = bmm_result.pow(2).mean(dim=-1, keepdim=True)
-    rms = (mean_square + eps).sqrt()
-    
-    # Normalize
-    normalized = bmm_result / rms
+    # Reshape back to original dimensions
+    rmsnorm_out = rmsnorm_out.view(batch_size, n, p)
     
     # Apply GELU activation
-    if approximate == 'none':
-        gelu_result = 0.5 * normalized * (1 + torch.tanh(0.7978845608 * (normalized + 0.044715 * normalized * normalized * normalized)))
-    elif approximate == 'tanh':
-        gelu_result = 0.5 * normalized * (1 + torch.tanh(torch.sqrt(torch.tensor(2.0 / torch.pi)) * (normalized + 0.044715 * normalized * normalized * normalized)))
+    gelu_out = torch.empty_like(rmsnorm_out)
+    n_elements = rmsnorm_out.numel()
+    block = 256
+    grid = (triton.cdiv(n_elements, block),)
+    
+    if approximate == 'tanh':
+        _gelu_kernel[grid](rmsnorm_out, gelu_out, n_elements, BLOCK=block)
     else:
-        raise ValueError("approximate must be 'none' or 'tanh'")
+        # Use standard GELU
+        gelu_out = torch.nn.functional.gelu(rmsnorm_out)
     
     # Apply dropout
-    if training:
-        dropout_mask = torch.rand_like(gelu_result) > dropout_p
-        gelu_result = gelu_result * dropout_mask / (1.0 - dropout_p)
+    if training and dropout_p > 0:
+        dropout_out = torch.empty_like(gelu_out)
+        n_elements = gelu_out.numel()
+        block = 256
+        grid = (triton.cdiv(n_elements, block),)
+        # For simplicity, we'll use PyTorch's dropout
+        dropout_out = torch.nn.functional.dropout(gelu_out, p=dropout_p, training=training)
+    else:
+        dropout_out = gelu_out
     
     # Subtract other tensor
-    result = gelu_result - other
+    result = dropout_out - other
     
-    # Copy result to output
-    out.copy_(result)
-    
-    return out
+    # Return result
+    return result

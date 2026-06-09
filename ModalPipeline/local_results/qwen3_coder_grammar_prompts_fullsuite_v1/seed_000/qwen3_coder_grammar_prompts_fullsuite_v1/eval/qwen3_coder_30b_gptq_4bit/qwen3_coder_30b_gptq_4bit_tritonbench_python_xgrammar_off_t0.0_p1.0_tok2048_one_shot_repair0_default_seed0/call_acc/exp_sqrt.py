@@ -13,7 +13,7 @@ def exp_sqrt_kernel(input_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr)
 
 def exp_sqrt(input, out=None) -> torch.Tensor:
     if out is None:
-        out = torch.empty_like(input, dtype=torch.float32)
+        out = torch.empty_like(input)
     
     n_elements = input.numel()
     BLOCK_SIZE = 1024

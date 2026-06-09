@@ -72,14 +72,19 @@ def tril_mm_and_scale(A: torch.Tensor, B: torch.Tensor, alpha: float, beta: floa
     # Calculate grid dimensions
     grid = (triton.cdiv(n, BLOCK), triton.cdiv(p, BLOCK))
     
+    # Get strides
+    stride_A_row, stride_A_col = A.stride(0), A.stride(1)
+    stride_B_row, stride_B_col = B.stride(0), B.stride(1)
+    stride_out_row, stride_out_col = out.stride(0), out.stride(1)
+    
     # Launch kernel
     _tril_mm_and_scale_kernel[grid](
         A, B, out,
         n, p,
         alpha, beta,
-        A.stride(0), A.stride(1),
-        B.stride(0), B.stride(1),
-        out.stride(0), out.stride(1),
+        stride_A_row, stride_A_col,
+        stride_B_row, stride_B_col,
+        stride_out_row, stride_out_col,
         BLOCK=BLOCK
     )
     

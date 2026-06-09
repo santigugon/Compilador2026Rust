@@ -26,9 +26,9 @@ def _grid_sample_kernel(
     out_c = out_idx % output_shape2
     
     # Load grid coordinates
-    grid_idx = out_h * grid_shape2 + out_w
+    grid_idx = out_h * output_shape2 + out_w
     grid_x = tl.load(grid_ptr + grid_idx, mask=mask, other=0.0)
-    grid_y = tl.load(grid_ptr + grid_idx + grid_shape0 * grid_shape1, mask=mask, other=0.0)
+    grid_y = tl.load(grid_ptr + grid_idx + output_shape0 * output_shape1 * output_shape2, mask=mask, other=0.0)
     
     # Normalize grid coordinates
     if align_corners:
@@ -43,24 +43,21 @@ def _grid_sample_kernel(
     y = tl.maximum(0.0, tl.minimum(y, input_shape2 - 1.0))
     
     # Handle padding modes
-    if padding_mode == "zeros":
-        # Check if coordinates are valid
-        valid = (x >= 0) & (x < input_shape3) & (y >= 0) & (y < input_shape2)
-        x = tl.where(valid, x, 0.0)
-        y = tl.where(valid, y, 0.0)
-    elif padding_mode == "border":
-        x = tl.clamp(x, 0.0, input_shape3 - 1.0)
-        y = tl.clamp(y, 0.0, input_shape2 - 1.0)
-    elif padding_mode == "reflection":
-        # Handle reflection padding
+    if padding_mode == 0:  # zeros
+        valid_mask = (grid_x >= -1.0) & (grid_x <= 1.0) & (grid_y >= -1.0) & (grid_y <= 1.0)
+        x = tl.where(valid_mask, x, 0.0)
+        y = tl.where(valid_mask, y, 0.0)
+    elif padding_mode == 1:  # border
+        x = tl.maximum(0.0, tl.minimum(x, input_shape3 - 1.0))
+        y = tl.maximum(0.0, tl.minimum(y, input_shape2 - 1.0))
+    elif padding_mode == 2:  # reflection
         x = tl.where(x < 0, -x, x)
         y = tl.where(y < 0, -y, y)
         x = tl.where(x >= input_shape3, 2 * input_shape3 - 2 - x, x)
         y = tl.where(y >= input_shape2, 2 * input_shape2 - 2 - y, y)
     
-    # Perform interpolation
-    if mode == "bilinear":
-        # Bilinear interpolation
+    # Bilinear interpolation
+    if mode == 0:  # bilinear
         x0 = tl.floor(x).to(tl.int32)
         y0 = tl.floor(y).to(tl.int32)
         x1 = x0 + 1
@@ -75,72 +72,100 @@ def _grid_sample_kernel(
         wy = y - y0
         
         # Load four corner values
-        val00 = tl.load(input_ptr + out_c * input_shape1 * input_shape2 + y0 * input_shape3 + x0, mask=mask, other=0.0)
-        val01 = tl.load(input_ptr + out_c * input_shape1 * input_shape2 + y0 * input_shape3 + x1, mask=mask, other=0.0)
-        val10 = tl.load(input_ptr + out_c * input_shape1 * input_shape2 + y1 * input_shape3 + x0, mask=mask, other=0.0)
-        val11 = tl.load(input_ptr + out_c * input_shape1 * input_shape2 + y1 * input_shape3 + x1, mask=mask, other=0.0)
+        val00 = tl.load(input_ptr + out_c + y0 * input_shape3 + x0 * input_shape1 * input_shape2, mask=mask, other=0.0)
+        val01 = tl.load(input_ptr + out_c + y0 * input_shape3 + x1 * input_shape1 * input_shape2, mask=mask, other=0.0)
+        val10 = tl.load(input_ptr + out_c + y1 * input_shape3 + x0 * input_shape1 * input_shape2, mask=mask, other=0.0)
+        val11 = tl.load(input_ptr + out_c + y1 * input_shape3 + x1 * input_shape1 * input_shape2, mask=mask, other=0.0)
         
         # Interpolate
         val0 = val00 * (1 - wx) + val01 * wx
         val1 = val10 * (1 - wx) + val11 * wx
         result = val0 * (1 - wy) + val1 * wy
-    else:  # mode == "nearest"
-        # Nearest neighbor interpolation
-        x_nearest = tl.round(x).to(tl.int32)
-        y_nearest = tl.round(y).to(tl.int32)
-        x_nearest = tl.clamp(x_nearest, 0, input_shape3 - 1)
-        y_nearest = tl.clamp(y_nearest, 0, input_shape2 - 1)
-        result = tl.load(input_ptr + out_c * input_shape1 * input_shape2 + y_nearest * input_shape3 + x_nearest, mask=mask, other=0.0)
+    else:  # nearest
+        x = tl.round(x).to(tl.int32)
+        y = tl.round(y).to(tl.int32)
+        x = tl.maximum(0, tl.minimum(x, input_shape3 - 1))
+        y = tl.maximum(0, tl.minimum(y, input_shape2 - 1))
+        result = tl.load(input_ptr + out_c + y * input_shape3 + x * input_shape1 * input_shape2, mask=mask, other=0.0)
     
     tl.store(output_ptr + offsets, result, mask=mask)
 
 def grid_sample(input, grid, mode='bilinear', padding_mode='zeros', align_corners=False):
-    # Validate inputs
-    if input.dim() not in [4, 5]:
-        raise ValueError("input must be 4D or 5D")
-    if grid.dim() != 4:
-        raise ValueError("grid must be 4D")
+    # Handle different padding modes
+    padding_mode_map = {'zeros': 0, 'border': 1, 'reflection': 2}
+    padding_mode_val = padding_mode_map.get(padding_mode, 0)
     
-    # Extract shapes
-    batch_size = input.shape[0]
-    channels = input.shape[1]
-    height = input.shape[2]
-    width = input.shape[3]
+    # Handle different modes
+    mode_map = {'bilinear': 0, 'nearest': 1}
+    mode_val = mode_map.get(mode, 0)
     
-    grid_batch_size = grid.shape[0]
-    grid_height = grid.shape[1]
-    grid_width = grid.shape[2]
+    # Get input and grid shapes
+    input_shape = input.shape
+    grid_shape = grid.shape
     
-    # Validate batch size matches
-    if batch_size != grid_batch_size:
-        raise ValueError("input and grid must have the same batch size")
+    # For 4D input (N, C, H, W) and 4D grid (N, H, W, 2)
+    if len(input_shape) == 4 and len(grid_shape) == 4:
+        N, C, H, W = input_shape
+        grid_N, grid_H, grid_W, grid_C = grid_shape
+        
+        # Output shape is (N, C, grid_H, grid_W)
+        output_shape = (N, C, grid_H, grid_W)
+        
+        # Create output tensor
+        output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+        
+        # Flatten for kernel processing
+        flat_output_size = N * C * grid_H * grid_W
+        block_size = 256
+        grid_size = triton.cdiv(flat_output_size, block_size)
+        
+        # Launch kernel
+        _grid_sample_kernel[grid_size](
+            input, grid, output,
+            N, C, H, W,
+            grid_N, grid_H, grid_W,
+            N, C, grid_H * grid_W,
+            mode_val,
+            padding_mode_val,
+            align_corners,
+            BLOCK_SIZE=block_size
+        )
+        
+        return output
     
-    # Create output tensor
-    output = torch.empty(batch_size, channels, grid_height, grid_width, device=input.device, dtype=input.dtype)
+    # For 5D input (N, C, D, H, W) and 5D grid (N, D, H, W, 3)
+    elif len(input_shape) == 5 and len(grid_shape) == 5:
+        N, C, D, H, W = input_shape
+        grid_N, grid_D, grid_H, grid_W, grid_C = grid_shape
+        
+        # Output shape is (N, C, grid_D, grid_H, grid_W)
+        output_shape = (N, C, grid_D, grid_H, grid_W)
+        
+        # Create output tensor
+        output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+        
+        # Flatten for kernel processing
+        flat_output_size = N * C * grid_D * grid_H * grid_W
+        block_size = 256
+        grid_size = triton.cdiv(flat_output_size, block_size)
+        
+        # Launch kernel
+        _grid_sample_kernel[grid_size](
+            input, grid, output,
+            N, C, D, H,
+            grid_N, grid_D, grid_H * grid_W,
+            N, C, grid_D * grid_H * grid_W,
+            mode_val,
+            padding_mode_val,
+            align_corners,
+            BLOCK_SIZE=block_size
+        )
+        
+        return output
     
-    # Flatten spatial dimensions for kernel
-    output_size = batch_size * channels * grid_height * grid_width
-    
-    # Launch kernel
-    block_size = 256
-    grid_size = triton.cdiv(output_size, block_size)
-    
-    # Prepare kernel arguments
-    input_ptr = input.data_ptr()
-    grid_ptr = grid.data_ptr()
-    output_ptr = output.data_ptr()
-    
-    # Call kernel
-    _grid_sample_kernel[grid_size](
-        input_ptr, grid_ptr, output_ptr,
-        batch_size, channels, height, width,
-        grid_batch_size, grid_height, grid_width,
-        batch_size, grid_height, grid_width,
-        mode,
-        padding_mode,
-        align_corners,
-        BLOCK_SIZE=block_size
-    )
-    
-    return output
+    else:
+        # Fall back to PyTorch for unsupported cases
+        return torch.nn.functional.grid_sample(
+            input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners
+        )
 ```

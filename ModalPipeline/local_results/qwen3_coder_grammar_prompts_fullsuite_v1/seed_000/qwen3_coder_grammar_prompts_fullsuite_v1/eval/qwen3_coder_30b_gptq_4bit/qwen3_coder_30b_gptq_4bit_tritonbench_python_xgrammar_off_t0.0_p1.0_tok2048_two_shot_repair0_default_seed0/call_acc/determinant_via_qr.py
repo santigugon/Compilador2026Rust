@@ -22,7 +22,7 @@ def _qr_decomposition_kernel(A_ptr, R_ptr, Q_ptr, n: tl.constexpr, BLOCK: tl.con
                 if i >= j:
                     tl.store(R_ptr + i * n + j, tl.load(A_ptr + i * n + j))
     
-    # Synchronize
+    # Synchronize all threads
     tl.sync()
     
     # Compute QR decomposition using Givens rotations
@@ -43,36 +43,52 @@ def _qr_decomposition_kernel(A_ptr, R_ptr, Q_ptr, n: tl.constexpr, BLOCK: tl.con
                 norm += val * val
             norm = tl.sqrt(norm)
         
-        # If norm is zero, skip
+        # Handle case where norm is zero
         if norm == 0.0:
             continue
             
-        # Compute Givens rotation
-        # We want to make R[k][k] = norm and R[k+1][k] = 0
-        # This is done by applying a rotation matrix
-        # For simplicity, we'll compute the rotation in a straightforward way
-        
-        # Compute cosine and sine
+        # Compute cosine and sine for Givens rotation
         c = tl.load(R_ptr + k * n + k) / norm
-        s = 0.0  # This will be computed properly in a more complex implementation
+        s = -norm / (norm + 1e-12)  # Avoid division by zero
         
-        # For now, we'll just compute the diagonal elements
-        # In a full implementation, we would update the entire matrix
-        # But for this simplified version, we'll just compute the diagonal elements
-        if k < n:
-            tl.store(R_ptr + k * n + k, norm)
+        # Apply Givens rotation to R
+        for j in range(k, n):
+            # Get current and next elements
+            a = tl.load(R_ptr + k * n + j)
+            b = tl.load(R_ptr + (k+1) * n + j)
+            
+            # Apply rotation
+            new_a = c * a - s * b
+            new_b = s * a + c * b
+            
+            # Store results
+            tl.store(R_ptr + k * n + j, new_a)
+            tl.store(R_ptr + (k+1) * n + j, new_b)
+        
+        # Apply Givens rotation to Q
+        for i in range(n):
+            # Get current and next elements
+            a = tl.load(Q_ptr + i * n + k)
+            b = tl.load(Q_ptr + i * n + (k+1))
+            
+            # Apply rotation
+            new_a = c * a - s * b
+            new_b = s * a + c * b
+            
+            # Store results
+            tl.store(Q_ptr + i * n + k, new_a)
+            tl.store(Q_ptr + i * n + (k+1), new_b)
 
 @triton.jit
-def _diagonal_product_kernel(R_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+def _determinant_kernel(R_ptr, det_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    product = 1.0
-    for i in range(n):
-        if i < n:
-            val = tl.load(R_ptr + i * n + i)
-            product *= val
-    tl.store(out_ptr, product)
+    if pid == 0:
+        # Compute determinant as product of diagonal elements
+        det = 1.0
+        for i in range(n):
+            diag_element = tl.load(R_ptr + i * n + i)
+            det *= diag_element
+        tl.store(det_ptr, det)
 
 def determinant_via_qr(A, *, mode='reduced', out=None):
     # Validate input
@@ -82,23 +98,62 @@ def determinant_via_qr(A, *, mode='reduced', out=None):
     if A.dim() != 2:
         raise ValueError("A must be a 2D tensor")
     
-    n = A.shape[0]
-    if A.shape[1] != n:
+    if A.size(0) != A.size(1):
         raise ValueError("A must be a square matrix")
     
-    # For small matrices, use PyTorch's built-in function
-    if n <= 4:
-        return torch.det(A)
+    n = A.size(0)
     
-    # For larger matrices, we'll implement a simplified version
-    # In a full implementation, we would:
-    # 1. Perform QR decomposition
-    # 2. Extract diagonal elements of R
-    # 3. Compute their product
+    # Create output tensor
+    if out is None:
+        out = torch.empty((), dtype=torch.float64, device=A.device)
+    else:
+        if out.shape != () or out.dtype != torch.float64:
+            raise ValueError("out must be a scalar tensor with dtype=torch.float64")
     
-    # For now, we'll use PyTorch's QR decomposition for correctness
-    # and just return the determinant
-    return torch.det(A)
+    # For small matrices, use direct computation
+    if n <= 2:
+        if n == 1:
+            return A[0, 0]
+        elif n == 2:
+            return A[0, 0] * A[1, 1] - A[0, 1] * A[1, 0]
+        else:
+            raise ValueError("Invalid matrix size")
+    
+    # For larger matrices, use QR decomposition
+    # Create Q and R matrices
+    Q = torch.eye(n, dtype=A.dtype, device=A.device)
+    R = A.clone().to(dtype=torch.float64)
+    
+    # Perform QR decomposition using Givens rotations
+    for k in range(n - 1):
+        # Compute Givens rotation
+        if abs(R[k, k]) < 1e-12:
+            continue
+            
+        # Compute cosine and sine
+        c = R[k, k] / (abs(R[k, k]) + 1e-12)
+        s = -R[k+1, k] / (abs(R[k+1, k]) + 1e-12)
+        
+        # Apply rotation to R
+        for j in range(k, n):
+            temp = R[k, j]
+            R[k, j] = c * temp - s * R[k+1, j]
+            R[k+1, j] = s * temp + c * R[k+1, j]
+        
+        # Apply rotation to Q
+        for i in range(n):
+            temp = Q[i, k]
+            Q[i, k] = c * temp - s * Q[i, k+1]
+            Q[i, k+1] = s * temp + c * Q[i, k+1]
+    
+    # Compute determinant as product of diagonal elements of R
+    det = 1.0
+    for i in range(n):
+        det *= R[i, i]
+    
+    # Store result
+    out.fill_(det)
+    return out
 
 ##################################################################################################################################################
 

@@ -7,175 +7,122 @@ import triton.language as tl
 def _bmm_dropout_gelu_kernel(
     input1_ptr, input2_ptr, out_ptr, 
     dropout_mask_ptr,
-    batch_size, n, m, p,
-    p_dropout: tl.constexpr,
-    training: tl.constexpr,
-    approximate: tl.constexpr,
+    batch_size, seq_len, hidden_dim, output_dim,
+    p, training, approximate,
     input1_stride_0, input1_stride_1, input1_stride_2,
     input2_stride_0, input2_stride_1, input2_stride_2,
     out_stride_0, out_stride_1, out_stride_2,
     dropout_mask_stride_0, dropout_mask_stride_1, dropout_mask_stride_2,
-    BLOCK_M: tl.constexpr, 
-    BLOCK_N: tl.constexpr, 
-    BLOCK_K: tl.constexpr
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
 ):
-    pid_batch = tl.program_id(0)
-    pid_m = tl.program_id(1)
-    pid_n = tl.program_id(2)
+    # Get the batch index
+    batch_idx = tl.program_id(0)
     
-    # Compute batch offset
-    batch_offset = pid_batch * n * m
+    # Get the sequence index
+    seq_idx = tl.program_id(1)
+    
+    # Get the output index
+    out_idx = tl.program_id(2)
+    
+    # Compute the starting positions for the matrices
+    input1_start = batch_idx * input1_stride_0 + seq_idx * input1_stride_1
+    input2_start = batch_idx * input2_stride_0 + out_idx * input2_stride_1
+    out_start = batch_idx * out_stride_0 + seq_idx * out_stride_1
     
     # Initialize accumulator
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     
-    # Loop over K dimension
-    for k in range(0, m, BLOCK_K):
-        # Load input1 slice
-        input1_block = tl.load(
-            input1_ptr + batch_offset + 
-            (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]) * input1_stride_1 + 
-            (k + tl.arange(0, BLOCK_K)[None, :]) * input1_stride_2,
-            mask=(pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None] < n) &
-                  (k + tl.arange(0, BLOCK_K)[None, :] < m),
+    # Loop over the K dimension
+    for k in range(0, hidden_dim, BLOCK_K):
+        # Load input1 and input2
+        input1 = tl.load(
+            input1_ptr + input1_start + k * input1_stride_2,
+            mask=(k + tl.arange(0, BLOCK_K)) < hidden_dim,
+            other=0.0
+        )
+        input2 = tl.load(
+            input2_ptr + input2_start + k * input2_stride_2,
+            mask=(k + tl.arange(0, BLOCK_K)) < hidden_dim,
             other=0.0
         )
         
-        # Load input2 slice
-        input2_block = tl.load(
-            input2_ptr + 
-            (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]) * input2_stride_1 + 
-            (k + tl.arange(0, BLOCK_K)[:, None]) * input2_stride_2,
-            mask=(pid_n * BLOCK_N + tl.arange(0, BLOCK_N)[None, :] < p) &
-                  (k + tl.arange(0, BLOCK_K)[:, None] < m),
-            other=0.0
-        )
-        
-        # Matrix multiplication
-        acc += tl.dot(input1_block, input2_block)
+        # Perform matrix multiplication
+        acc += tl.dot(input1, input2)
+    
+    # Store the result
+    out = acc
     
     # Apply dropout if training
     if training:
-        # Load dropout mask
+        # Generate dropout mask
         dropout_mask = tl.load(
-            dropout_mask_ptr + 
-            batch_offset + 
-            (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]) * dropout_mask_stride_1 + 
-            (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]) * dropout_mask_stride_2,
-            mask=(pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None] < n) &
-                  (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)[None, :] < p),
+            dropout_mask_ptr + batch_idx * dropout_mask_stride_0 + seq_idx * dropout_mask_stride_1,
+            mask=(tl.arange(0, BLOCK_N) < output_dim),
             other=0.0
         )
-        acc = acc * (1.0 / (1.0 - p_dropout)) * dropout_mask
-    else:
-        # No dropout in inference mode
-        pass
+        # Apply dropout
+        out = out * (1.0 - p) * dropout_mask
     
     # Apply GELU activation
     if approximate == 'tanh':
-        # GELU with tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-        sqrt_2_over_pi = 0.7978845608028654
-        x = acc
-        x_cubed = x * x * x
-        tanh_arg = sqrt_2_over_pi * (x + 0.044715 * x_cubed)
-        gelu = 0.5 * x * (1.0 + tl.tanh(tanh_arg))
+        # GELU with tanh approximation
+        out = 0.5 * out * (1.0 + tl.tanh(0.7978845608028654 * (out + 0.044715 * out * out * out)))
     else:
-        # Standard GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
-        x = acc
-        sqrt_2 = 1.4142135623730951
-        erf_arg = x / sqrt_2
-        # Approximate erf using polynomial
-        # erf(x) ≈ 1 - (a1*t + a2*t^2 + a3*t^3 + a4*t^4 + a5*t^5) * exp(-x^2)
-        t = 1.0 / (1.0 + 0.3275911 * tl.abs(erf_arg))
-        erf_approx = 1.0 - (
-            0.254829592 * t - 
-            0.284496736 * t * t + 
-            1.421413741 * t * t * t - 
-            1.453152027 * t * t * t * t + 
-            1.061405429 * t * t * t * t * t
-        ) * tl.exp(-erf_arg * erf_arg)
-        gelu = 0.5 * x * (1.0 + tl.where(erf_arg >= 0, erf_approx, -erf_approx))
+        # Standard GELU
+        out = 0.5 * out * (1.0 + tl.erf(out / tl.sqrt(2.0)))
     
-    # Store result
+    # Store the result
     tl.store(
-        out_ptr + 
-        batch_offset + 
-        (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]) * out_stride_1 + 
-        (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]) * out_stride_2,
-        gelu,
-        mask=(pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None] < n) &
-              (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)[None, :] < p)
+        out_ptr + out_start,
+        out,
+        mask=(tl.arange(0, BLOCK_N) < output_dim)
     )
 
 def fused_bmm_dropout_gelu(input1, input2, p=0.5, training=True, inplace=False, approximate='none', *, out=None):
-    # Validate inputs
+    # Check input dimensions
     assert input1.dim() == 3, "input1 must be a 3D tensor"
     assert input2.dim() == 3, "input2 must be a 3D tensor"
     assert input1.size(0) == input2.size(0), "Batch sizes must match"
-    assert input1.size(2) == input2.size(1), "Matrix dimensions must be compatible for multiplication"
+    assert input1.size(2) == input2.size(1), "Inner dimensions must match"
     
-    batch_size, n, m = input1.shape
-    _, _, p = input2.shape
+    # Get dimensions
+    batch_size, seq_len, hidden_dim = input1.shape
+    _, _, output_dim = input2.shape
     
     # Create output tensor
-    if out is not None:
-        assert out.shape == (batch_size, n, p), "Output tensor shape must match expected output shape"
-        output = out
+    if out is None:
+        out = torch.empty(batch_size, seq_len, output_dim, dtype=input1.dtype, device=input1.device)
     else:
-        output = torch.empty((batch_size, n, p), dtype=input1.dtype, device=input1.device)
+        assert out.shape == (batch_size, seq_len, output_dim), "Output tensor shape mismatch"
+        assert out.dtype == input1.dtype, "Output tensor dtype mismatch"
+        assert out.device == input1.device, "Output tensor device mismatch"
     
     # Create dropout mask if needed
     dropout_mask = None
     if training:
-        dropout_mask = torch.empty((batch_size, n, p), dtype=torch.float32, device=input1.device)
-        dropout_mask = torch.bernoulli(1.0 - p, dropout_mask)
-        dropout_mask = dropout_mask.to(input1.dtype)
+        dropout_mask = torch.rand(batch_size, seq_len, output_dim, dtype=torch.float32, device=input1.device)
+        dropout_mask = (dropout_mask > p).to(torch.float32)
     
     # Launch kernel
-    BLOCK_M = 16
-    BLOCK_N = 16
+    grid = (batch_size, seq_len, output_dim)
+    block = (1, 1, 1)
+    
+    # Define block sizes
+    BLOCK_M = 1
+    BLOCK_N = 1
     BLOCK_K = 32
-    
-    grid = (
-        batch_size,
-        triton.cdiv(n, BLOCK_M),
-        triton.cdiv(p, BLOCK_N)
-    )
-    
-    # Prepare strides
-    input1_stride_0, input1_stride_1, input1_stride_2 = input1.stride()
-    input2_stride_0, input2_stride_1, input2_stride_2 = input2.stride()
-    out_stride_0, out_stride_1, out_stride_2 = output.stride()
-    
-    if dropout_mask is not None:
-        dropout_mask_stride_0, dropout_mask_stride_1, dropout_mask_stride_2 = dropout_mask.stride()
-    else:
-        dropout_mask_stride_0 = dropout_mask_stride_1 = dropout_mask_stride_2 = 0
     
     # Launch kernel
     _bmm_dropout_gelu_kernel[grid](
-        input1, input2, output,
-        dropout_mask,
-        batch_size, n, m, p,
-        p_dropout=p,
-        training=training,
-        approximate=approximate,
-        input1_stride_0=input1_stride_0,
-        input1_stride_1=input1_stride_1,
-        input1_stride_2=input1_stride_2,
-        input2_stride_0=input2_stride_0,
-        input2_stride_1=input2_stride_1,
-        input2_stride_2=input2_stride_2,
-        out_stride_0=out_stride_0,
-        out_stride_1=out_stride_1,
-        out_stride_2=out_stride_2,
-        dropout_mask_stride_0=dropout_mask_stride_0,
-        dropout_mask_stride_1=dropout_mask_stride_1,
-        dropout_mask_stride_2=dropout_mask_stride_2,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K
+        input1, input2, out, dropout_mask,
+        batch_size, seq_len, hidden_dim, output_dim,
+        p, training, approximate,
+        input1.stride(0), input1.stride(1), input1.stride(2),
+        input2.stride(0), input2.stride(1), input2.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        dropout_mask.stride(0), dropout_mask.stride(1), dropout_mask.stride(2),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K
     )
     
-    return output
+    return out
 ```

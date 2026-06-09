@@ -7,7 +7,7 @@ from torch.nn import functional as F
 @triton.jit
 def _conv2d_add_kernel(
     input_ptr, weight_ptr, bias_ptr, other_ptr, output_ptr,
-    batch_size, in_channels, out_channels, iH, iW, oH, oW,
+    batch, in_channels, out_channels, iH, iW, oH, oW,
     kH, kW, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w,
     groups, alpha,
     input_batch_stride, input_channel_stride, input_h_stride, input_w_stride,
@@ -23,43 +23,49 @@ def _conv2d_add_kernel(
     h_id = (pid // oW) % oH
     w_id = pid % oW
     
-    if batch_id >= batch_size or channel_id >= out_channels or h_id >= oH or w_id >= oW:
+    if batch_id >= batch or channel_id >= out_channels or h_id >= oH or w_id >= oW:
         return
     
     # Initialize accumulator
     acc = tl.zeros((1,), dtype=tl.float32)
     
-    # Group convolution
+    # Group index
     group_id = channel_id // (out_channels // groups)
-    group_start = group_id * (in_channels // groups)
     
-    # Convolution computation
-    for kh in range(kH):
-        for kw in range(kW):
-            # Calculate input position
-            ih = h_id * stride_h - pad_h + kh * dilation_h
-            iw = w_id * stride_w - pad_w + kw * dilation_w
+    # Compute convolution
+    for g in range(groups):
+        if group_id != g:
+            continue
             
-            # Check bounds
-            if ih >= 0 and ih < iH and iw >= 0 and iw < iW:
-                for ic in range(in_channels // groups):
-                    input_idx = batch_id * input_batch_stride + (group_start + ic) * input_channel_stride + ih * input_h_stride + iw * input_w_stride
-                    weight_idx = channel_id * weight_batch_stride + ic * weight_channel_stride + kh * weight_h_stride + kw * weight_w_stride
+        for ih in range(kH):
+            for iw in range(kW):
+                # Calculate input indices
+                ih_in = h_id * stride_h - pad_h + ih * dilation_h
+                iw_in = w_id * stride_w - pad_w + iw * dilation_w
+                
+                # Check bounds
+                if ih_in >= 0 and ih_in < iH and iw_in >= 0 and iw_in < iW:
+                    # Calculate input and weight indices
+                    input_idx = batch_id * input_batch_stride + g * (in_channels // groups) * input_channel_stride + ih_in * input_h_stride + iw_in * input_w_stride
+                    weight_idx = channel_id * weight_batch_stride + g * (in_channels // groups) * weight_channel_stride + ih * weight_h_stride + iw * weight_w_stride
                     
-                    input_val = tl.load(input_ptr + input_idx, mask=True, other=0.0)
-                    weight_val = tl.load(weight_ptr + weight_idx, mask=True, other=0.0)
+                    # Load values
+                    input_val = tl.load(input_ptr + input_idx, mask=True)
+                    weight_val = tl.load(weight_ptr + weight_idx, mask=True)
+                    
+                    # Accumulate
                     acc += input_val * weight_val
     
     # Add bias if provided
     if bias_ptr is not None:
         bias_idx = channel_id * bias_stride
-        bias_val = tl.load(bias_ptr + bias_idx, mask=True, other=0.0)
+        bias_val = tl.load(bias_ptr + bias_idx, mask=True)
         acc += bias_val
     
     # Add other tensor or scalar
     if other_ptr is not None:
         other_idx = batch_id * other_batch_stride + channel_id * other_channel_stride + h_id * other_h_stride + w_id * other_w_stride
-        other_val = tl.load(other_ptr + other_idx, mask=True, other=0.0)
+        other_val = tl.load(other_ptr + other_idx, mask=True)
         acc += alpha * other_val
     else:
         # If other is a scalar, we need to handle it differently
@@ -73,43 +79,27 @@ def _conv2d_add_kernel(
 def conv2d_add(input, weight, bias=None, other=None, stride=1, padding=0, dilation=1, groups=1, alpha=1, out=None):
     # Handle scalar inputs
     if not torch.is_tensor(other):
-        other_scalar = other
-        other = None
-    else:
-        other_scalar = None
+        if other is not None:
+            other = torch.tensor(other, dtype=input.dtype, device=input.device)
+        alpha = float(alpha)
     
-    # Handle stride
+    # Handle stride, padding, dilation
     if isinstance(stride, int):
-        stride_h = stride_w = stride
-    else:
-        stride_h, stride_w = stride
-    
-    # Handle padding
-    if isinstance(padding, str):
-        if padding == 'valid':
-            pad_h = pad_w = 0
-        elif padding == 'same':
-            # For 'same' padding, we need to compute padding values
-            # This is a simplified version - in practice, you'd compute actual padding
-            pad_h = pad_w = 0
-        else:
-            raise ValueError("Padding must be 'valid', 'same', or an integer/tuple")
-    elif isinstance(padding, int):
-        pad_h = pad_w = padding
-    else:
-        pad_h, pad_w = padding
-    
-    # Handle dilation
+        stride = (stride, stride)
+    if isinstance(padding, int):
+        padding = (padding, padding)
     if isinstance(dilation, int):
-        dilation_h = dilation_w = dilation
-    else:
-        dilation_h, dilation_w = dilation
+        dilation = (dilation, dilation)
     
-    # Get input dimensions
-    batch_size, in_channels, iH, iW = input.shape
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    dilation_h, dilation_w = dilation
+    
+    # Get dimensions
+    batch, in_channels, iH, iW = input.shape
     out_channels, _, kH, kW = weight.shape
     
-    # Compute output dimensions
+    # Calculate output dimensions
     oH = (iH + 2 * pad_h - (dilation_h * (kH - 1) + 1)) // stride_h + 1
     oW = (iW + 2 * pad_w - (dilation_w * (kW - 1) + 1)) // stride_w + 1
     
@@ -117,7 +107,7 @@ def conv2d_add(input, weight, bias=None, other=None, stride=1, padding=0, dilati
     if out is not None:
         output = out
     else:
-        output = torch.empty((batch_size, out_channels, oH, oW), dtype=input.dtype, device=input.device)
+        output = torch.empty((batch, out_channels, oH, oW), dtype=input.dtype, device=input.device)
     
     # Handle bias
     if bias is not None:
@@ -137,27 +127,31 @@ def conv2d_add(input, weight, bias=None, other=None, stride=1, padding=0, dilati
     
     # Set up kernel launch parameters
     BLOCK_SIZE = 256
-    total_elements = batch_size * out_channels * oH * oW
-    grid_size = triton.cdiv(total_elements, BLOCK_SIZE)
+    total_elements = batch * out_channels * oH * oW
+    grid = (triton.cdiv(total_elements, BLOCK_SIZE),)
+    
+    # Get tensor pointers and strides
+    input_ptr = input.data_ptr()
+    weight_ptr = weight.data_ptr()
+    output_ptr = output.data_ptr()
+    
+    input_batch_stride, input_channel_stride, input_h_stride, input_w_stride = input.stride()
+    weight_batch_stride, weight_channel_stride, weight_h_stride, weight_w_stride = weight.stride()
+    output_batch_stride, output_channel_stride, output_h_stride, output_w_stride = output.stride()
     
     # Launch kernel
-    if total_elements > 0:
-        _conv2d_add_kernel[grid_size](
-            input.data_ptr(), weight.data_ptr(), bias_ptr, other_ptr, output.data_ptr(),
-            batch_size, in_channels, out_channels, iH, iW, oH, oW,
-            kH, kW, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w,
-            groups, alpha,
-            input.stride(0), input.stride(1), input.stride(2), input.stride(3),
-            weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
-            bias_stride,
-            other_batch_stride, other_channel_stride, other_h_stride, other_w_stride,
-            output.stride(0), output.stride(1), output.stride(2), output.stride(3),
-            BLOCK_SIZE
-        )
-    
-    # Handle scalar other
-    if other_scalar is not None:
-        output += alpha * other_scalar
+    _conv2d_add_kernel[grid](
+        input_ptr, weight_ptr, bias_ptr, other_ptr, output_ptr,
+        batch, in_channels, out_channels, iH, iW, oH, oW,
+        kH, kW, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w,
+        groups, alpha,
+        input_batch_stride, input_channel_stride, input_h_stride, input_w_stride,
+        weight_batch_stride, weight_channel_stride, weight_h_stride, weight_w_stride,
+        bias_stride,
+        other_batch_stride, other_channel_stride, other_h_stride, other_w_stride,
+        output_batch_stride, output_channel_stride, output_h_stride, output_w_stride,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
     
     return output
 ```

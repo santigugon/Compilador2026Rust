@@ -51,18 +51,15 @@ def fused_avg_pool2d_cosine_similarity(x1, x2, kernel_size, stride=None, padding
     
     # Apply 2D average pooling
     # We need to reshape to 2D for pooling
-    # Original shape: [n_samples, 1]
-    # After reshape: [n_samples, 1, 1, 1] for pooling
-    if stride is None:
-        stride = kernel_size
-    
-    # Create a 2D tensor for pooling
+    # Assuming we want to pool along the feature dimension
+    # Reshape to (batch, 1, 1, features) for pooling
+    batch_size = cosine_sim_reshaped.shape[0]
     pooled = torch.nn.functional.avg_pool2d(
-        cosine_sim_reshaped.unsqueeze(1),  # [n_samples, 1, 1, 1]
+        cosine_sim_reshaped.view(batch_size, 1, 1, -1),
         kernel_size=kernel_size,
         stride=stride,
         padding=padding
     )
     
-    # Return the result
-    return pooled.squeeze(1).squeeze(1)
+    # Reshape back to original dimensions
+    return pooled.view(batch_size, -1)

@@ -12,8 +12,8 @@ matrix:
   output_profiles:
     - tritonbench_python
   decoding_modes:
-    - xgrammar_on
     - xgrammar_off
+    - xgrammar_on
   sampling:
     - temperature: 0.0
       top_p: 1.0

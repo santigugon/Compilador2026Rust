@@ -10,7 +10,6 @@ def _fused_mv_sigmoid_sub_kernel(
     input_stride_0: tl.constexpr, input_stride_1: tl.constexpr,
     vec_stride: tl.constexpr,
     other_stride: tl.constexpr,
-    out_stride: tl.constexpr,
     BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
@@ -22,58 +21,50 @@ def _fused_mv_sigmoid_sub_kernel(
     # Initialize accumulator for matrix-vector multiplication
     acc = tl.zeros((1,), dtype=tl.float32)
     
-    # Perform matrix-vector multiplication for this row
+    # Compute dot product of row of input with vec
     for i in range(0, m, BLOCK_SIZE):
         vec_offsets = i + tl.arange(0, BLOCK_SIZE)
         input_offsets = row * input_stride_0 + vec_offsets * input_stride_1
-        other_offsets = vec_offsets * other_stride
+        mask = vec_offsets < m
         
-        # Load vector elements with mask
-        vec_vals = tl.load(vec_ptr + vec_offsets, mask=vec_offsets < m, other=0.0)
+        vec_vals = tl.load(vec_ptr + vec_offsets, mask=mask, other=0.0)
+        input_vals = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
         
-        # Load input elements with mask
-        input_vals = tl.load(input_ptr + input_offsets, mask=vec_offsets < m, other=0.0)
-        
-        # Accumulate dot product
         acc += tl.sum(input_vals * vec_vals)
     
-    # Compute sigmoid of the result
+    # Apply sigmoid activation
     sigmoid_val = 1.0 / (1.0 + tl.exp(-acc))
     
     # Load other value (could be scalar or tensor)
-    if other_ptr is not None:
-        other_val = tl.load(other_ptr + row * other_stride, mask=row < n, other=0.0)
-    else:
-        other_val = 0.0
+    other_val = tl.load(other_ptr, mask=True)
+    if alpha != 1.0:
+        other_val = alpha * other_val
     
-    # Apply alpha scaling and subtraction
-    result = sigmoid_val - alpha * other_val
+    # Compute final result: sigmoid - other_val
+    result = sigmoid_val - other_val
     
     # Store result
-    tl.store(out_ptr + row * out_stride, result, mask=row < n)
+    tl.store(out_ptr + row, result)
 
 def fused_mv_sigmoid_sub(input, vec, other, alpha=1, *, out=None):
     # Validate input shapes
-    n, m = input.shape
-    assert vec.shape == (m,), f"Vector shape {vec.shape} does not match expected (m,) where m={m}"
+    assert input.dim() == 2, "input must be a 2D tensor"
+    assert vec.dim() == 1, "vec must be a 1D tensor"
+    assert input.size(1) == vec.size(0), "input column count must match vec length"
     
-    # Create output tensor if not provided
-    if out is None:
-        out = torch.empty((n,), dtype=input.dtype, device=input.device)
-    else:
-        assert out.shape == (n,), f"Output shape {out.shape} does not match expected (n,)"
-        assert out.dtype == input.dtype, f"Output dtype {out.dtype} does not match input dtype {input.dtype}"
-        assert out.device == input.device, f"Output device {out.device} does not match input device {input.device}"
+    n, m = input.shape
+    out = torch.empty(n, dtype=input.dtype, device=input.device) if out is None else out
     
     # Handle scalar other
     if not torch.is_tensor(other):
         other = torch.tensor(other, dtype=input.dtype, device=input.device)
     
-    # Ensure other is broadcastable to (n,)
-    if other.shape == ():
-        other = other.expand((n,))
-    elif other.shape != (n,):
-        raise ValueError(f"Other shape {other.shape} is not broadcastable to (n,)")
+    # Ensure other is broadcastable to output shape
+    if other.numel() == 1:
+        # Scalar case - broadcast to output
+        pass
+    else:
+        assert other.numel() == n, "other tensor must be scalar or have same number of rows as input"
     
     # Launch kernel
     block_size = 256
@@ -82,19 +73,15 @@ def fused_mv_sigmoid_sub(input, vec, other, alpha=1, *, out=None):
     # Get strides
     input_stride_0, input_stride_1 = input.stride()
     vec_stride = vec.stride(0) if vec.numel() > 0 else 1
-    other_stride = other.stride(0) if other.numel() > 0 else 1
-    out_stride = out.stride(0) if out.numel() > 0 else 1
-    
-    # Handle case where other is a scalar (no pointer needed)
-    other_ptr = other.data_ptr() if other.numel() > 0 else None
+    other_stride = other.stride(0) if other.numel() > 1 else 1
     
     _fused_mv_sigmoid_sub_kernel[grid_size](
-        input.data_ptr(), vec.data_ptr(), other_ptr, out.data_ptr(),
-        n, m, alpha,
+        input, vec, other, out,
+        n, m,
+        alpha,
         input_stride_0, input_stride_1,
         vec_stride,
         other_stride,
-        out_stride,
         BLOCK_SIZE=block_size
     )
     

@@ -5,12 +5,12 @@ import triton.language as tl
 @triton.jit
 def _softplus_linear_kernel(
     input_ptr, weight_ptr, bias_ptr, output_ptr,
-    n_rows: tl.constexpr, n_cols: tl.constexpr, n_out: tl.constexpr,
-    beta: tl.constexpr, threshold: tl.constexpr,
-    input_stride_row: tl.constexpr, input_stride_col: tl.constexpr,
-    weight_stride_row: tl.constexpr, weight_stride_col: tl.constexpr,
-    bias_stride: tl.constexpr,
-    output_stride_row: tl.constexpr, output_stride_col: tl.constexpr,
+    n_rows, n_cols, out_features,
+    beta, threshold,
+    input_stride_0, input_stride_1,
+    weight_stride_0, weight_stride_1,
+    bias_stride_0,
+    output_stride_0, output_stride_1,
     BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
@@ -19,39 +19,40 @@ def _softplus_linear_kernel(
         return
     
     # Load input row
-    input_offsets = row * input_stride_row + tl.arange(0, BLOCK_SIZE)
-    input_block = tl.load(input_ptr + input_offsets, mask=input_offsets < n_rows * input_stride_row, other=0.0)
+    input_offsets = row * input_stride_0 + tl.arange(0, BLOCK_SIZE)
+    input_row = tl.load(input_ptr + input_offsets, mask=input_offsets < n_rows * input_stride_0, other=0.0)
     
     # Compute linear transformation: input @ weight.T + bias
-    output_offsets = row * output_stride_row + tl.arange(0, n_out)
-    output_block = tl.zeros((n_out,), dtype=tl.float32)
+    output_offsets = row * output_stride_0 + tl.arange(0, out_features)
+    output_row = tl.zeros((out_features,), dtype=tl.float32)
     
-    # Compute dot product with weight matrix
+    # Compute linear part
     for i in range(0, n_cols, BLOCK_SIZE):
-        weight_offsets = i + tl.arange(0, BLOCK_SIZE)
-        weight_mask = weight_offsets < n_cols
-        weight_block = tl.load(weight_ptr + i * weight_stride_col + tl.arange(0, n_out), mask=weight_mask, other=0.0)
-        input_val = tl.load(input_ptr + row * input_stride_row + i, mask=i < n_cols, other=0.0)
-        output_block += input_val * weight_block
+        # Load weight column
+        weight_offsets = tl.arange(0, BLOCK_SIZE) + i
+        weight_col = tl.load(weight_ptr + weight_offsets * weight_stride_1, mask=weight_offsets < n_cols, other=0.0)
+        
+        # Compute dot product
+        dot_product = tl.sum(input_row * weight_col)
+        output_row += dot_product
     
     # Add bias if provided
     if bias_ptr is not None:
-        bias_offsets = tl.arange(0, n_out)
-        bias_block = tl.load(bias_ptr + bias_offsets, mask=bias_offsets < n_out, other=0.0)
-        output_block += bias_block
+        bias_offsets = tl.arange(0, out_features)
+        bias = tl.load(bias_ptr + bias_offsets * bias_stride_0, mask=bias_offsets < out_features, other=0.0)
+        output_row += bias
     
     # Apply softplus activation
     # Softplus(x) = (1/beta) * log(1 + exp(beta * x))
     # For numerical stability, when x > threshold, we use x instead of softplus(x)
-    for i in range(n_out):
-        x = output_block[i]
-        if x > threshold:
-            output_block[i] = x
-        else:
-            output_block[i] = (1.0 / beta) * tl.log(1.0 + tl.exp(beta * x))
+    output_row = tl.where(
+        output_row > threshold,
+        output_row,
+        (1.0 / beta) * tl.log(1.0 + tl.exp(beta * output_row))
+    )
     
     # Store result
-    tl.store(output_ptr + output_offsets, output_block, mask=output_offsets < n_rows * output_stride_row)
+    tl.store(output_ptr + output_offsets, output_row, mask=output_offsets < n_rows * output_stride_0)
 
 def softplus_linear(input, weight, bias=None, beta=1, threshold=20):
     # Validate inputs
@@ -63,16 +64,13 @@ def softplus_linear(input, weight, bias=None, beta=1, threshold=20):
         raise ValueError("bias must be a 1D tensor or None")
     
     n_rows, n_cols = input.shape
-    n_out = weight.shape[0]
+    out_features = weight.shape[0]
     
-    if bias is not None and bias.shape[0] != n_out:
-        raise ValueError("bias must have the same number of elements as weight rows")
-    
-    if n_cols != weight.shape[1]:
-        raise ValueError("input columns must match weight columns")
+    if bias is not None and bias.shape[0] != out_features:
+        raise ValueError("bias must have the same number of elements as weight.shape[0]")
     
     # Create output tensor
-    output = torch.empty(n_rows, n_out, dtype=input.dtype, device=input.device)
+    output = torch.empty(n_rows, out_features, dtype=input.dtype, device=input.device)
     
     # Define block size
     BLOCK_SIZE = 256
@@ -80,25 +78,29 @@ def softplus_linear(input, weight, bias=None, beta=1, threshold=20):
     # Launch kernel
     grid = (triton.cdiv(n_rows, BLOCK_SIZE),)
     
-    # Get strides
-    input_stride_row, input_stride_col = input.stride()
-    weight_stride_row, weight_stride_col = weight.stride()
-    output_stride_row, output_stride_col = output.stride()
-    bias_stride = bias.stride()[0] if bias is not None else 0
+    # Prepare pointers and strides
+    input_ptr = input.data_ptr()
+    weight_ptr = weight.data_ptr()
+    bias_ptr = bias.data_ptr() if bias is not None else None
+    output_ptr = output.data_ptr()
     
-    # Handle bias being None
-    bias_ptr = bias if bias is not None else tl.tensor(0, dtype=tl.float32)
+    input_stride_0 = input.stride(0)
+    input_stride_1 = input.stride(1)
+    weight_stride_0 = weight.stride(0)
+    weight_stride_1 = weight.stride(1)
+    bias_stride_0 = bias.stride(0) if bias is not None else 0
+    output_stride_0 = output.stride(0)
+    output_stride_1 = output.stride(1)
     
-    # Launch kernel
     _softplus_linear_kernel[grid](
-        input, weight, bias, output,
-        n_rows, n_cols, n_out,
+        input_ptr, weight_ptr, bias_ptr, output_ptr,
+        n_rows, n_cols, out_features,
         beta, threshold,
-        input_stride_row, input_stride_col,
-        weight_stride_row, weight_stride_col,
-        bias_stride,
-        output_stride_row, output_stride_col,
-        BLOCK_SIZE
+        input_stride_0, input_stride_1,
+        weight_stride_0, weight_stride_1,
+        bias_stride_0,
+        output_stride_0, output_stride_1,
+        BLOCK_SIZE=BLOCK_SIZE
     )
     
     return output

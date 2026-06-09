@@ -27,7 +27,7 @@ def _var_kernel(x_ptr, mean_ptr, out_ptr, n: tl.constexpr, correction: tl.conste
 def std(input, dim=None, *, correction=1, keepdim=False, out=None):
     # Handle scalar input
     if input.dim() == 0:
-        return torch.tensor(0.0, dtype=input.dtype, device=input.device)
+        return torch.tensor(0.0, device=input.device, dtype=input.dtype)
     
     # Flatten input for easier processing
     input_flat = input.flatten()
@@ -35,59 +35,69 @@ def std(input, dim=None, *, correction=1, keepdim=False, out=None):
     
     # Handle case where we reduce over all dimensions
     if dim is None:
-        # Calculate mean first
-        mean_out = torch.empty(1, dtype=torch.float32, device=input.device)
+        # Calculate mean
+        mean_out = torch.empty(1, device=input.device, dtype=torch.float32)
         block = 256
         grid = (triton.cdiv(n, block),)
         _mean_kernel[grid](input_flat, mean_out, n, BLOCK=block)
         mean_val = mean_out.item()
         
         # Calculate variance
-        var_out = torch.empty(1, dtype=torch.float32, device=input.device)
+        var_out = torch.empty(1, device=input.device, dtype=torch.float32)
         _var_kernel[grid](input_flat, mean_out, var_out, n, correction, BLOCK=block)
         var_val = var_out.item()
         
         # Return standard deviation
-        result = torch.sqrt(torch.tensor(var_val, dtype=torch.float32))
+        result = torch.sqrt(torch.tensor(var_val, device=input.device, dtype=input.dtype))
+        
         if out is not None:
             out.copy_(result)
             return out
         return result
     
     # For specific dimensions, we need to handle the reduction properly
-    # This is a simplified implementation that works for the common case
+    # This is a simplified implementation that works for common cases
     # For more complex cases, we would need to implement proper dimension handling
     
     # Get the output shape
     if isinstance(dim, int):
-        dims = [dim]
-    elif isinstance(dim, tuple):
-        dims = list(dim)
-    else:
-        dims = []
+        dim = [dim]
     
-    # If no dimensions specified, reduce all
-    if not dims:
-        # Calculate mean
-        mean_out = torch.empty(1, dtype=torch.float32, device=input.device)
+    # Calculate output shape
+    output_shape = list(input.shape)
+    if dim is not None:
+        for d in sorted(dim, reverse=True):
+            if d < 0:
+                d = len(input.shape) + d
+            if d >= 0 and d < len(input.shape):
+                output_shape[d] = 1 if keepdim else 1
+    else:
+        # Reduce all dimensions
+        output_shape = [1] * len(input.shape) if keepdim else []
+    
+    # For simplicity, we'll use PyTorch's implementation for complex cases
+    # and only use Triton for the basic case of reducing all dimensions
+    if dim is None:
+        # Use Triton for all dimensions reduction
+        mean_out = torch.empty(1, device=input.device, dtype=torch.float32)
         block = 256
         grid = (triton.cdiv(n, block),)
         _mean_kernel[grid](input_flat, mean_out, n, BLOCK=block)
         mean_val = mean_out.item()
         
-        # Calculate variance
-        var_out = torch.empty(1, dtype=torch.float32, device=input.device)
+        # Calculate variance using Triton
+        var_out = torch.empty(1, device=input.device, dtype=torch.float32)
         _var_kernel[grid](input_flat, mean_out, var_out, n, correction, BLOCK=block)
         var_val = var_out.item()
         
         # Return standard deviation
-        result = torch.sqrt(torch.tensor(var_val, dtype=torch.float32))
+        result = torch.sqrt(torch.tensor(var_val, device=input.device, dtype=input.dtype))
+        
         if out is not None:
             out.copy_(result)
             return out
         return result
     
-    # For multi-dimensional reduction, we'll use PyTorch's implementation
-    # since it's more complex to implement in Triton
+    # For other cases, fall back to PyTorch
     return torch.std(input, dim=dim, correction=correction, keepdim=keepdim, out=out)
 ```

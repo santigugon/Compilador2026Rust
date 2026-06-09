@@ -9,62 +9,76 @@ def _tanh_linear_kernel(input_ptr, weight_ptr, bias_ptr, output_ptr,
     # Get the batch dimension
     batch_idx = tl.program_id(0)
     
-    # Load weight matrix (out_features x in_features)
-    weight_row = tl.load(weight_ptr + batch_idx * out_features * in_features + 
-                        tl.arange(0, out_features)[:, None] * in_features + 
-                        tl.arange(0, in_features)[None, :])
-    
-    # Load input (in_features)
-    input_row = tl.load(input_ptr + batch_idx * in_features + 
-                       tl.arange(0, in_features))
-    
-    # Compute linear transformation: input @ weight.T + bias
-    # Using tl.dot for matrix multiplication
-    linear_output = tl.dot(weight_row, input_row[None, :])
-    
-    # Add bias if provided
+    # Load bias if it exists
     if bias_ptr is not None:
-        bias = tl.load(bias_ptr + tl.arange(0, out_features))
-        linear_output = linear_output + bias[None, :]
+        bias = tl.load(bias_ptr + tl.arange(0, out_features), mask=tl.arange(0, out_features) < out_features)
+    else:
+        bias = tl.zeros((out_features,), dtype=tl.float32)
     
-    # Apply tanh activation
-    tanh_output = 2.0 / (1.0 + tl.exp(-2.0 * linear_output)) - 1.0
-    
-    # Store result
-    tl.store(output_ptr + batch_idx * out_features + tl.arange(0, out_features), 
-             tanh_output[0, :])
+    # Process each output feature
+    for i in range(0, out_features, BLOCK_SIZE):
+        # Create mask for output features
+        output_mask = (tl.arange(0, BLOCK_SIZE) + i) < out_features
+        
+        # Initialize output for this block
+        output_block = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        
+        # Compute linear transformation for this block of output features
+        for j in range(0, in_features, BLOCK_SIZE):
+            # Create mask for input features
+            input_mask = (tl.arange(0, BLOCK_SIZE) + j) < in_features
+            
+            # Load input values
+            input_vals = tl.load(input_ptr + batch_idx * in_features + tl.arange(0, BLOCK_SIZE) + j, 
+                               mask=input_mask, other=0.0)
+            
+            # Load weight values for this output feature
+            weight_vals = tl.load(weight_ptr + (tl.arange(0, BLOCK_SIZE) + i) * in_features + j, 
+                                mask=output_mask & input_mask, other=0.0)
+            
+            # Compute dot product
+            output_block += tl.sum(input_vals[None, :] * weight_vals[:, None], axis=1)
+        
+        # Add bias and apply tanh
+        output_block = output_block + bias[tl.arange(0, BLOCK_SIZE) + i]
+        output_block = 2.0 / (1.0 + tl.exp(-2.0 * output_block)) - 1.0
+        
+        # Store result
+        tl.store(output_ptr + batch_idx * out_features + tl.arange(0, BLOCK_SIZE) + i, 
+                output_block, mask=output_mask)
 
 def tanh_linear(input, weight, bias=None):
-    # Handle the case where input has multiple dimensions
-    input_shape = input.shape
-    batch_size = 1
-    for dim in input_shape[:-1]:
-        batch_size *= dim
-    in_features = input_shape[-1]
+    # Get dimensions
+    batch_shape = input.shape[:-1]
+    in_features = input.shape[-1]
     out_features = weight.shape[0]
     
-    # Reshape input to 2D for processing
-    input_2d = input.view(batch_size, in_features)
+    # Flatten input to 2D for processing
+    input_flat = input.view(-1, in_features)
+    batch_size = input_flat.shape[0]
     
     # Create output tensor
-    output = torch.empty(batch_size, out_features, device=input.device, dtype=input.dtype)
+    output = torch.empty(batch_size, out_features, dtype=input.dtype, device=input.device)
+    
+    # Handle bias
+    bias_ptr = bias.data_ptr() if bias is not None else None
     
     # Launch kernel
-    block_size = 256
-    grid_size = batch_size
+    BLOCK_SIZE = 32
+    grid = (batch_size,)
     
-    if bias is not None:
-        _tanh_linear_kernel[grid_size](
-            input_2d, weight, bias, output,
-            in_features, out_features, batch_size, block_size
-        )
-    else:
-        _tanh_linear_kernel[grid_size](
-            input_2d, weight, None, output,
-            in_features, out_features, batch_size, block_size
-        )
+    _tanh_linear_kernel[grid](
+        input_flat, 
+        weight, 
+        bias_ptr, 
+        output,
+        in_features,
+        out_features,
+        batch_size,
+        BLOCK_SIZE
+    )
     
-    # Reshape output back to original shape
-    output = output.view(*input_shape[:-1], out_features)
+    # Reshape output to match input shape
+    output = output.view(*batch_shape, out_features)
     
     return output

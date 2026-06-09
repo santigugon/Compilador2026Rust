@@ -9,7 +9,7 @@ def _quantize_kernel(x_ptr, scales_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.cons
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     scales = tl.load(scales_ptr + offsets, mask=mask, other=1.0)
-    # Quantize to int8: scale and clip to [-128, 127]
+    # Quantize to int8
     quantized = tl.clamp(tl.round(x / scales), -128.0, 127.0)
     tl.store(out_ptr + offsets, quantized, mask=mask)
 
@@ -20,7 +20,7 @@ def _dequantize_kernel(quantized_ptr, scales_ptr, out_ptr, n: tl.constexpr, BLOC
     mask = offsets < n
     quantized = tl.load(quantized_ptr + offsets, mask=mask, other=0.0)
     scales = tl.load(scales_ptr + offsets, mask=mask, other=1.0)
-    # Dequantize: scale back to float
+    # Dequantize to float
     dequantized = quantized * scales
     tl.store(out_ptr + offsets, dequantized, mask=mask)
 
@@ -30,14 +30,26 @@ def quantize_dynamic(model, qconfig_spec=None, inplace=False, mapping=None):
     # different module types, qconfig_spec, and mapping parameters
     
     if not inplace:
-        # Create a copy of the model for non-inplace operation
-        model = torch.nn.utils.rnn.pad_sequence([torch.tensor([])], batch_first=True).detach().clone().to(model.weight.device)
-        # This is a placeholder - actual implementation would require
-        # deep copying the model structure and replacing modules
-        return model
+        # Create a copy of the model
+        model = torch.nn.utils.rnn.pad_sequence([model], batch_first=True)[0]
     
-    # For inplace operation, we would modify the model in place
-    # This is a simplified version that just returns the model
-    # A full implementation would traverse the model and quantize appropriate modules
-    
+    # For demonstration purposes, we'll quantize all linear layers
+    # In a real implementation, this would be more sophisticated
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            # Get the weight tensor
+            weight = module.weight.data
+            # Compute scale factor (simple approach)
+            max_val = torch.max(torch.abs(weight))
+            scale = max_val / 127.0 if max_val > 0 else 1.0
+            
+            # Quantize the weight
+            quantized_weight = torch.round(weight / scale).to(torch.int8)
+            
+            # Store the scale
+            module.scale = scale
+            
+            # Update the weight
+            module.weight.data = quantized_weight
+            
     return model

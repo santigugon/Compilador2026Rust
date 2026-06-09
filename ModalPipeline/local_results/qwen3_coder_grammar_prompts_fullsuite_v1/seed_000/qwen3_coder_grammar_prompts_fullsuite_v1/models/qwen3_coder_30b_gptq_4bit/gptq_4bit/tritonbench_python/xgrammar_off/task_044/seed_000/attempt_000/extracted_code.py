@@ -71,8 +71,8 @@ def softplus_linear(input, weight, bias=None, beta=1, threshold=20):
     # Determine block size
     BLOCK_SIZE = 256
     
-    # Launch kernel
-    grid = (triton.cdiv(n_rows, BLOCK_SIZE),)
+    # Calculate grid size
+    grid = (n_rows,)
     
     # Prepare pointers
     input_ptr = input.data_ptr()

@@ -22,21 +22,17 @@ def _logspace_kernel(start_ptr, end_ptr, out_ptr, steps: tl.constexpr, base: tl.
     # Using log space: exp(log(base) * (start + i * (end - start) / (steps - 1)))
     
     # Compute the step size
-    if steps > 1:
-        step_size = (end_val - start_val) / (steps - 1)
-    else:
-        step_size = 0.0
+    step_size = (end_val - start_val) / (steps - 1.0)
     
-    # Compute indices
-    indices = start_val + offsets * step_size
+    # Compute the indices
+    indices = offsets.to(tl.float32) * step_size + start_val
     
     # Compute base^indices
-    # Using log space for numerical stability
     log_base = tl.log(base)
-    log_result = log_base * indices
-    result = tl.exp(log_result)
+    log_values = log_base * indices
+    values = tl.exp(log_values)
     
-    tl.store(out_ptr + offsets, result, mask=mask)
+    tl.store(out_ptr + offsets, values, mask=mask)
 
 def logspace(start, end, steps, base=10.0, *, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False):
     # Handle scalar inputs
@@ -45,21 +41,25 @@ def logspace(start, end, steps, base=10.0, *, out=None, dtype=None, layout=torch
     if not torch.is_tensor(end):
         end = torch.tensor(end, dtype=torch.get_default_dtype())
     
-    # Validate steps
-    if steps <= 0:
-        raise ValueError("steps must be positive")
+    # Handle device and dtype
+    if device is None:
+        device = torch.get_default_device()
+    if dtype is None:
+        dtype = torch.get_default_dtype()
     
-    # Determine output tensor
+    # Create output tensor
     if out is not None:
         result = out
     else:
-        # Create output tensor with appropriate dtype and device
-        if dtype is None:
-            dtype = torch.get_default_dtype()
         result = torch.empty(steps, dtype=dtype, device=device, layout=layout, requires_grad=requires_grad)
     
-    # Handle special case of 1 step
+    # Handle the case where steps is 0
+    if steps == 0:
+        return result
+    
+    # Handle the case where steps is 1
     if steps == 1:
+        # Just put base^start
         with torch.no_grad():
             result.fill_(torch.pow(base, start.item()))
         return result

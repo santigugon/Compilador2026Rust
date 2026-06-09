@@ -44,14 +44,14 @@ def div(input, other, *, rounding_mode=None, out=None):
     block = 256
     grid = (triton.cdiv(n, block),)
     
-    # Determine rounding mode
-    rounding_mode_enum = None
-    if rounding_mode is not None:
-        if rounding_mode not in ["trunc", "floor"]:
-            raise ValueError("rounding_mode must be None, 'trunc', or 'floor'")
-        rounding_mode_enum = rounding_mode
-    
     # Launch kernel
-    _div_kernel[grid](input, other, out, n, rounding_mode_enum, BLOCK=block)
+    _div_kernel[grid](
+        input, 
+        other, 
+        out, 
+        n, 
+        rounding_mode, 
+        BLOCK=block
+    )
     
     return out

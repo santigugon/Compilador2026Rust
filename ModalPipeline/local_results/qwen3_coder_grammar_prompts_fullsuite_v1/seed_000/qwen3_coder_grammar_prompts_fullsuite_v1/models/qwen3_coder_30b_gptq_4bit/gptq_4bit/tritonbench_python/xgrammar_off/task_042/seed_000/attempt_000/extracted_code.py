@@ -12,23 +12,20 @@ def _zeta_kernel(x_ptr, q_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     
     # Compute Hurwitz zeta function: sum_{n=0}^inf 1 / (n + q)^x
     # Using a simple iterative approach for demonstration
-    # In practice, more sophisticated algorithms would be used
-    result = tl.zeros([BLOCK], dtype=tl.float32)
+    # In practice, this would require more sophisticated numerical methods
+    # For now, we'll compute a few terms to demonstrate the concept
     
-    # For small x values, we can compute a few terms directly
-    # This is a simplified implementation for demonstration
-    # A full implementation would require more sophisticated numerical methods
-    for i in range(100):  # Limit iterations for stability
-        n_term = i + q
+    # Initialize result
+    result = tl.zeros((BLOCK,), dtype=tl.float32)
+    
+    # Compute first few terms (this is a simplified approximation)
+    # We'll compute terms for n = 0 to 9
+    for i in range(10):
+        n_val = i
+        denominator = (n_val + q) ** x
         # Avoid division by zero
-        n_term = tl.where(n_term == 0, 1.0, n_term)
-        term = tl.pow(n_term, -x)
-        result = result + term
-        # Early stopping condition
-        term_abs = tl.abs(term)
-        # Stop if term is very small
-        if tl.all(term_abs < 1e-10):
-            break
+        denominator = tl.where(denominator == 0, 1.0, denominator)
+        result += 1.0 / denominator
     
     tl.store(out_ptr + offsets, result, mask=mask)
 
@@ -47,7 +44,7 @@ def zeta(input, other, *, out=None):
     # Get total number of elements
     n = input.numel()
     
-    # Set block size
+    # Set block size and grid
     block = 256
     grid = (triton.cdiv(n, block),)
     

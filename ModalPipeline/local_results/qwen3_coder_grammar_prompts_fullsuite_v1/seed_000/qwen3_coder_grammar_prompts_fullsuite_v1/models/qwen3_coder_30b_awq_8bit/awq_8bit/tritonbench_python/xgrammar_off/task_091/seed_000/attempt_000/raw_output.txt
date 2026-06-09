@@ -2,6 +2,7 @@
 import torch
 import triton
 import triton.language as tl
+from typing import Tuple
 
 @triton.jit
 def _erfc_sqrt_kernel(x_ptr, erfc_ptr, sqrt_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
@@ -11,18 +12,14 @@ def _erfc_sqrt_kernel(x_ptr, erfc_ptr, sqrt_ptr, n: tl.constexpr, BLOCK: tl.cons
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     
     # Compute erfc(x) using the approximation: erfc(x) = 1 - erf(x)
-    # For numerical stability, we use the relationship with the error function
-    # erf(x) can be approximated using a series expansion or lookup tables
-    # Here we use a simple approximation for demonstration
-    # A more accurate implementation would use a proper erfc approximation
-    
-    # Approximation for erf(x) using rational function (simplified)
-    # This is a basic approximation; a more accurate version would use
-    # the full error function implementation
-    t = 1.0 / (1.0 + 0.5 * tl.abs(x))
-    erf_approx = 1.0 - t * tl.exp(-x * x - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))))
-    
-    # erfc(x) = 1 - erf(x)
+    # For simplicity, we'll use a standard approximation for erf
+    # erf(x) ≈ sign(x) * (1 - exp(-x^2 * (4/π + a*x^2)/(1 + a*x^2)))
+    # where a = 0.147
+    x_squared = x * x
+    a = 0.147
+    erf_approx = tl.where(x >= 0, 
+                         1.0 - tl.exp(-x_squared * (4.0 / 3.14159 + a * x_squared) / (1.0 + a * x_squared)),
+                         -1.0 + tl.exp(-x_squared * (4.0 / 3.14159 + a * x_squared) / (1.0 + a * x_squared)))
     erfc = 1.0 - erf_approx
     
     # Compute sqrt(x)
@@ -31,7 +28,7 @@ def _erfc_sqrt_kernel(x_ptr, erfc_ptr, sqrt_ptr, n: tl.constexpr, BLOCK: tl.cons
     tl.store(erfc_ptr + offsets, erfc, mask=mask)
     tl.store(sqrt_ptr + offsets, sqrt_val, mask=mask)
 
-def erfc_sqrt(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def erfc_sqrt(input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     out_erfc = torch.empty_like(input)
     out_sqrt = torch.empty_like(input)
     n = input.numel()

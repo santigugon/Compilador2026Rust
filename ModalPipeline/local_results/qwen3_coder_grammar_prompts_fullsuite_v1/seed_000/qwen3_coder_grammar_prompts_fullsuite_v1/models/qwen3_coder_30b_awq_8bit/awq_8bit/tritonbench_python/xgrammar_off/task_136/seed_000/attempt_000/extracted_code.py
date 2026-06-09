@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _softmax_kernel(x_ptr, out_ptr, stride_x, stride_out, dim_size: tl.constexpr, BLOCK: tl.constexpr):
+def _softmax_kernel(x_ptr, out_ptr, dim_size: tl.constexpr, stride_x, stride_out, BLOCK: tl.constexpr):
     # Get the program ID for the dimension we're processing
     pid = tl.program_id(0)
     
@@ -37,53 +37,63 @@ def softmax(input, dim, dtype=None):
     if dtype is not None:
         input = input.to(dtype)
     
-    # Create output tensor with same shape and dtype
+    # Get input shape and create output tensor
+    input_shape = input.shape
     out = torch.empty_like(input)
     
     # Get the size of the specified dimension
-    dim_size = input.shape[dim]
+    dim_size = input_shape[dim]
     
-    # Get the stride for the specified dimension
-    stride = input.stride(dim)
+    # Handle negative dimensions
+    if dim < 0:
+        dim = len(input_shape) + dim
     
-    # For small dimensions, use a simple approach
-    if dim_size <= 1024:
-        block = 256
-        grid = (triton.cdiv(dim_size, block),)
+    # Calculate total number of elements
+    total_elements = input.numel()
+    
+    # For softmax along a specific dimension, we need to process each slice
+    # along that dimension separately
+    
+    # Create a view of the input tensor with the specified dimension as the last dimension
+    # This makes it easier to process with a single kernel
+    if dim != len(input_shape) - 1:
+        # Permute the tensor so that the specified dimension becomes the last one
+        permute_dims = list(range(len(input_shape)))
+        permute_dims[dim], permute_dims[-1] = permute_dims[-1], permute_dims[dim]
+        input_permuted = input.permute(permute_dims)
+        out_permuted = out.permute(permute_dims)
+    else:
+        input_permuted = input
+        out_permuted = out
+    
+    # Get strides for the permuted tensor
+    input_strides = input_permuted.stride()
+    out_strides = out_permuted.stride()
+    
+    # Calculate the number of slices along the specified dimension
+    num_slices = total_elements // dim_size
+    
+    # Process each slice
+    block = 256
+    grid = (triton.cdiv(dim_size, block),)
+    
+    # For each slice, apply softmax to the last dimension
+    for i in range(num_slices):
+        # Calculate the starting offset for this slice
+        slice_start = i * dim_size
         
-        # Create a temporary tensor for the computation
-        temp_input = input.contiguous()
-        temp_out = out.contiguous()
-        
+        # Launch kernel for this slice
         _softmax_kernel[grid](
-            temp_input,
-            temp_out,
-            stride,
-            temp_out.stride(dim),
+            input_permuted.view(-1)[slice_start:slice_start + dim_size],
+            out_permuted.view(-1)[slice_start:slice_start + dim_size],
             dim_size,
+            input_strides[-1],
+            out_strides[-1],
             BLOCK=block
         )
-    else:
-        # For larger dimensions, we need to handle it differently
-        # This is a simplified approach that works for most cases
-        # For a more robust implementation, we'd need to handle
-        # multi-dimensional cases more carefully
-        
-        # Reshape to handle the softmax along the specified dimension
-        # We'll compute softmax along the last dimension for simplicity
-        # and then reshape back
-        input_flat = input.view(-1, dim_size)
-        out_flat = out.view(-1, dim_size)
-        
-        for i in range(input_flat.shape[0]):
-            # Compute softmax for each slice
-            slice_input = input_flat[i]
-            slice_out = out_flat[i]
-            
-            # Get max for numerical stability
-            max_val = slice_input.max()
-            exp_vals = (slice_input - max_val).exp()
-            sum_vals = exp_vals.sum()
-            slice_out.copy_(exp_vals / sum_vals)
+    
+    # Restore original shape if needed
+    if dim != len(input_shape) - 1:
+        out = out.permute(permute_dims)
     
     return out

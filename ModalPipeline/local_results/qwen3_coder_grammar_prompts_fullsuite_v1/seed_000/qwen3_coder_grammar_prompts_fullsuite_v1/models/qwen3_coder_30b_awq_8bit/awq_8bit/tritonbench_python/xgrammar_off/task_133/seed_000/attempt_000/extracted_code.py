@@ -13,17 +13,17 @@ def _ldl_factor_kernel(A_ptr, LD_ptr, pivots_ptr, n, batch_size,
     LD_base = LD_ptr + batch_idx * n * n
     pivots_base = pivots_ptr + batch_idx * n
     
-    # Initialize pivots
-    for i in range(n):
-        tl.store(pivots_base + i, i, mask=(i < n))
-    
-    # Copy A to LD
+    # Initialize LD with A
     for i in range(n):
         for j in range(n):
-            if j >= i:
+            if i <= j:
                 idx = i * n + j
-                val = tl.load(A_base + idx, mask=(i < n) & (j < n))
-                tl.store(LD_base + idx, val, mask=(i < n) & (j < n))
+                val = tl.load(A_base + idx)
+                tl.store(LD_base + idx, val)
+    
+    # Initialize pivots
+    for i in range(n):
+        tl.store(pivots_base + i, i)
     
     # LDL factorization
     for k in range(n):
@@ -37,7 +37,7 @@ def _ldl_factor_kernel(A_ptr, LD_ptr, pivots_ptr, n, batch_size,
                 max_val = val
                 pivot_idx = i
         
-        # Swap rows and columns if needed
+        # Swap rows/columns if needed
         if pivot_idx != k:
             # Swap rows
             for j in range(n):
@@ -58,84 +58,54 @@ def _ldl_factor_kernel(A_ptr, LD_ptr, pivots_ptr, n, batch_size,
         
         # Check for zero pivot
         pivot_val = tl.load(LD_base + k * n + k)
-        if tl.abs(pivot_val) < 1e-12:
-            # Set diagonal to zero for singular case
+        if abs(pivot_val) < 1e-12:
+            # Set diagonal to zero for zero pivot
             tl.store(LD_base + k * n + k, 0.0)
             continue
         
         # Compute column k
         for i in range(k + 1, n):
-            # Compute L[i,k]
-            if hermitian:
-                # For Hermitian matrices, use conjugate transpose
-                l_ik = tl.load(LD_base + i * n + k) / pivot_val
-                tl.store(LD_base + i * n + k, l_ik)
-                
-                # Update remaining elements
-                for j in range(k + 1, n):
-                    val = tl.load(LD_base + i * n + j) - l_ik * tl.conj(tl.load(LD_base + k * n + j))
-                    tl.store(LD_base + i * n + j, val)
-            else:
-                # For symmetric matrices, use transpose
-                l_ik = tl.load(LD_base + i * n + k) / pivot_val
-                tl.store(LD_base + i * n + k, l_ik)
-                
-                # Update remaining elements
-                for j in range(k + 1, n):
-                    val = tl.load(LD_base + i * n + j) - l_ik * tl.load(LD_base + k * n + j)
-                    tl.store(LD_base + i * n + j, val)
-        
-        # Store diagonal element in D
-        tl.store(LD_base + k * n + k, pivot_val)
+            # Compute L(i,k) = A(i,k) / A(k,k)
+            l_ik = tl.load(LD_base + i * n + k) / pivot_val
+            tl.store(LD_base + i * n + k, l_ik)
+            
+            # Update A(i,k+1:n) = A(i,k+1:n) - L(i,k) * A(k,k+1:n)
+            for j in range(k + 1, n):
+                val = tl.load(LD_base + i * n + j) - l_ik * tl.load(LD_base + k * n + j)
+                tl.store(LD_base + i * n + j, val)
 
 def linalg_ldl_factor(A, *, hermitian=False, out=None):
+    if A.dim() < 2:
+        raise ValueError("Input tensor must have at least 2 dimensions")
+    
+    n = A.shape[-1]
+    if A.shape[-2] != n:
+        raise ValueError("Input tensor must be square")
+    
+    batch_dims = A.shape[:-2]
+    batch_size = 1
+    for dim in batch_dims:
+        batch_size *= dim
+    
+    # Create output tensors
     if out is not None:
         LD, pivots = out
     else:
         LD = torch.empty_like(A)
-        pivots = torch.empty(A.shape[:-1], dtype=torch.int32, device=A.device)
+        pivots = torch.empty(batch_size * n, dtype=torch.int32, device=A.device)
     
-    # Handle batch dimensions
-    batch_dims = A.shape[:-2]
-    n = A.shape[-1]
-    
-    if len(batch_dims) == 0:
-        batch_size = 1
+    # Handle batched case
+    if batch_size > 1:
+        # For simplicity, we'll use a single kernel for all batches
+        # In practice, this would be more complex with proper batch handling
+        block = 16
+        grid = (batch_size, triton.cdiv(n, block))
+        _ldl_factor_kernel[grid](A, LD, pivots, n, batch_size, hermitian, BLOCK=block)
     else:
-        batch_size = 1
-        for dim in batch_dims:
-            batch_size *= dim
-    
-    # Launch kernel
-    grid = (batch_size, triton.cdiv(n, 16))
-    block = 16
-    
-    # For simplicity, we'll use PyTorch's implementation for now
-    # since LDL factorization is complex and requires careful handling
-    # of pivoting and numerical stability
-    if batch_size == 1:
         # Single matrix case
-        if A.dtype in [torch.complex64, torch.complex128]:
-            # For complex matrices, use torch.linalg.ldl_factor
-            LD_result, pivots_result = torch.linalg.ldl_factor(A, hermitian=hermitian)
-            LD.copy_(LD_result)
-            pivots.copy_(pivots_result)
-        else:
-            # For real matrices, use torch.linalg.ldl_factor
-            LD_result, pivots_result = torch.linalg.ldl_factor(A, hermitian=hermitian)
-            LD.copy_(LD_result)
-            pivots.copy_(pivots_result)
-    else:
-        # Batch case - process each matrix separately
-        for i in range(batch_size):
-            if A.dtype in [torch.complex64, torch.complex128]:
-                LD_result, pivots_result = torch.linalg.ldl_factor(A[i], hermitian=hermitian)
-                LD[i].copy_(LD_result)
-                pivots[i].copy_(pivots_result)
-            else:
-                LD_result, pivots_result = torch.linalg.ldl_factor(A[i], hermitian=hermitian)
-                LD[i].copy_(LD_result)
-                pivots[i].copy_(pivots_result)
+        block = 16
+        grid = (1, triton.cdiv(n, block))
+        _ldl_factor_kernel[grid](A, LD, pivots, n, 1, hermitian, BLOCK=block)
     
-    # Return named tuple (LD, pivots)
+    # Return as named tuple
     return (LD, pivots)

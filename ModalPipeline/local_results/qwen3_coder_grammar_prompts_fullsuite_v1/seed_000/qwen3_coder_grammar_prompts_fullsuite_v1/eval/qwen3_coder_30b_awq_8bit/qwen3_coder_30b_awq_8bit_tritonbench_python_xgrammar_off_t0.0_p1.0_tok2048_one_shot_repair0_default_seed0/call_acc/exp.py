@@ -15,13 +15,13 @@ def exp_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
 def exp(input, *, out=None):
     if out is None:
         out = torch.empty_like(input)
+    else:
+        assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
+        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input tensor"
     
     n_elements = input.numel()
-    block_size = 1024
-    num_blocks = (n_elements + block_size - 1) // block_size
-    
-    exp_kernel[(num_blocks,)](input, out, n_elements, BLOCK_SIZE=block_size)
-    
+    grid = (triton.cdiv(n_elements, 1024),)
+    exp_kernel[grid](input, out, n_elements, BLOCK_SIZE=1024)
     return out
 
 ##################################################################################################################################################

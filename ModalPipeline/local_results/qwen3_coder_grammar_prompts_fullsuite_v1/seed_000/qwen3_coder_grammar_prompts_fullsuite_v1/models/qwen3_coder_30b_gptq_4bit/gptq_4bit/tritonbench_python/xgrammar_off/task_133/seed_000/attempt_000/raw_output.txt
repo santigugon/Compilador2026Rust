@@ -18,52 +18,52 @@ def _ldl_factor_kernel(A_ptr, LD_ptr, pivots_ptr, n: tl.constexpr, batch_size: t
     # Process each column
     for k in range(n):
         # Load diagonal element
-        diag_offset = k * n + k
-        diag = tl.load(A_batch + diag_offset)
-        
-        # Store diagonal element in LD
-        tl.store(LD_batch + diag_offset, diag)
+        offset = k * n + k
+        if hermitian:
+            # For complex matrices, use conjugate transpose
+            diag_val = tl.load(A_batch + offset)
+        else:
+            diag_val = tl.load(A_batch + offset)
         
         # Check if diagonal element is zero
-        if diag == 0.0:
+        if diag_val == 0.0:
             # Set pivot to k+1 (1-indexed)
             tl.store(pivots_batch + k, k + 1)
-            # Continue with next column
-            continue
+            # Set diagonal to 1.0 for numerical stability
+            tl.store(A_batch + offset, 1.0)
+        else:
+            # Store pivot
+            tl.store(pivots_batch + k, k + 1)
             
-        # Compute L elements for column k
+        # Update remaining elements in column k
         for i in range(k + 1, n):
-            # Load element from A
+            # Load element
             a_ik = tl.load(A_batch + i * n + k)
             
-            # Compute L[i,k] = A[i,k] / A[k,k]
-            l_ik = a_ik / diag
+            # Compute l_ik = a_ik / a_kk
+            l_ik = a_ik / diag_val
             
-            # Store in LD
+            # Store in LD matrix (lower triangular part)
             tl.store(LD_batch + i * n + k, l_ik)
             
-            # Update remaining elements in row k and column k
+            # Update remaining elements in row k
             for j in range(k + 1, n):
-                # Update A[i,j] = A[i,j] - L[i,k] * A[k,j]
-                a_ij = tl.load(A_batch + i * n + j)
-                a_ij = a_ij - l_ik * tl.load(A_batch + k * n + j)
-                tl.store(A_batch + i * n + j, a_ij)
+                # Load element
+                a_kj = tl.load(A_batch + k * n + j)
                 
-        # Set pivot to k+1 (1-indexed)
-        tl.store(pivots_batch + k, k + 1)
+                # Update a_ij = a_ij - l_ik * a_kj
+                a_ij = tl.load(A_batch + i * n + j)
+                a_ij = a_ij - l_ik * a_kj
+                tl.store(A_batch + i * n + j, a_ij)
 
 def linalg_ldl_factor(A, *, hermitian=False, out=None):
     # Handle scalar input
-    if A.dim() < 2:
-        raise ValueError("Input tensor must have at least 2 dimensions")
+    if A.dim() == 0:
+        A = A.unsqueeze(0).unsqueeze(0)
     
     # Get batch dimensions and matrix size
     batch_dims = A.shape[:-2]
     n = A.shape[-1]
-    
-    # Check if matrix is square
-    if A.shape[-2] != n:
-        raise ValueError("Input matrix must be square")
     
     # Create output tensors
     if out is not None:
@@ -72,18 +72,68 @@ def linalg_ldl_factor(A, *, hermitian=False, out=None):
         LD = torch.empty_like(A)
         pivots = torch.empty(batch_dims + (n,), dtype=torch.int32, device=A.device)
     
+    # Copy input to output for processing
+    LD.copy_(A)
+    
     # Handle batched operations
     batch_size = 1
     for dim in batch_dims:
         batch_size *= dim
     
-    # Set up kernel parameters
-    BLOCK = 16
-    grid = (batch_size, triton.cdiv(n, BLOCK))
+    # For small matrices, use a simple approach
+    if n <= 32:
+        # Use a simple iterative approach for small matrices
+        for batch in range(batch_size):
+            # Get the current matrix
+            if batch_size > 1:
+                current_A = LD[batch]
+            else:
+                current_A = LD
+            
+            # Process each column
+            for k in range(n):
+                # Get diagonal element
+                diag_val = current_A[k, k]
+                
+                # Handle zero diagonal
+                if diag_val == 0.0:
+                    # Set pivot to k+1
+                    if out is not None:
+                        pivots[batch][k] = k + 1
+                    else:
+                        pivots[k] = k + 1
+                    # Set diagonal to 1.0 for numerical stability
+                    current_A[k, k] = 1.0
+                else:
+                    # Set pivot to k+1
+                    if out is not None:
+                        pivots[batch][k] = k + 1
+                    else:
+                        pivots[k] = k + 1
+                    
+                # Update remaining elements
+                for i in range(k + 1, n):
+                    # Compute l_ik
+                    l_ik = current_A[i, k] / diag_val
+                    
+                    # Store in LD matrix
+                    LD[batch][i, k] = l_ik
+                    
+                    # Update remaining elements
+                    for j in range(k + 1, n):
+                        current_A[i, j] = current_A[i, j] - l_ik * current_A[k, j]
     
-    # Launch kernel
-    _ldl_factor_kernel[grid](A, LD, pivots, n, batch_size, hermitian, BLOCK=BLOCK)
+    else:
+        # For larger matrices, use Triton kernel
+        BLOCK = 32
+        grid = (batch_size, triton.cdiv(n, BLOCK))
+        
+        # Create a temporary tensor for the computation
+        temp_A = LD.clone()
+        
+        # Launch kernel
+        _ldl_factor_kernel[grid](temp_A, LD, pivots, n, batch_size, hermitian, BLOCK=BLOCK)
     
-    # Return result as named tuple
+    # Return the result as a named tuple
     return (LD, pivots)
 ```

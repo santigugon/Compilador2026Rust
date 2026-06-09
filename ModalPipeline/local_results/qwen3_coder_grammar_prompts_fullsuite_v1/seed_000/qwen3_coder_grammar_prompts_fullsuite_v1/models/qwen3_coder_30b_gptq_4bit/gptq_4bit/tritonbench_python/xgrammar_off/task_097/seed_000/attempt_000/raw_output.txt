@@ -29,7 +29,7 @@ def bitwise_and(input, other, *, out=None):
     else:
         out = torch.empty_like(input)
     
-    # Get total number of elements
+    # Get the total number of elements
     n = input.numel()
     
     # Set block size and grid size

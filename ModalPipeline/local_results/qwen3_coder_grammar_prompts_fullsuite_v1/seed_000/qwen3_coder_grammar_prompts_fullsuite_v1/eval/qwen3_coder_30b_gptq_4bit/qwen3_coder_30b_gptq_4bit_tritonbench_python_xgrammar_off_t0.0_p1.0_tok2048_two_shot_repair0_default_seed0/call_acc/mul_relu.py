@@ -12,36 +12,37 @@ def _mul_relu_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, inplace: tl.constex
     result = x * y
     # Apply ReLU
     result = tl.maximum(result, 0.0)
-    if inplace:
-        tl.store(x_ptr + offsets, result, mask=mask)
-    else:
-        tl.store(out_ptr + offsets, result, mask=mask)
+    tl.store(out_ptr + offsets, result, mask=mask)
 
 def mul_relu(input, other, inplace=False, out=None):
-    if inplace and out is not None:
-        raise ValueError("Cannot specify both 'inplace' and 'out'")
-    
+    # Handle scalar other
     if not torch.is_tensor(other):
         other = torch.tensor(other, dtype=input.dtype, device=input.device)
     
-    # Expand other to match input shape for broadcasting
-    other = other.expand_as(input)
+    # Ensure other is broadcastable with input
+    if other.shape != input.shape:
+        # Use torch's broadcasting rules
+        other = other.expand_as(input)
     
-    if inplace:
-        out = input
-        n = input.numel()
-        block = 256
-        grid = (triton.cdiv(n, block),)
-        _mul_relu_kernel[grid](input, other, input, n, True, BLOCK=block)
-        return out
+    # Determine output tensor
+    if out is not None:
+        output = out
+    elif inplace:
+        output = input
     else:
-        if out is None:
-            out = torch.empty_like(input)
-        n = input.numel()
-        block = 256
-        grid = (triton.cdiv(n, block),)
-        _mul_relu_kernel[grid](input, other, out, n, False, BLOCK=block)
-        return out
+        output = torch.empty_like(input)
+    
+    # Get the total number of elements
+    n = input.numel()
+    
+    # Set up grid and block size
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    
+    # Launch kernel
+    _mul_relu_kernel[grid](input, other, output, n, inplace, BLOCK=block)
+    
+    return output
 
 ##################################################################################################################################################
 

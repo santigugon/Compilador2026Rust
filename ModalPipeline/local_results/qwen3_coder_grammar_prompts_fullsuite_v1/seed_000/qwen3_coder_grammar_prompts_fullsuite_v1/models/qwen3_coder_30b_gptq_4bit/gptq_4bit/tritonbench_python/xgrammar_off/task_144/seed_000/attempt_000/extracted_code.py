@@ -32,7 +32,7 @@ def _matrix_multiply_and_row_dot_kernel(
     c_tile = tl.load(C_ptr + (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)[:, None]) * p + 
                      (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)[None, :]))
     
-    # Apply alpha and beta
+    # Compute the final result
     result = alpha * acc + beta * c_tile
     
     # Store result
@@ -40,15 +40,21 @@ def _matrix_multiply_and_row_dot_kernel(
              (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)[None, :]), result)
 
 def matrix_multiply_and_row_dot(A: torch.Tensor, B: torch.Tensor, alpha: float, beta: float, C: torch.Tensor) -> torch.Tensor:
-    # Validate input dimensions
-    assert A.shape[1] == B.shape[0], "Incompatible dimensions for matrix multiplication"
-    assert A.shape[0] == C.shape[0] and B.shape[1] == C.shape[1], "Incompatible dimensions for C"
+    # Ensure inputs are contiguous
+    A = A.contiguous()
+    B = B.contiguous()
+    C = C.contiguous()
+    
+    # Get dimensions
+    n, m = A.shape
+    m2, p = B.shape
+    
+    # Check dimensions match
+    if m != m2:
+        raise ValueError("Matrix dimensions do not match for multiplication")
     
     # Create output tensor
     out = torch.empty_like(C)
-    
-    # Get dimensions
-    n, m, p = A.shape[0], A.shape[1], B.shape[1]
     
     # Define block sizes
     BLOCK_SIZE_M = 16

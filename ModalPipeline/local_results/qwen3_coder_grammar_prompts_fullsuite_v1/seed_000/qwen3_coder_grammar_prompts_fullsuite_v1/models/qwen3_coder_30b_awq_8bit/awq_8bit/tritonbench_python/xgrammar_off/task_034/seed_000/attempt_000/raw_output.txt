@@ -10,7 +10,9 @@ def _fused_embedding_add_tanh_kernel(
     other_ptr,
     out_ptr,
     n_indices: tl.constexpr,
-    embedding_dim: tl.constexpr,
+    weight_size_1: tl.constexpr,
+    other_shape_0: tl.constexpr,
+    other_shape_1: tl.constexpr,
     padding_idx: tl.constexpr,
     max_norm: tl.constexpr,
     norm_type: tl.constexpr,
@@ -26,38 +28,40 @@ def _fused_embedding_add_tanh_kernel(
     # Check for padding index
     if padding_idx >= 0:
         padding_mask = indices == padding_idx
-    else:
-        padding_mask = tl.zeros(BLOCK, dtype=tl.bool)
+        mask = mask & ~padding_mask
     
     # Embedding lookup
-    # Create a block of indices for embedding lookup
-    indices_expanded = indices[:, None]  # [BLOCK, 1]
+    # We need to handle the case where indices are out of bounds
+    indices = tl.where(indices < 0, indices + weight_size_1, indices)
+    indices = tl.clamp(indices, 0, weight_size_1 - 1)
     
-    # Load embedding vectors
-    weight_offsets = indices_expanded * embedding_dim + tl.arange(0, embedding_dim)[None, :]
-    weight_mask = (indices >= 0) & (indices < embedding_dim)  # Simple check for valid indices
+    # Create embedding indices
+    emb_offsets = indices * weight_size_1
     
-    # Load weight values
-    weight_values = tl.load(weight_ptr + weight_offsets, mask=weight_mask[:, None], other=0.0)
+    # Load embedding
+    emb = tl.load(weight_ptr + emb_offsets, mask=mask, other=0.0)
     
     # Load other tensor (broadcasting)
-    other_values = tl.load(other_ptr + offsets, mask=mask, other=0.0)
+    other_offsets = (offsets % other_shape_0) * other_shape_1
+    other = tl.load(other_ptr + other_offsets, mask=mask, other=0.0)
     
-    # Element-wise addition
-    result = weight_values + other_values[:, None]
+    # Add other tensor
+    result = emb + other
     
     # Apply tanh
     result = 2.0 / (1.0 + tl.exp(-2.0 * result)) - 1.0
     
     # Apply max_norm if specified
     if max_norm > 0:
-        norms = tl.sqrt(tl.sum(result * result, axis=1, keepdims=True))
-        scale = tl.where(norms > max_norm, max_norm / (norms + 1e-8), 1.0)
-        result = result * scale
+        if norm_type == 2.0:
+            norm = tl.sqrt(tl.sum(result * result, axis=0))
+        else:
+            norm = tl.pow(tl.sum(tl.pow(tl.abs(result), norm_type), axis=0), 1.0 / norm_type)
+        scale = max_norm / (norm + 1e-8)
+        result = tl.where(norm > max_norm, result * scale, result)
     
     # Store result
-    out_offsets = offsets[:, None] * embedding_dim + tl.arange(0, embedding_dim)[None, :]
-    tl.store(out_ptr + out_offsets, result, mask=mask[:, None])
+    tl.store(out_ptr + offsets, result, mask=mask)
 
 def fused_embedding_add_tanh(
     input_indices,
@@ -79,27 +83,31 @@ def fused_embedding_add_tanh(
     if max_norm is not None and not isinstance(max_norm, (int, float)):
         max_norm = float(max_norm)
     
-    # Validate inputs
-    if input_indices.dim() == 0:
-        input_indices = input_indices.unsqueeze(0)
+    # Handle scalar norm_type
+    if not isinstance(norm_type, (int, float)):
+        norm_type = float(norm_type)
     
     # Determine output shape
     input_shape = input_indices.shape
-    embedding_dim = weight.shape[1]
-    output_shape = input_shape + (embedding_dim,)
+    weight_shape = weight.shape
+    other_shape = other.shape
+    
+    # Compute output shape
+    # The output shape is the same as input_indices shape, but with the last dimension
+    # replaced by the embedding dimension
+    output_shape = input_shape + (weight_shape[1],)
     
     # Create output tensor
-    if out is not None:
+    if out is None:
+        out = torch.empty(output_shape, dtype=weight.dtype, device=weight.device)
+    else:
         if out.shape != output_shape:
             raise ValueError(f"Output tensor shape {out.shape} does not match expected shape {output_shape}")
-        out = out
-    else:
-        out = torch.empty(output_shape, dtype=weight.dtype, device=weight.device)
     
-    # Flatten indices for processing
+    # Flatten input indices for processing
     n_indices = input_indices.numel()
     
-    # Handle special case where there are no indices
+    # Handle special cases
     if n_indices == 0:
         return out
     
@@ -114,7 +122,9 @@ def fused_embedding_add_tanh(
         other,
         out,
         n_indices,
-        embedding_dim,
+        weight_shape[1],
+        other_shape[0],
+        other_shape[1],
         padding_idx if padding_idx is not None else -1,
         max_norm if max_norm is not None else 0.0,
         norm_type,

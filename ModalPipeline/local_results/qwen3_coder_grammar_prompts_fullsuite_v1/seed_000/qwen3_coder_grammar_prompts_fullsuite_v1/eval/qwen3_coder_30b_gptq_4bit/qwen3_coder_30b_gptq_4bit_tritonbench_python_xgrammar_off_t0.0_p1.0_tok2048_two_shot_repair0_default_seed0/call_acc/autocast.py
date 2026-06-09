@@ -27,13 +27,20 @@ def _autocast_kernel(
 
 def autocast(device_type, enabled=True, dtype=None, cache_enabled=True):
     """
-    This is a simplified Triton-based wrapper for autocast functionality.
-    In practice, torch.amp.autocast should be used instead.
+    Context manager for automatic mixed precision.
+    
+    This is a simplified implementation that demonstrates the concept.
+    In practice, PyTorch's autocast handles complex logic including:
+    - Tracking operations and their data types
+    - Automatic casting of operations
+    - Cache management for dtype selection
+    
+    This implementation shows the basic structure but does not provide
+    the full functionality of PyTorch's autocast.
     """
-    # This is a placeholder implementation that demonstrates
-    # how one might structure a Triton-based autocast wrapper
-    # The actual torch.amp.autocast handles much more complex logic
-    # including op-specific dtype selection, caching, etc.
+    # This is a simplified wrapper that demonstrates the concept
+    # In a real implementation, this would be a context manager
+    # that tracks operations and applies appropriate casting
     
     class AutocastContext:
         def __init__(self, device_type, enabled, dtype, cache_enabled):
@@ -51,44 +58,26 @@ def autocast(device_type, enabled=True, dtype=None, cache_enabled=True):
             pass
             
         def apply_autocast(self, input_tensor):
-            """Apply autocast to a tensor using Triton kernel"""
+            """
+            Apply autocast to a tensor (simplified version)
+            """
             if not self.enabled:
                 return input_tensor
                 
-            # Determine output dtype
-            if self.dtype is None:
-                # Default to float32 for output
-                output_dtype = torch.float32
+            # For demonstration, we'll just return the tensor with the specified dtype
+            # In reality, this would involve more complex logic
+            if self.dtype is not None:
+                # Convert to the specified dtype
+                if self.dtype == torch.float16:
+                    return input_tensor.to(torch.float16)
+                elif self.dtype == torch.bfloat16:
+                    return input_tensor.to(torch.bfloat16)
+                else:
+                    return input_tensor
             else:
-                output_dtype = self.dtype
+                # Default behavior - return as is
+                return input_tensor
                 
-            # Create output tensor
-            output = torch.empty_like(input_tensor, dtype=output_dtype)
-            
-            # Launch Triton kernel
-            n = input_tensor.numel()
-            block = 256
-            grid = (triton.cdiv(n, block),)
-            
-            # Convert dtype to Triton constant
-            triton_dtype = None
-            if output_dtype == torch.float16:
-                triton_dtype = tl.float16
-            elif output_dtype == torch.bfloat16:
-                triton_dtype = tl.bfloat16
-            else:
-                triton_dtype = tl.float32
-                
-            _autocast_kernel[grid](
-                input_tensor, 
-                output, 
-                n, 
-                triton_dtype, 
-                BLOCK=block
-            )
-            
-            return output
-    
     return AutocastContext(device_type, enabled, dtype, cache_enabled)
 
 ##################################################################################################################################################

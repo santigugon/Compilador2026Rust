@@ -21,7 +21,7 @@ def add(input, other, *, alpha=1, out=None):
     if out is None:
         out = torch.empty_like(input)
     else:
-        # Ensure out has the correct shape and dtype
+        # Ensure output has the right shape and dtype
         out = torch.empty_like(input, dtype=input.dtype)
     
     # Get total number of elements

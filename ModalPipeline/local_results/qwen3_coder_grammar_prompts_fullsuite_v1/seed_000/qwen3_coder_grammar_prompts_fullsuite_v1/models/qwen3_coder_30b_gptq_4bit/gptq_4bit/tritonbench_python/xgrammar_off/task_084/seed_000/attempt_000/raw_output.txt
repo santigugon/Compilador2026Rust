@@ -14,15 +14,17 @@ def _trunc_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(out_ptr + offsets, y, mask=mask)
 
 def trunc(input, *, out=None):
-    if out is not None:
-        raise NotImplementedError("out parameter is not supported")
+    if out is None:
+        out = torch.empty_like(input)
+    else:
+        assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
+        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input tensor"
     
-    # For integer inputs, return a copy
-    if input.dtype in [torch.int32, torch.int64, torch.int16, torch.int8, torch.uint8]:
-        return input.clone()
+    if input.is_integer():
+        # For integer inputs, return a copy
+        out.copy_(input)
+        return out
     
-    # For floating point inputs, apply truncation
-    out = torch.empty_like(input)
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)

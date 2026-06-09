@@ -16,17 +16,16 @@ def _symmetric_mm_and_abs_sum_kernel(
     # Compute the symmetric matrix multiplication part
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     
-    # Loop over the K dimension (m in this case)
     for k in range(0, m, BLOCK_N):
         # Load A block
         a_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         a_mask = a_offsets < n
         a_block = tl.load(a_ptr + a_offsets * m + k, mask=a_mask[:, None], other=0.0)
         
-        # Load A.T block (transpose)
-        a_t_offsets = k + tl.arange(0, BLOCK_N)
+        # Load A.T block
+        a_t_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         a_t_mask = a_t_offsets < m
-        a_t_block = tl.load(a_ptr + a_t_offsets + pid_n * BLOCK_N * m, mask=a_t_mask[None, :], other=0.0)
+        a_t_block = tl.load(a_ptr + k + a_t_offsets * m, mask=a_t_mask[None, :], other=0.0)
         
         # Compute dot product
         acc += tl.dot(a_block, a_t_block)
@@ -40,18 +39,11 @@ def _symmetric_mm_and_abs_sum_kernel(
     c_block = tl.load(c_ptr + c_offsets * m + pid_n * BLOCK_N, mask=c_mask[:, None], other=0.0)
     c_block *= beta
     
-    # Add to result
+    # Add to accumulator
     result = acc + c_block
     
-    # Store result back to C
-    tl.store(c_ptr + c_offsets * m + pid_n * BLOCK_N, result, mask=c_mask[:, None])
-    
-    # Compute sum of absolute values
-    abs_result = tl.abs(result)
-    sum_abs = tl.sum(abs_result)
-    
-    # Store the sum of absolute values
-    tl.store(out_ptr, sum_abs, mask=True)
+    # Store result
+    tl.store(out_ptr + c_offsets * m + pid_n * BLOCK_N, result, mask=c_mask[:, None])
 
 def symmetric_mm_and_abs_sum(A: torch.Tensor, C: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
     # Ensure inputs are contiguous
@@ -60,7 +52,7 @@ def symmetric_mm_and_abs_sum(A: torch.Tensor, C: torch.Tensor, alpha: float, bet
     
     n, m = A.shape
     
-    # Create output tensor for the sum of absolute values
+    # Create output tensor
     out = torch.empty(1, dtype=torch.float32, device=A.device)
     
     # Define block size
@@ -72,13 +64,17 @@ def symmetric_mm_and_abs_sum(A: torch.Tensor, C: torch.Tensor, alpha: float, bet
     grid_n = triton.cdiv(m, BLOCK_N)
     grid = (grid_m, grid_n)
     
+    # Allocate intermediate result tensor
+    result = torch.empty_like(C)
+    
     # Launch kernel
     _symmetric_mm_and_abs_sum_kernel[grid](
-        A, C, out,
+        A, C, result,
         n, m,
         alpha, beta,
         BLOCK_M, BLOCK_N
     )
     
-    return out
+    # Compute sum of absolute values
+    return torch.sum(torch.abs(result))
 ```

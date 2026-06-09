@@ -10,6 +10,7 @@ def _erf_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     
     # Coefficients for the approximation of erf
+    # Using the rational approximation from Abramowitz and Stegun
     a1 = 0.254829592
     a2 = -0.284496736
     a3 = 1.421413741
@@ -25,7 +26,7 @@ def _erf_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     t = 1.0 / (1.0 + p * x)
     y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * tl.exp(-x * x)
     
-    # Apply sign
+    # Apply the sign
     erf_x = sign * y
     
     tl.store(out_ptr + offsets, erf_x, mask=mask)

@@ -38,7 +38,7 @@ def _addmm_kernel(mat1_ptr, mat2_ptr, input_ptr, out_ptr,
         mat2 = tl.load(mat2_ptr + offs_k[:, None] * stride_mat2_n + 
                        offs_n[None, :] * stride_mat2_p, mask=mat2_mask, other=0.0)
         
-        # Matrix multiplication
+        # Compute partial dot product
         acc += tl.dot(mat1, mat2)
     
     # Compute output: alpha * (mat1 @ mat2) + beta * input
@@ -63,27 +63,25 @@ def addmm(input, mat1, mat2, *, beta=1, alpha=1, out=None):
     input = input.contiguous()
     
     # Get dimensions
-    m, k = mat1.shape
-    k2, p = mat2.shape
+    m, n = mat1.shape
+    _, p = mat2.shape
     
-    # Check dimensions
-    if k != k2:
-        raise ValueError(f"mat1 and mat2 cannot be multiplied: {m}x{k} and {k2}x{p}")
-    
-    # Check if input is broadcastable with output
+    # Check if input is broadcastable with (m, p)
     if input.shape != (m, p):
         # Try to broadcast input to (m, p)
         try:
             input = input.expand(m, p)
         except RuntimeError:
-            raise ValueError(f"input shape {input.shape} is not broadcastable to ({m}, {p})")
+            raise ValueError("input is not broadcastable with the result of mat1 @ mat2")
     
     # Create output tensor
     if out is None:
         out = torch.empty(m, p, dtype=mat1.dtype, device=mat1.device)
     else:
         if out.shape != (m, p):
-            raise ValueError(f"out tensor must have shape ({m}, {p}), got {out.shape}")
+            raise ValueError("out tensor must have shape (m, p)")
+        if out.dtype != mat1.dtype or out.device != mat1.device:
+            raise ValueError("out tensor must have the same dtype and device as mat1")
     
     # Launch kernel
     BLOCK_M = 16
@@ -94,24 +92,15 @@ def addmm(input, mat1, mat2, *, beta=1, alpha=1, out=None):
     grid_n = triton.cdiv(p, BLOCK_N)
     grid = (grid_m, grid_n)
     
-    # Get strides
-    stride_mat1_m, stride_mat1_k = mat1.stride()
-    stride_mat2_k, stride_mat2_p = mat2.stride()
-    stride_input_m, stride_input_p = input.stride()
-    stride_out_m, stride_out_p = out.stride()
-    
     _addmm_kernel[grid](
-        mat1_ptr=mat1.data_ptr(),
-        mat2_ptr=mat2.data_ptr(),
-        input_ptr=input.data_ptr(),
-        out_ptr=out.data_ptr(),
-        m=m, n=k, p=p,
-        stride_mat1_m=stride_mat1_m, stride_mat1_n=stride_mat1_k,
-        stride_mat2_n=stride_mat2_k, stride_mat2_p=stride_mat2_p,
-        stride_input_m=stride_input_m, stride_input_p=stride_input_p,
-        stride_out_m=stride_out_m, stride_out_p=stride_out_p,
-        beta=beta, alpha=alpha,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K
+        mat1, mat2, input, out,
+        m, n, p,
+        mat1.stride(0), mat1.stride(1),
+        mat2.stride(0), mat2.stride(1),
+        input.stride(0), input.stride(1),
+        out.stride(0), out.stride(1),
+        beta, alpha,
+        BLOCK_M, BLOCK_N, BLOCK_K
     )
     
     return out

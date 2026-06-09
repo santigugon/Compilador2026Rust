@@ -39,29 +39,32 @@ def fused_silu_layer_norm_conv2d(x, weight, conv_weight, conv_bias=None,
                                 conv_stride=1, conv_padding=0, conv_dilation=1, 
                                 conv_groups=1, ln_eps=1e-5):
     # Perform convolution
-    conv_out = torch.conv2d(x, conv_weight, conv_bias, conv_stride, 
-                           conv_padding, conv_dilation, conv_groups)
+    conv_out = torch.nn.functional.conv2d(x, conv_weight, conv_bias, 
+                                         conv_stride, conv_padding, 
+                                         conv_dilation, conv_groups)
     
     # Reshape for layer normalization (flatten spatial dimensions)
     batch_size, channels, height, width = conv_out.shape
     flattened = conv_out.view(batch_size, channels, -1)
     
     # Apply layer normalization
-    # For simplicity, we'll use PyTorch's layer norm since it's more complex to implement
-    # in Triton with proper broadcasting
-    normalized = torch.nn.functional.layer_norm(
-        flattened, (channels,), weight=weight, eps=ln_eps
-    )
+    # For layer normalization, we normalize along the channel dimension
+    # We'll compute mean and variance for each channel across spatial dimensions
+    mean = flattened.mean(dim=-1, keepdim=True)
+    var = flattened.var(dim=-1, keepdim=True, unbiased=False)
+    normalized = (flattened - mean) / torch.sqrt(var + ln_eps)
+    
+    # Scale by weight
+    normalized = normalized * weight.view(1, -1, 1)
     
     # Reshape back to original dimensions
     normalized = normalized.view(batch_size, channels, height, width)
     
-    # Apply SiLU activation using Triton kernel
-    out = torch.empty_like(normalized)
+    # Apply SiLU activation
     n = normalized.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
-    
+    out = torch.empty_like(normalized)
     _silu_kernel[grid](normalized, out, n, BLOCK=block)
     
     return out

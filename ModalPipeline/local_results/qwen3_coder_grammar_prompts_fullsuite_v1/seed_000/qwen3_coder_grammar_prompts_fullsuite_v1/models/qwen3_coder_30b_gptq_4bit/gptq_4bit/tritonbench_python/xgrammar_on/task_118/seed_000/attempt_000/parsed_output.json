@@ -1,0 +1,4 @@
+{
+  "instruction": "Solve the triangular system of linear equations Ax = b, where A is a triangular matrix, then add a scaled version of the vector y to the solution x. The operations are: 1. Solve the triangular system Ax = b using torch.linalg.solve_triangular with A as an upper triangular matrix. 2. Add the scaled vector alpha * y to the solution x.",
+  "predict": "import torch\nimport triton\nimport triton.language as tl\n\ndef solve_and_add_scaled_vector(A: torch.Tensor, b: torch.Tensor, y: torch.Tensor, alpha: float) -> torch.Tensor:\n    # Solve triangular system Ax = b\n    x = torch.linalg.solve_triangular(A, b, upper=True)\n    \n    # Add scaled vector alpha * y to solution x\n    out = x + alpha * y\n    \n    return out"
+}

@@ -20,22 +20,26 @@ def _quantize_kernel(
     scale = max_val / 127.0
     
     # Quantize to int8
-    quantized = tl.round(x / scale)
-    quantized = tl.clamp(quantized, -128, 127)
+    quantized = tl.cast(x / scale, tl.int8)
     
     # Store quantized values and scale
-    tl.store(output_ptr + offsets, quantized.to(tl.int8), mask=mask)
-    tl.store(scale_ptr + pid, scale, mask=pid < 1)
+    tl.store(output_ptr + offsets, quantized, mask=mask)
+    if pid == 0:
+        tl.store(scale_ptr, scale)
 
 def quantize_dynamic(model, qconfig_spec=None, inplace=False, mapping=None):
     # This is a simplified implementation for demonstration
     # In practice, this would involve more complex logic for
-    # actual dynamic quantization of modules
+    # actual quantization and module replacement
     
     if not inplace:
         # Create a copy of the model
         model = torch.nn.utils.prune.l1_unstructured(model, name="weight", amount=0.0)
     
     # For demonstration, we'll just return the model as-is
-    # A full implementation would traverse the model and quantize appropriate layers
+    # A full implementation would:
+    # 1. Identify modules to quantize based on qconfig_spec
+    # 2. Replace them with quantized versions
+    # 3. Apply the quantization process
+    
     return model

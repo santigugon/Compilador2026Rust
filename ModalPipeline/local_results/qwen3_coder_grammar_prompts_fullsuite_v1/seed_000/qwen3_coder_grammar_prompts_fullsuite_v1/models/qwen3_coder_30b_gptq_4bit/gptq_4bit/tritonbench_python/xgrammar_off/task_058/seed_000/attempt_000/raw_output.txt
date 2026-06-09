@@ -31,20 +31,21 @@ def logit(input, eps=None, *, out=None):
         assert out.shape == input.shape, "Output tensor must have the same shape as input"
         assert out.dtype == input.dtype, "Output tensor must have the same dtype as input"
     
-    # Handle case where eps is None and input is outside [0, 1]
+    # Handle case where eps is None
     if eps is None:
-        # Check for invalid values that would produce NaN
-        if (input < 0).any() or (input > 1).any():
-            # For this case, we let PyTorch handle the NaN behavior
-            return torch.logit(input, eps=eps, out=out)
+        # For eps=None, we let the function produce NaN for inputs outside [0, 1]
+        # This is handled naturally by the logit computation
+        pass
     
+    # Get number of elements
     n = input.numel()
+    
+    # Set block size
     block = 256
     grid = (triton.cdiv(n, block),)
     
-    # Convert eps to a constexpr if it's not None
-    eps_val = eps if eps is not None else 0.0
+    # Launch kernel
+    _logit_kernel[grid](input, out, n, eps, BLOCK=block)
     
-    _logit_kernel[grid](input, out, n, eps_val, BLOCK=block)
     return out
 ```

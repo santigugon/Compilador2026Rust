@@ -39,7 +39,7 @@ def trunc(input, *, out=None):
         input_ptr=input,
         output_ptr=out,
         n_elements=n_elements,
-        BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_SIZE=BLOCK_SIZE
     )
     
     return out

@@ -27,18 +27,10 @@ def _silu_batch_norm_kernel(
     mean_val = tl.load(running_mean_ptr + feature_id, mask=mask, other=0.0)
     var_val = tl.load(running_var_ptr + feature_id, mask=mask, other=0.0)
     
-    # Batch normalization
-    if training:
-        # For training, we compute the batch statistics
-        # This is a simplified version - in practice, you'd need to compute
-        # batch mean and variance, but for this kernel we assume the running stats
-        # are already updated
-        pass
-    
     # Normalize
     normalized = (input_vals - mean_val) / tl.sqrt(var_val + eps)
     
-    # Apply weight and bias if provided
+    # Apply scale and shift if provided
     if weight_ptr is not None and bias_ptr is not None:
         weight_vals = tl.load(weight_ptr + feature_id, mask=mask, other=0.0)
         bias_vals = tl.load(bias_ptr + feature_id, mask=mask, other=0.0)
@@ -53,61 +45,51 @@ def _silu_batch_norm_kernel(
 
 def silu_batch_norm(input, running_mean, running_var, weight=None, bias=None, training=False, momentum=0.1, eps=1e-5):
     # Handle scalar inputs
-    if not torch.is_tensor(input):
-        input = torch.tensor(input)
-    if not torch.is_tensor(running_mean):
-        running_mean = torch.tensor(running_mean)
-    if not torch.is_tensor(running_var):
-        running_var = torch.tensor(running_var)
-    if weight is not None and not torch.is_tensor(weight):
-        weight = torch.tensor(weight)
-    if bias is not None and not torch.is_tensor(bias):
-        bias = torch.tensor(bias)
-    
-    # Ensure input is 2D (batch_size, features)
-    original_shape = input.shape
-    if input.dim() == 1:
+    if input.dim() == 0:
         input = input.unsqueeze(0)
-    elif input.dim() > 2:
-        # Flatten all dimensions except the last one (features)
-        batch_size = input.numel() // input.shape[-1]
-        input = input.view(batch_size, -1)
     
-    batch_size = input.shape[0]
-    n_features = input.shape[1]
+    # Get dimensions
+    n_samples = input.shape[0]
+    n_features = input.shape[1] if input.dim() > 1 else 1
     
     # Create output tensor
-    output = torch.empty_like(input)
+    out = torch.empty_like(input)
     
-    # Determine block size
-    BLOCK = 256
-    grid = (triton.cdiv(n_features, BLOCK),)
+    # Handle case where input is 1D
+    if input.dim() == 1:
+        input = input.unsqueeze(0)
+        out = out.unsqueeze(0)
     
-    # Handle None weights and biases
-    weight_ptr = weight if weight is not None else None
-    bias_ptr = bias if bias is not None else None
+    # Set up kernel launch parameters
+    block = 256
+    grid = (triton.cdiv(n_features, block),)
+    
+    # Prepare pointers
+    input_ptr = input.data_ptr()
+    running_mean_ptr = running_mean.data_ptr()
+    running_var_ptr = running_var.data_ptr()
+    weight_ptr = weight.data_ptr() if weight is not None else None
+    bias_ptr = bias.data_ptr() if bias is not None else None
+    output_ptr = out.data_ptr()
     
     # Launch kernel
     _silu_batch_norm_kernel[grid](
-        input, 
-        running_mean, 
-        running_var, 
-        weight_ptr, 
+        input_ptr,
+        running_mean_ptr,
+        running_var_ptr,
+        weight_ptr,
         bias_ptr,
-        output,
+        output_ptr,
         n_features,
-        batch_size,
+        n_samples,
         training,
         momentum,
         eps,
-        BLOCK=BLOCK
+        BLOCK=block
     )
     
-    # Reshape output back to original shape
-    if len(original_shape) == 1:
-        output = output.squeeze(0)
-    elif len(original_shape) > 2:
-        output = output.view(original_shape)
-    
-    return output
+    # Return output with proper shape
+    if input.dim() == 1:
+        return out.squeeze(0)
+    return out
 ```

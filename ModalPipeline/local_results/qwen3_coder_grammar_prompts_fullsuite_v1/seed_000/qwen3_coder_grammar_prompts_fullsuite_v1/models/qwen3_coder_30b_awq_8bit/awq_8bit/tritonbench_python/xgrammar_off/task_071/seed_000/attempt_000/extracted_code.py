@@ -50,76 +50,58 @@ def _sgd_kernel(
     tl.store(param_ptr + offsets, new_param, mask=mask)
 
 def SGD(params, lr=1e-3, momentum=0, weight_decay=0, dampening=0, nesterov=False, maximize=False, foreach=None, differentiable=False, fused=None):
-    if foreach is not None or fused is not None:
-        # Fall back to PyTorch implementation for unsupported cases
-        return torch.optim.SGD(
-            params, 
-            lr=lr, 
-            momentum=momentum, 
-            weight_decay=weight_decay, 
-            dampening=dampening, 
-            nesterov=nesterov, 
-            maximize=maximize
-        ).step()
+    if foreach is not None and foreach:
+        raise NotImplementedError("foreach=True is not implemented in this Triton version")
     
+    if differentiable:
+        raise NotImplementedError("differentiable=True is not implemented in this Triton version")
+    
+    if fused is not None and fused:
+        raise NotImplementedError("fused=True is not implemented in this Triton version")
+    
+    # Handle single parameter case
     if not isinstance(params, (list, tuple)):
         params = [params]
     
-    # Initialize momentum buffers
-    momentum_buffers = []
-    for param in params:
-        if momentum != 0 and param.requires_grad:
-            momentum_buffers.append(torch.zeros_like(param, memory_format=torch.contiguous_format))
-        else:
-            momentum_buffers.append(None)
-    
     # Process each parameter
-    for param, momentum_buffer in zip(params, momentum_buffers):
-        if param.requires_grad:
-            # Create output tensor
-            out = torch.empty_like(param)
+    for param in params:
+        if param.grad is None:
+            continue
             
-            # Copy parameter to output
-            out.copy_(param)
-            
-            # Get parameter size
-            n = param.numel()
-            
-            # Launch kernel
-            block = 256
-            grid = (triton.cdiv(n, block),)
-            
-            if momentum_buffer is not None:
-                _sgd_kernel[grid](
-                    out, 
-                    param.grad, 
-                    momentum_buffer,
-                    lr,
-                    momentum,
-                    weight_decay,
-                    dampening,
-                    nesterov,
-                    maximize,
-                    n,
-                    BLOCK=block
-                )
-            else:
-                # No momentum case
-                _sgd_kernel[grid](
-                    out, 
-                    param.grad, 
-                    torch.empty(1, device=param.device, dtype=torch.float32),  # dummy momentum buffer
-                    lr,
-                    0.0,
-                    weight_decay,
-                    0.0,
-                    False,
-                    maximize,
-                    n,
-                    BLOCK=block
-                )
-            
-            # Update parameter
-            param.copy_(out)
+        # Create momentum buffer if needed
+        if momentum != 0:
+            if not hasattr(param, '_momentum_buffer'):
+                param._momentum_buffer = torch.zeros_like(param, dtype=torch.float32)
+            momentum_buffer = param._momentum_buffer
+        else:
+            momentum_buffer = None
+        
+        # Prepare tensors for Triton kernel
+        param_flat = param.view(-1)
+        grad_flat = param.grad.view(-1)
+        
+        if momentum_buffer is not None:
+            momentum_flat = momentum_buffer.view(-1)
+        else:
+            momentum_flat = None
+        
+        # Launch kernel
+        n = param_flat.numel()
+        block = 256
+        grid = (triton.cdiv(n, block),)
+        
+        _sgd_kernel[grid](
+            param_flat,
+            grad_flat,
+            momentum_flat,
+            lr,
+            momentum,
+            weight_decay,
+            dampening,
+            nesterov,
+            maximize,
+            n,
+            BLOCK=block
+        )
     
     return None

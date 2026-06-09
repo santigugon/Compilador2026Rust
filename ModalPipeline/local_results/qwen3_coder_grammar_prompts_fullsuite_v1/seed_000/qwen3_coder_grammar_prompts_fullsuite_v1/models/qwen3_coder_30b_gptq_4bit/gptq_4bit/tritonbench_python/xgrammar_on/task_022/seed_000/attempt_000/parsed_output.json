@@ -1,0 +1,4 @@
+{
+  "instruction": "Implement a Triton wrapper for log_softmax_linear that applies a linear transformation followed by log_softmax activation, ensuring numerical stability and efficiency.",
+  "predict": "import torch\nimport triton\nimport triton.language as tl\n\ndef log_softmax_linear(input, weight, bias=None, dim=-1, dtype=None):\n    if dtype is not None:\n        input = input.to(dtype)\n    \n    # Linear transformation\n    if bias is not None:\n        output = torch.addmm(bias, input, weight.t())\n    else:\n        output = torch.mm(input, weight.t())\n    \n    # Apply log_softmax\n    return torch.log_softmax(output, dim=dim)"
+}

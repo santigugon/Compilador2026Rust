@@ -9,16 +9,18 @@ def _gelu_kernel(x_ptr, out_ptr, n: tl.constexpr, approximate: tl.constexpr, BLO
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     
-    # GELU approximation
+    # GELU implementation
     if approximate == 'tanh':
         # GELU with tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
         x_cubed = x * x * x
         tanh_arg = 0.7978845608 * (x + 0.044715 * x_cubed)  # sqrt(2/pi) ≈ 0.7978845608
         gelu_x = 0.5 * x * (1.0 + tl.tanh(tanh_arg))
     else:
-        # Standard GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
-        erf_arg = x / 1.4142135623730951  # sqrt(2)
-        gelu_x = 0.5 * x * (1.0 + tl.erf(erf_arg))
+        # Standard GELU: x * Φ(x) where Φ is the CDF of the standard normal distribution
+        # Using approximation: x * 0.5 * (1 + tanh(sqrt(π/2) * (x + 0.044715 * x^3)))
+        x_cubed = x * x * x
+        tanh_arg = 1.702103772 * (x + 0.044715 * x_cubed)  # sqrt(π/2) ≈ 1.702103772
+        gelu_x = x * 0.5 * (1.0 + tl.tanh(tanh_arg))
     
     tl.store(out_ptr + offsets, gelu_x, mask=mask)
 
@@ -33,8 +35,7 @@ def gelu_std(input, dim=None, keepdim=False, correction=1, approximate='none', o
     # Launch GELU kernel
     block = 256
     grid = (triton.cdiv(n, block),)
-    approximate_val = 1 if approximate == 'tanh' else 0
-    _gelu_kernel[grid](input_flat, gelu_out, n, approximate_val, BLOCK=block)
+    _gelu_kernel[grid](input_flat, gelu_out, n, approximate == 'tanh', BLOCK=block)
     
     # Reshape to original shape
     gelu_out = gelu_out.view(input.shape)

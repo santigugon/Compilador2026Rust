@@ -18,13 +18,13 @@ def symmetric_mv_norm_kernel(
     
     # Initialize y with beta * y
     y = tl.load(y_ptr + offsets, mask=mask)
-    y = beta * y
+    y = y * beta
     
-    # Compute alpha * mv(A, x)
+    # Compute alpha * A @ x
     for i in range(n):
-        a_row = tl.load(A_ptr + i * n + offsets, mask=mask)
+        a_val = tl.load(A_ptr + i * n + offsets, mask=mask)
         x_val = tl.load(x_ptr + i)
-        y += alpha * a_row * x_val
+        y = y + alpha * a_val * x_val
     
     # Store result back to y
     tl.store(y_ptr + offsets, y, mask=mask)
@@ -48,9 +48,9 @@ def symmetric_matrix_vector_norm(A: torch.Tensor, x: torch.Tensor, alpha: float,
     y = torch.zeros_like(x)
     
     # Initialize y with beta * y
-    y = beta * y
+    y = y * beta
     
-    # Compute alpha * mv(A, x)
+    # Compute alpha * A @ x
     for i in range(n):
         y += alpha * A[i] * x[i]
     

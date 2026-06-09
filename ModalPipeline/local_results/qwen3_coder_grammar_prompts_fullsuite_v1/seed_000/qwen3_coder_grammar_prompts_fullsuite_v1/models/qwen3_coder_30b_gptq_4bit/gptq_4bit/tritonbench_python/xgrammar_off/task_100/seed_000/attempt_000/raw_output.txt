@@ -20,7 +20,7 @@ def _permute_copy_kernel(
     
     # Load input element
     input_offsets = offsets
-    input_indices = tl.zeros((BLOCK,), dtype=tl.int64)
+    input_indices = tl.zeros((BLOCK,), dtype=tl.int32)
     
     # Convert linear index to multi-dimensional indices
     temp = input_offsets
@@ -46,32 +46,32 @@ def permute_copy(input, dims):
         raise ValueError("dims must have the same length as input.shape")
     
     # Create output tensor with correct shape
-    output_shape = tuple(input.shape[i] for i in dims)
+    output_shape = [input.shape[i] for i in dims]
     out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
     
     # Calculate number of elements
     num_elements = input.numel()
     
     # Calculate strides for input and output
-    input_strides = input.stride()
-    output_strides = out.stride()
+    input_strides = list(input.stride())
+    output_strides = [out.stride(i) for i in range(len(out.shape))]
     
     # Create shape arrays
-    input_shape = input.shape
-    output_shape = out.shape
+    input_shape = list(input.shape)
+    output_shape = list(out.shape)
     
     # Launch kernel
     BLOCK = 256
     grid = (triton.cdiv(num_elements, BLOCK),)
     
-    # Create a temporary tensor to pass to kernel
-    input_ptr = input.data_ptr()
-    output_ptr = out.data_ptr()
+    # Create a temporary tensor for the kernel to work with
+    # We'll use a flattened view for the kernel
+    input_flat = input.view(-1)
+    output_flat = out.view(-1)
     
-    # Create a kernel that handles the permutation
     _permute_copy_kernel[grid](
-        input_ptr, 
-        output_ptr, 
+        input_flat, 
+        output_flat, 
         input_shape, 
         output_shape, 
         input_strides, 

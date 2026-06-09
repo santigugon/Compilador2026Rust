@@ -3,35 +3,36 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _mean_kernel(x_ptr, out_ptr, n_elements: tl.constexpr, n_rows: tl.constexpr, n_cols: tl.constexpr, BLOCK_SIZE: tl.constexpr):
-    row_id = tl.program_id(0)
-    if row_id >= n_rows:
-        return
+def _mean_kernel(x_ptr, out_ptr, n_elements, n_cols, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    col = tl.program_id(1)
     
-    # Initialize accumulator
-    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-    num_elements = 0
+    # Each program handles one row
+    row_start = pid * n_cols
+    row_end = tl.minimum(row_start + n_cols, n_elements)
     
-    # Process elements in chunks
-    for i in range(0, n_cols, BLOCK_SIZE):
-        offsets = row_id * n_cols + i + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < (row_id + 1) * n_cols
+    # Load data and compute sum
+    sum_val = 0.0
+    count = 0
+    for i in range(row_start, row_end, BLOCK):
+        offsets = i + tl.arange(0, BLOCK)
+        mask = offsets < row_end
         x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-        acc += x
-        num_elements += tl.sum(tl.where(mask, 1, 0))
+        sum_val += tl.sum(x)
+        count += tl.sum(mask.to(tl.float32))
     
-    # Compute mean for this row
-    mean_val = tl.sum(acc) / num_elements
+    # Compute mean
+    mean_val = sum_val / count
     
     # Store result
-    tl.store(out_ptr + row_id, mean_val)
+    tl.store(out_ptr + col, mean_val)
 
 def mean(input, dim, keepdim=False, dtype=None, out=None):
-    # Handle dtype casting if specified
+    # Handle dtype casting
     if dtype is not None:
         input = input.to(dtype)
     
-    # Handle scalar input case
+    # Handle scalar input
     if input.dim() == 0:
         if out is not None:
             out.copy_(input)
@@ -39,22 +40,24 @@ def mean(input, dim, keepdim=False, dtype=None, out=None):
     
     # Handle list/tuple of dimensions
     if isinstance(dim, (list, tuple)):
-        # For multiple dimensions, we need to flatten and then reduce
-        # This is a simplified approach - in practice, more complex handling needed
-        # For now, we'll handle single dimension case properly
-        if len(dim) == 1:
-            dim = dim[0]
-        else:
-            # For multiple dimensions, we'll reduce one by one or use torch
-            # This is a fallback to torch for complex cases
-            return torch.mean(input, dim, keepdim=keepdim, dtype=dtype, out=out)
+        # For multiple dimensions, we need to flatten and reduce
+        # This is a simplified approach - in practice, you'd want to handle this more carefully
+        # For now, we'll reduce one dimension at a time
+        input_ = input
+        for d in sorted(dim, reverse=True):
+            input_ = mean(input_, d, keepdim=True)
+        if not keepdim:
+            # Remove the dimensions that were reduced
+            for d in sorted(dim):
+                input_ = input_.squeeze(d)
+        return input_ if out is None else out.copy_(input_)
     
-    # Handle negative dimensions
+    # Handle single dimension
     if dim < 0:
         dim = input.dim() + dim
     
     # Special case: reduce all dimensions
-    if dim is None or dim == tuple(range(input.dim())):
+    if dim is None or dim == -1:
         if out is not None:
             out.copy_(input.mean())
         return input.mean()
@@ -78,22 +81,31 @@ def mean(input, dim, keepdim=False, dtype=None, out=None):
     else:
         out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
     
-    # Handle special case of 1D tensor
-    if input.dim() == 1:
-        if out.numel() == 1:
-            out.fill_(input.mean())
-        return out
-    
-    # Handle 2D case for efficient kernel
-    if input.dim() == 2 and dim == 1:
-        # Reduce along columns (dim=1)
-        n_rows, n_cols = input.shape
-        block_size = 256
-        grid_size = triton.cdiv(n_rows, block_size)
+    # Handle special case of reducing last dimension
+    if dim == input.dim() - 1:
+        # For the last dimension, we can use a simpler approach
+        n_elements = input.numel()
+        n_cols = input.shape[-1]
+        n_rows = n_elements // n_cols
         
-        # Launch kernel
-        _mean_kernel[grid_size](input, out, input.numel(), n_rows, n_cols, BLOCK_SIZE=block_size)
-        return out
+        if n_rows > 0:
+            block = 256
+            grid = (n_rows, 1)
+            _mean_kernel[grid](input, out, n_elements, n_cols, BLOCK=block)
+    else:
+        # For other dimensions, we need to handle the reduction more carefully
+        # This is a simplified implementation that works for the common case
+        # but may not handle all edge cases perfectly
+        if keepdim:
+            # Use torch for the general case when keepdim=True
+            result = input.mean(dim=dim, keepdim=True)
+        else:
+            result = input.mean(dim=dim, keepdim=False)
+        
+        if out is not None:
+            out.copy_(result)
+            return out
+        else:
+            return result
     
-    # For other cases, fall back to PyTorch
-    return torch.mean(input, dim, keepdim=keepdim, dtype=dtype, out=out)
+    return out

@@ -45,9 +45,8 @@ def sub(input, other, *, alpha=1, out=None):
     n = out.numel()
     
     # Launch kernel
-    if n > 0:
-        block = 256
-        grid = (triton.cdiv(n, block),)
-        _sub_kernel[grid](input, other, out, n, alpha, BLOCK=block)
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _sub_kernel[grid](input, other, out, n, alpha, BLOCK=block)
     
     return out

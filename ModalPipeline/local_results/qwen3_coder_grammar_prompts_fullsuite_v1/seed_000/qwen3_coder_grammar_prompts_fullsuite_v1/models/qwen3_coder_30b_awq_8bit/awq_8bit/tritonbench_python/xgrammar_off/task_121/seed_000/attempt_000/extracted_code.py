@@ -13,74 +13,93 @@ def _gelu_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr, approxima
         # Exact GELU: x * 0.5 * (1 + erf(x / sqrt(2)))
         sqrt_2 = 1.4142135623730951
         x_over_sqrt2 = x / sqrt_2
-        # erf approximation using Taylor series or standard library
-        # For simplicity, using torch's erf in the kernel (this is a limitation of Triton)
-        # We'll compute it directly using the approximation
+        # erf approximation using Taylor series or lookup table
+        # Using a simple approximation for erf
         # erf(x) ≈ sign(x) * (1 - exp(-x^2 * (4/π + a*x^2)/(1 + a*x^2)))
         a = 0.147
         x2 = x_over_sqrt2 * x_over_sqrt2
-        erf_approx = tl.sign(x_over_sqrt2) * (1.0 - tl.exp(-x2 * (4.0 / 3.141592653589793 + a * x2) / (1.0 + a * x2)))
-        gelu = x * 0.5 * (1.0 + erf_approx)
+        erf_approx = tl.where(x >= 0, 
+                             1.0 - tl.exp(-x2 * (4.0/3.14159 + a*x2)/(1.0 + a*x2)),
+                             -1.0 + tl.exp(-x2 * (4.0/3.14159 + a*x2)/(1.0 + a*x2)))
+        y = x * 0.5 * (1.0 + erf_approx)
     else:  # approximate == 'tanh'
         # Approximate GELU using tanh: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
         sqrt_2_over_pi = 0.7978845608028654  # sqrt(2/pi)
         x3 = x * x * x
         tanh_arg = sqrt_2_over_pi * (x + 0.044715 * x3)
         tanh_val = 2.0 / (1.0 + tl.exp(-2.0 * tanh_arg)) - 1.0
-        gelu = 0.5 * x * (1.0 + tanh_val)
+        y = 0.5 * x * (1.0 + tanh_val)
     
-    tl.store(out_ptr + offsets, gelu, mask=mask)
+    tl.store(out_ptr + offsets, y, mask=mask)
 
 @triton.jit
-def _min_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr, keepdim: tl.constexpr, dim_size: tl.constexpr):
-    # This is a simplified version - in practice, reduction kernels are more complex
-    # For this implementation, we'll use a simple approach that works for the basic case
+def _min_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr, stride: tl.constexpr):
     pid = tl.program_id(0)
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=float('inf'))
     
-    # Simple reduction - in practice, this would be a proper reduction kernel
-    # For now, we'll compute the minimum in a simple way
-    # This is a placeholder - a full reduction kernel would be more complex
+    # Simple reduction to find minimum
+    # This is a simplified version - in practice, you'd want a proper reduction kernel
+    # For now, we'll use a simple approach that works for small tensors
     min_val = tl.min(x)
-    if keepdim:
-        tl.store(out_ptr, min_val)
-    else:
-        # For simplicity, we'll just store the first element
-        tl.store(out_ptr + 0, min_val)
+    tl.store(out_ptr, min_val, mask=tl.arange(0, 1) < 1)
 
 def min_gelu(input, dim=None, keepdim=False, approximate='none', out=None):
-    # Handle scalar input
-    if input.dim() == 0:
-        input = input.unsqueeze(0)
+    # Handle the case where we need to compute GELU first
+    if input.numel() == 0:
+        if out is not None:
+            return out
+        else:
+            if dim is None:
+                return torch.tensor(float('inf'), dtype=input.dtype, device=input.device)
+            else:
+                shape = list(input.shape)
+                if keepdim:
+                    shape[dim] = 1
+                else:
+                    shape.pop(dim)
+                return torch.tensor(float('inf'), dtype=input.dtype, device=input.device).expand(shape)
     
     # Compute GELU
     gelu_input = input
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    if approximate not in ['none', 'tanh']:
+        raise ValueError("approximate must be 'none' or 'tanh'")
     
     # Create output tensor for GELU
     gelu_out = torch.empty_like(input)
     
-    # Determine approximate method
-    approx_method = 'none' if approximate == 'none' else 'tanh'
+    # Launch GELU kernel
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _gelu_kernel[grid](gelu_input, gelu_out, n, BLOCK=block, approximate=approximate)
     
-    _gelu_kernel[grid](gelu_input, gelu_out, n, BLOCK=block, approximate=approx_method)
-    
-    # Handle reduction
+    # Now compute min
     if dim is None:
-        # Reduce all elements
-        result = torch.min(gelu_out)
+        # Reduce all dimensions
         if out is not None:
-            out.copy_(result)
+            # Use the provided output tensor
+            if out.numel() != 1:
+                raise ValueError("Output tensor must have exactly one element for global min")
+            # Compute min of all elements
+            min_val = torch.min(gelu_out)
+            out.fill_(min_val)
             return out
-        return result
+        else:
+            # Return scalar result
+            return torch.min(gelu_out)
     else:
         # Reduce along specified dimension
-        result = torch.min(gelu_out, dim=dim, keepdim=keepdim)
         if out is not None:
-            out.copy_(result.values if isinstance(result, tuple) else result)
+            # Use the provided output tensor
+            result = torch.min(gelu_out, dim=dim, keepdim=keepdim)
+            if isinstance(result, tuple):
+                min_val = result[0]
+            else:
+                min_val = result
+            out.copy_(min_val)
             return out
-        return result
+        else:
+            # Return result tensor
+            return torch.min(gelu_out, dim=dim, keepdim=keepdim)[0]

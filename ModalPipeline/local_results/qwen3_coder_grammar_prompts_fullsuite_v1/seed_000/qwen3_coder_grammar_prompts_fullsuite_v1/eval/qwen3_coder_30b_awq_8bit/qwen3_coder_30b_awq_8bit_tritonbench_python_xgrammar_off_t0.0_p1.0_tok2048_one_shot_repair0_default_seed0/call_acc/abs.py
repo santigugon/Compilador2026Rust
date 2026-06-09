@@ -16,14 +16,12 @@ def abs(input, *, out=None):
     if out is None:
         out = torch.empty_like(input)
     else:
-        if out.shape != input.shape:
-            raise ValueError("Output tensor must have the same shape as input tensor")
+        assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
+        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input tensor"
     
     n_elements = input.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    abs_kernel[grid](input, out, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+    grid = (triton.cdiv(n_elements, 1024),)
+    abs_kernel[grid](input, out, n_elements, BLOCK_SIZE=1024)
     return out
 
 ##################################################################################################################################################

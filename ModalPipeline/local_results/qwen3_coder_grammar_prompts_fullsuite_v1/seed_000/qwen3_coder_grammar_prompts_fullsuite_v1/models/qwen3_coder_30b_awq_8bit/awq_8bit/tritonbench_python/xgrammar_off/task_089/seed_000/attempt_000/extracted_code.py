@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _cosine_similarity_kernel(x1_ptr, x2_ptr, out_ptr, n: tl.constexpr, dim: tl.constexpr, BLOCK: tl.constexpr):
+def _cosine_similarity_kernel(x1_ptr, x2_ptr, out_ptr, n: tl.constexpr, dim: tl.constexpr, eps: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
@@ -15,52 +15,51 @@ def _cosine_similarity_kernel(x1_ptr, x2_ptr, out_ptr, n: tl.constexpr, dim: tl.
     dot = tl.sum(x1_vals * x2_vals)
     
     # Compute norms
-    x1_norm = tl.sqrt(tl.sum(x1_vals * x1_vals) + 1e-8)
-    x2_norm = tl.sqrt(tl.sum(x2_vals * x2_vals) + 1e-8)
+    x1_norm = tl.sqrt(tl.sum(x1_vals * x1_vals) + eps)
+    x2_norm = tl.sqrt(tl.sum(x2_vals * x2_vals) + eps)
     
     # Compute cosine similarity
     cosine_sim = dot / (x1_norm * x2_norm)
     
-    tl.store(out_ptr + offsets[0], cosine_sim, mask=mask[0])
+    tl.store(out_ptr + pid, cosine_sim, mask=pid < n // BLOCK)
 
 def fused_avg_pool2d_cosine_similarity(x1, x2, kernel_size, stride=None, padding=0, eps=1e-8):
     if stride is None:
         stride = kernel_size
     
     # Compute cosine similarity along dim=1
-    # First, we need to reshape the tensors to compute similarity correctly
+    # First, we need to reshape the tensors to compute similarity per sample
     batch_size, dim_size = x1.shape[0], x1.shape[1]
     
-    # Compute cosine similarity for each batch
+    # Compute cosine similarity for each sample
     out = torch.empty(batch_size, dtype=x1.dtype, device=x1.device)
     
-    # Reshape to compute dot products and norms
+    # Reshape to compute similarity per sample
     x1_flat = x1.view(batch_size, -1)
     x2_flat = x2.view(batch_size, -1)
     
-    # Compute cosine similarity for each batch
-    for i in range(batch_size):
-        x1_i = x1_flat[i]
-        x2_i = x2_flat[i]
-        
-        dot = torch.dot(x1_i, x2_i)
-        norm1 = torch.norm(x1_i)
-        norm2 = torch.norm(x2_i)
-        
-        cosine_sim = dot / (norm1 * norm2 + eps)
-        out[i] = cosine_sim
+    # Compute cosine similarity using PyTorch for now
+    cosine_sim = torch.nn.functional.cosine_similarity(x1_flat, x2_flat, dim=1, eps=eps)
     
-    # Add singleton dimension using unsqueeze
-    out = out.unsqueeze(1)  # Shape: [batch_size, 1]
+    # Add singleton dimension
+    cosine_sim = cosine_sim.unsqueeze(1)  # Shape: (batch_size, 1)
     
-    # Apply 2D average pooling
-    # Reshape to [batch_size, 1, 1, 1] for pooling
-    out = out.unsqueeze(2).unsqueeze(3)  # Shape: [batch_size, 1, 1, 1]
+    # Expand to 2D for pooling
+    # We'll expand to (batch_size, 1, 1, 1) and then apply pooling
+    # But since we want to pool over the last two dimensions, we need to reshape
+    # Let's assume we want to pool over a 1x1 region (which is just the value itself)
+    # For a more realistic case, we'll assume we want to pool over the last two dimensions
+    # of a 2D tensor, so we'll reshape to (batch_size, 1, 1, 1) and then pool
     
-    # Apply average pooling
-    out = torch.nn.functional.avg_pool2d(out, kernel_size, stride=stride, padding=padding)
+    # For simplicity, let's assume we want to pool over a 1x1 region
+    # This is a bit tricky since we don't know the exact intended shape
+    # Let's just pool over the single element
+    pooled = torch.nn.functional.avg_pool2d(
+        cosine_sim.unsqueeze(1).unsqueeze(1),  # (batch_size, 1, 1, 1)
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding
+    )
     
-    # Remove the singleton dimensions
-    out = out.squeeze(2).squeeze(2)  # Shape: [batch_size]
-    
-    return out
+    # Return the result
+    return pooled.squeeze(1).squeeze(1)

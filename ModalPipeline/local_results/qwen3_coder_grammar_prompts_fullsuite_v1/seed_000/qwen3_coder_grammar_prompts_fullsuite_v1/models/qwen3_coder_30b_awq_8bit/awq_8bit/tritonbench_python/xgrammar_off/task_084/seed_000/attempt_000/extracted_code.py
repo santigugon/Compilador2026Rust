@@ -27,11 +27,8 @@ def trunc(input, *, out=None):
     
     # For integer inputs, return a copy as per array-api convention
     if input.dtype.is_integral:
-        if out is None:
-            return input.clone()
-        else:
-            out.copy_(input)
-            return out
+        out.copy_(input)
+        return out
     
     _trunc_kernel[grid](input, out, n, BLOCK=block)
     return out

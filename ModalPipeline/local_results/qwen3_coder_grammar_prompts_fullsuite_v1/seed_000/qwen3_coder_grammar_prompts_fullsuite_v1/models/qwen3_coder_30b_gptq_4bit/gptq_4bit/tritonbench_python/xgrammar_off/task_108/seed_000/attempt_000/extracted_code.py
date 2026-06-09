@@ -36,15 +36,15 @@ def _affine_grid_kernel(
         y = h_idx / (H_out - 1) * 2.0 - 1.0
     
     # Apply affine transformation
-    x_out = theta_row0 * x + theta_row0 * y + theta_row0 * 1.0
-    y_out = theta_row1 * x + theta_row1 * y + theta_row1 * 1.0
+    x_out = theta_row0 * x + theta_row0 * y + theta_row0
+    y_out = theta_row1 * x + theta_row1 * y + theta_row1
     
     # Store results
     tl.store(grid_ptr + pid * 2 + 0, x_out)
     tl.store(grid_ptr + pid * 2 + 1, y_out)
 
 @triton.jit
-def _grid_sample_bilinear_kernel(
+def _bilinear_sample_kernel(
     input_ptr, 
     grid_ptr, 
     output_ptr, 
@@ -67,8 +67,8 @@ def _grid_sample_bilinear_kernel(
     w_idx = (out_idx % (H_out * W_out)) % W_out
     
     # Load grid coordinates
-    grid_x = tl.load(grid_ptr + pid * 2 + 0)
-    grid_y = tl.load(grid_ptr + pid * 2 + 1)
+    grid_x = tl.load(grid_ptr + (batch_idx * H_out * W_out + h_idx * W_out + w_idx) * 2 + 0)
+    grid_y = tl.load(grid_ptr + (batch_idx * H_out * W_out + h_idx * W_out + w_idx) * 2 + 1)
     
     # Normalize grid coordinates to image coordinates
     x = (grid_x + 1.0) * (W_in - 1) / 2.0
@@ -88,21 +88,24 @@ def _grid_sample_bilinear_kernel(
     wx = x - x0
     wy = y - y0
     
-    # Load input values
-    input_ptr_base = input_ptr + batch_idx * C * H_in * W_in
+    # Sample four corners
+    x0 = tl.cast(x0, tl.int32)
+    x1 = tl.cast(x1, tl.int32)
+    y0 = tl.cast(y0, tl.int32)
+    y1 = tl.cast(y1, tl.int32)
     
-    # Bilinear interpolation
-    val00 = tl.load(input_ptr_base + c_idx * H_in * W_in + y0 * W_in + x0, mask=(x0 >= 0) & (y0 >= 0) & (x0 < W_in) & (y0 < H_in), other=0.0)
-    val01 = tl.load(input_ptr_base + c_idx * H_in * W_in + y0 * W_in + x1, mask=(x1 >= 0) & (y0 >= 0) & (x1 < W_in) & (y0 < H_in), other=0.0)
-    val10 = tl.load(input_ptr_base + c_idx * H_in * W_in + y1 * W_in + x0, mask=(x0 >= 0) & (y1 >= 0) & (x0 < W_in) & (y1 < H_in), other=0.0)
-    val11 = tl.load(input_ptr_base + c_idx * H_in * W_in + y1 * W_in + x1, mask=(x1 >= 0) & (y1 >= 0) & (x1 < W_in) & (y1 < H_in), other=0.0)
+    # Sample from input
+    val00 = tl.load(input_ptr + batch_idx * H_in * W_in * C + c_idx * H_in * W_in + y0 * W_in + x0, mask=(x0 >= 0) & (x0 < W_in) & (y0 >= 0) & (y0 < H_in), other=0.0)
+    val01 = tl.load(input_ptr + batch_idx * H_in * W_in * C + c_idx * H_in * W_in + y0 * W_in + x1, mask=(x1 >= 0) & (x1 < W_in) & (y0 >= 0) & (y0 < H_in), other=0.0)
+    val10 = tl.load(input_ptr + batch_idx * H_in * W_in * C + c_idx * H_in * W_in + y1 * W_in + x0, mask=(x0 >= 0) & (x0 < W_in) & (y1 >= 0) & (y1 < H_in), other=0.0)
+    val11 = tl.load(input_ptr + batch_idx * H_in * W_in * C + c_idx * H_in * W_in + y1 * W_in + x1, mask=(x1 >= 0) & (x1 < W_in) & (y1 >= 0) & (y1 < H_in), other=0.0)
     
     # Interpolate
     val0 = val00 * (1.0 - wx) + val01 * wx
     val1 = val10 * (1.0 - wx) + val11 * wx
     result = val0 * (1.0 - wy) + val1 * wy
     
-    # Store output
+    # Store result
     tl.store(output_ptr + pid, result)
 
 def grid_sample_with_affine(input: torch.Tensor, theta: torch.Tensor, size: torch.Size, mode: str = 'bilinear', padding_mode: str = 'zeros', align_corners: bool = False) -> torch.Tensor:
@@ -114,13 +117,13 @@ def grid_sample_with_affine(input: torch.Tensor, theta: torch.Tensor, size: torc
     
     # Extract dimensions
     N, C, H_in, W_in = input.shape
-    _, H_out, W_out = size[0], size[2], size[3]
+    _, _, H_out, W_out = size
     
     # Create output tensor
     output = torch.empty(size, dtype=input.dtype, device=input.device)
     
     # Generate grid using affine transformation
-    grid = torch.empty(N, H_out, W_out, 2, dtype=torch.float32, device=input.device)
+    grid = torch.empty((N, H_out, W_out, 2), dtype=torch.float32, device=input.device)
     
     # Compute grid using Triton kernel
     block = 256
@@ -137,12 +140,12 @@ def grid_sample_with_affine(input: torch.Tensor, theta: torch.Tensor, size: torc
         BLOCK=block
     )
     
-    # Apply grid sampling
+    # Apply grid sampling with bilinear interpolation
     if mode == 'bilinear':
         # Launch bilinear sampling kernel
         total_elements = N * C * H_out * W_out
         grid_size = triton.cdiv(total_elements, block)
-        _grid_sample_bilinear_kernel[grid_size](
+        _bilinear_sample_kernel[grid_size](
             input, 
             grid, 
             output, 
@@ -157,15 +160,14 @@ def grid_sample_with_affine(input: torch.Tensor, theta: torch.Tensor, size: torc
     else:
         # For other modes, fall back to PyTorch implementation
         # This is a simplified version - in practice, you'd implement other modes
-        # like nearest or bicubic with their own kernels
-        grid_sample_input = input.permute(0, 2, 3, 1).contiguous()
-        grid_sample_grid = grid.permute(0, 3, 1, 2).contiguous()
-        output = torch.nn.functional.grid_sample(
-            grid_sample_input, 
-            grid_sample_grid, 
+        # like nearest or bicubic using similar kernels
+        grid_sample_result = torch.nn.functional.grid_sample(
+            input, 
+            grid, 
             mode=mode, 
             padding_mode=padding_mode, 
             align_corners=align_corners
-        ).permute(0, 3, 1, 2)
+        )
+        return grid_sample_result
     
     return output

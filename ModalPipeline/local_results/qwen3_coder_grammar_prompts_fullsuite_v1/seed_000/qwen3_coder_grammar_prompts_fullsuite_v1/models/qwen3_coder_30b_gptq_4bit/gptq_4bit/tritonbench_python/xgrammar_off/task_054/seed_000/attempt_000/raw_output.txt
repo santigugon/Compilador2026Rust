@@ -25,42 +25,51 @@ def _gelu_conv2d_kernel(
     dilation_h: tl.constexpr,
     dilation_w: tl.constexpr,
     groups: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
     batch_id = tl.program_id(1)
     
-    # Each block processes one output element
-    output_offset = batch_id * out_channels * oH * oW + pid
+    # Calculate output dimensions
+    output_size = oH * oW * out_channels
     
-    # Compute output coordinates
-    out_h = pid // (oW * out_channels)
-    out_w = (pid // out_channels) % oW
+    # Each thread handles one output element
+    if pid >= output_size:
+        return
+    
+    # Calculate which output element this thread is responsible for
     out_c = pid % out_channels
+    out_w = (pid // out_channels) % oW
+    out_h = (pid // out_channels) // oW
+    
+    # Calculate input region
+    in_h_start = out_h * stride_h - pad_h
+    in_w_start = out_w * stride_w - pad_w
     
     # Initialize accumulator
     acc = 0.0
     
     # Loop over input channels and kernel elements
     for g in range(groups):
-        for kh in range(kH):
-            for kw in range(kW):
-                # Compute input coordinates
-                ih = out_h * stride_h - pad_h + kh * dilation_h
-                iw = out_w * stride_w - pad_w + kw * dilation_w
+        for k_h in range(kH):
+            for k_w in range(kW):
+                # Calculate input position
+                in_h = in_h_start + k_h * dilation_h
+                in_w = in_w_start + k_w * dilation_w
                 
                 # Check bounds
-                if ih >= 0 and ih < iH and iw >= 0 and iw < iW:
-                    # Compute input channel index
-                    in_c = g * (in_channels // groups) + (out_c % (in_channels // groups))
+                if in_h >= 0 and in_h < iH and in_w >= 0 and in_w < iW:
+                    # Calculate input channel index
+                    in_c = (g * (in_channels // groups)) + (out_c % (in_channels // groups))
                     
                     # Load input and weight
-                    input_val = tl.load(input_ptr + batch_id * in_channels * iH * iW + 
-                                       g * (in_channels // groups) * iH * iW + 
-                                       in_c * iH * iW + ih * iW + iw)
+                    input_val = tl.load(input_ptr + batch_id * iH * iW * in_channels + 
+                                       in_h * iW * in_channels + in_w * in_channels + in_c)
                     weight_val = tl.load(weight_ptr + out_c * (in_channels // groups) * kH * kW + 
                                        g * (in_channels // groups) * kH * kW + 
-                                       kh * kW + kw)
+                                       k_h * kW * (in_channels // groups) + 
+                                       k_w * (in_channels // groups) + 
+                                       (out_c % (in_channels // groups)))
                     acc += input_val * weight_val
     
     # Add bias if present
@@ -68,17 +77,21 @@ def _gelu_conv2d_kernel(
         acc += tl.load(bias_ptr + out_c)
     
     # Apply GELU activation
-    # GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    # Using approximation: GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * x))
-    # For better accuracy, we'll use the full formula
-    sqrt_2_over_pi = 0.7978845608028654  # sqrt(2/pi)
-    x = acc
-    x_cubed = x * x * x
-    tanh_arg = sqrt_2_over_pi * (x + 0.044715 * x_cubed)
-    gelu_val = 0.5 * x * (1.0 + tl.tanh(tanh_arg))
+    # Using approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    # For simplicity, we'll use the standard approximation
+    if True:  # approximate == 'none' or default
+        # Standard GELU approximation
+        x = acc
+        # Using: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        # Simplified version: 0.5 * x * (1 + tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
+        x_cubed = x * x * x
+        tanh_arg = 0.7978845608 * (x + 0.044715 * x_cubed)
+        gelu_val = 0.5 * x * (1.0 + tl.tanh(tanh_arg))
+        acc = gelu_val
     
     # Store result
-    tl.store(output_ptr + output_offset, gelu_val)
+    tl.store(output_ptr + batch_id * oH * oW * out_channels + 
+             out_h * oW * out_channels + out_w * out_channels + out_c, acc)
 
 def gelu_conv2d(
     input: torch.Tensor,
@@ -103,8 +116,6 @@ def gelu_conv2d(
             pad_h = pad_w = 0
         elif padding == 'same':
             # For 'same' padding, we'll compute the actual padding needed
-            # This is a simplified version - in practice, you'd want to compute
-            # the exact padding needed for the output size to match the input size
             pad_h = pad_w = 0
         else:
             raise ValueError("Invalid padding string")
@@ -123,56 +134,39 @@ def gelu_conv2d(
     batch_size, in_channels, iH, iW = input.shape
     out_channels, _, kH, kW = weight.shape
     
-    # Compute output dimensions
+    # Calculate output dimensions
     oH = (iH + 2 * pad_h - (dilation_h * (kH - 1) + 1)) // stride_h + 1
     oW = (iW + 2 * pad_w - (dilation_w * (kW - 1) + 1)) // stride_w + 1
     
     # Create output tensor
-    if out is not None:
-        output = out
+    if out is None:
+        out = torch.empty(batch_size, out_channels, oH, oW, device=input.device, dtype=input.dtype)
     else:
-        output = torch.empty(batch_size, out_channels, oH, oW, device=input.device, dtype=input.dtype)
+        assert out.shape == (batch_size, out_channels, oH, oW)
     
     # Handle bias
     if bias is not None:
-        if bias.shape[0] != out_channels:
-            raise ValueError("Bias shape does not match out_channels")
+        assert bias.shape == (out_channels,)
     else:
-        bias = None
+        bias = torch.zeros(out_channels, device=input.device, dtype=input.dtype)
     
     # Launch kernel
+    BLOCK = 256
     grid = (oH * oW * out_channels, batch_size)
-    BLOCK_SIZE = 256
     
-    # Ensure tensors are contiguous
-    input = input.contiguous()
-    weight = weight.contiguous()
-    if bias is not None:
-        bias = bias.contiguous()
+    # Create pointers
+    input_ptr = input.data_ptr()
+    weight_ptr = weight.data_ptr()
+    bias_ptr = bias.data_ptr()
+    output_ptr = out.data_ptr()
     
-    # Launch kernel
+    # Call kernel
     _gelu_conv2d_kernel[grid](
-        input,
-        weight,
-        bias,
-        output,
-        iH,
-        iW,
-        oH,
-        oW,
-        in_channels,
-        out_channels,
-        kH,
-        kW,
-        stride_h,
-        stride_w,
-        pad_h,
-        pad_w,
-        dilation_h,
-        dilation_w,
-        groups,
-        BLOCK_SIZE
+        input_ptr, weight_ptr, bias_ptr, output_ptr,
+        iH, iW, oH, oW, in_channels, out_channels,
+        kH, kW, stride_h, stride_w, pad_h, pad_w,
+        dilation_h, dilation_w, groups, BLOCK
     )
     
-    return output
+    return out
 ```

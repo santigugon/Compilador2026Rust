@@ -11,8 +11,6 @@ def _cholesky_solve_kernel(B_ptr, L_ptr, out_ptr, batch_size: tl.constexpr, n: t
     # Load B and L for this batch
     B_batch = B_ptr + batch_idx * n * k
     L_batch = L_ptr + batch_idx * n * n
-    
-    # Output tensor
     out_batch = out_ptr + batch_idx * n * k
     
     # Process each column of B
@@ -22,19 +20,23 @@ def _cholesky_solve_kernel(B_ptr, L_ptr, out_ptr, batch_size: tl.constexpr, n: t
         
         # Forward substitution or back substitution depending on upper
         if upper:
-            # Back substitution for upper triangular matrix
+            # Back substitution for upper triangular
             for i in range(n - 1, -1, -1):
-                # Compute the sum of known terms
-                sum_val = tl.sum(b_col[tl.arange(0, n) > i] * tl.load(L_batch + i * n + tl.arange(0, n) > i, mask=tl.arange(0, n) > i, other=0.0))
+                # Load the value from L
+                l_i = tl.load(L_batch + i * n + i, mask=True, other=0.0)
+                # Compute the sum of the known terms
+                sum_val = tl.sum(b_col[i+1:n] * tl.load(L_batch + i * n + i+1:n, mask=tl.arange(i+1, n) < n, other=0.0))
                 # Update the value
-                b_col[i] = (b_col[i] - sum_val) / tl.load(L_batch + i * n + i, mask=True, other=0.0)
+                b_col[i] = (b_col[i] - sum_val) / l_i
         else:
-            # Forward substitution for lower triangular matrix
+            # Forward substitution for lower triangular
             for i in range(n):
-                # Compute the sum of known terms
-                sum_val = tl.sum(b_col[tl.arange(0, n) < i] * tl.load(L_batch + i * n + tl.arange(0, n) < i, mask=tl.arange(0, n) < i, other=0.0))
+                # Load the value from L
+                l_i = tl.load(L_batch + i * n + i, mask=True, other=0.0)
+                # Compute the sum of the known terms
+                sum_val = tl.sum(b_col[0:i] * tl.load(L_batch + i * n + 0:i, mask=tl.arange(0, i) < i, other=0.0))
                 # Update the value
-                b_col[i] = (b_col[i] - sum_val) / tl.load(L_batch + i * n + i, mask=True, other=0.0)
+                b_col[i] = (b_col[i] - sum_val) / l_i
         
         # Store the result
         tl.store(out_batch + col * n, b_col, mask=tl.arange(0, n) < n)
@@ -64,7 +66,7 @@ def cholesky_solve(B, L, upper=False, *, out=None):
         if out.shape != B.shape:
             raise ValueError("Output tensor shape must match input tensor B")
     
-    # Determine block size
+    # Set block size
     BLOCK = 256
     
     # Launch kernel

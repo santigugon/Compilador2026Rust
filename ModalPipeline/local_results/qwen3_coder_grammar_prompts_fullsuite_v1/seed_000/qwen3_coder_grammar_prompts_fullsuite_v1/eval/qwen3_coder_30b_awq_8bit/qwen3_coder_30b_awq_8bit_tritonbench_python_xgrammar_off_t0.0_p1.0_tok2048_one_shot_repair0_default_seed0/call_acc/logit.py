@@ -19,7 +19,7 @@ def logit_kernel(
     if eps is not None:
         input = tl.clamp(input, eps, 1.0 - eps)
     
-    output = tl.log(input / (1.0 - input))
+    output = tl.math.log(input / (1.0 - input))
     tl.store(output_ptr + offsets, output, mask=mask)
 
 def logit(input, eps=None, *, out=None):

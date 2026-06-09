@@ -9,90 +9,96 @@ def _fused_masked_select_add_gelu_kernel(
     n: tl.constexpr,
     alpha: tl.constexpr,
     mask_is_tensor: tl.constexpr,
+    other_is_tensor: tl.constexpr,
     BLOCK: tl.constexpr
 ):
     pid = tl.program_id(0)
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     
-    input_vals = tl.load(input_ptr + offsets, mask=mask, other=0.0)
-    mask_vals = tl.load(mask_ptr + offsets, mask=mask, other=False)
+    # Load input
+    input = tl.load(input_ptr + offsets, mask=mask, other=0.0)
     
-    # Select elements based on mask
-    selected_vals = tl.where(mask_vals, input_vals, 0.0)
+    # Load mask
+    mask_val = tl.load(mask_ptr + offsets, mask=mask, other=False)
     
-    # Add other (scaled by alpha)
-    if mask_is_tensor:
-        other_vals = tl.load(other_ptr + offsets, mask=mask, other=0.0)
-        result = selected_vals + alpha * other_vals
+    # Select based on mask
+    selected = tl.where(mask_val, input, 0.0)
+    
+    # Load other (scalar or tensor)
+    if other_is_tensor:
+        other = tl.load(other_ptr + offsets, mask=mask, other=0.0)
     else:
-        result = selected_vals + alpha * other_ptr
+        other = other_ptr[0]  # scalar
+    
+    # Add with alpha scaling
+    added = selected + alpha * other
     
     # Apply GELU activation
     # GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    # Using approximation: GELU(x) ≈ 0.5 * x * (1 + tanh(0.7978845608 * (x + 0.044715 * x^3)))
-    x = result
-    cubed_x = x * x * x
-    tanh_arg = 0.7978845608 * (x + 0.044715 * cubed_x)
-    gelu_val = 0.5 * x * (1.0 + tl.tanh(tanh_arg))
+    # Using approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * x * (1 + 0.044715 * x^2)))
+    sqrt_2_over_pi = 0.7978845608028654  # sqrt(2/pi)
+    x = added
+    x_cubed = x * x * x
+    inner = sqrt_2_over_pi * x * (1.0 + 0.044715 * x_cubed)
+    tanh_val = 2.0 / (1.0 + tl.exp(-2.0 * inner)) - 1.0
+    gelu = 0.5 * x * (1.0 + tanh_val)
     
-    tl.store(out_ptr + offsets, gelu_val, mask=mask)
+    tl.store(out_ptr + offsets, gelu, mask=mask)
 
 def fused_masked_select_add_gelu(input, mask, other, *, alpha=1, approximate='none', out=None):
-    # Validate inputs
-    if not torch.is_tensor(input):
-        raise TypeError("input must be a tensor")
-    if not torch.is_tensor(mask):
-        raise TypeError("mask must be a tensor")
-    if not isinstance(alpha, (int, float)):
-        raise TypeError("alpha must be a scalar")
-    
     # Handle scalar other
-    other_is_scalar = not torch.is_tensor(other)
+    if not torch.is_tensor(other):
+        other_is_tensor = False
+        other_tensor = torch.tensor(other, dtype=input.dtype, device=input.device)
+    else:
+        other_is_tensor = True
+        other_tensor = other
     
-    # Ensure mask is boolean
-    if mask.dtype != torch.bool:
-        mask = mask.bool()
+    # Handle scalar mask
+    if not torch.is_tensor(mask):
+        mask_tensor = torch.tensor(mask, dtype=torch.bool, device=input.device)
+    else:
+        mask_tensor = mask
     
-    # Validate shapes for broadcasting
-    if not other_is_scalar:
-        if input.shape != other.shape:
-            # Check if they can be broadcast
-            try:
-                torch.broadcast_tensors(input, other)
-            except RuntimeError:
-                raise ValueError("input and other tensors must be broadcastable")
+    # Ensure mask and input have compatible shapes for broadcasting
+    if mask_tensor.shape != input.shape:
+        # Broadcast mask to input shape
+        mask_tensor = mask_tensor.expand(input.shape)
     
-    # Determine output shape
-    out_shape = input.shape
+    # Ensure other and input have compatible shapes for broadcasting
+    if other_is_tensor and other_tensor.shape != input.shape:
+        # Broadcast other to input shape
+        other_tensor = other_tensor.expand(input.shape)
     
     # Create output tensor
     if out is None:
-        out = torch.empty_like(input, dtype=input.dtype)
+        out = torch.empty_like(input)
     else:
-        if out.shape != out_shape:
-            raise ValueError("out tensor must have the same shape as input")
-        if out.dtype != input.dtype:
-            raise ValueError("out tensor must have the same dtype as input")
+        if out.shape != input.shape:
+            raise ValueError("Output tensor must have the same shape as input tensor")
     
-    # Flatten tensors for kernel processing
+    # Get total number of elements
     n = input.numel()
     
     # Launch kernel
     block = 256
     grid = (triton.cdiv(n, block),)
     
-    # Handle scalar other case
-    if other_is_scalar:
-        _fused_masked_select_add_gelu_kernel[grid](
-            input, mask, other, out, 
-            n, alpha, False, BLOCK=block
-        )
+    # Convert scalar values to tensor pointers for kernel
+    if not other_is_tensor:
+        other_ptr = tl.tensor([other_tensor.item()], dtype=tl.float32)
     else:
-        _fused_masked_select_add_gelu_kernel[grid](
-            input, mask, other, out,
-            n, alpha, True, BLOCK=block
-        )
+        other_ptr = other_tensor
+    
+    _fused_masked_select_add_gelu_kernel[grid](
+        input, mask_tensor, other_ptr, out,
+        n,
+        alpha,
+        mask_is_tensor=True,
+        other_is_tensor=other_is_tensor,
+        BLOCK=block
+    )
     
     return out
 ```

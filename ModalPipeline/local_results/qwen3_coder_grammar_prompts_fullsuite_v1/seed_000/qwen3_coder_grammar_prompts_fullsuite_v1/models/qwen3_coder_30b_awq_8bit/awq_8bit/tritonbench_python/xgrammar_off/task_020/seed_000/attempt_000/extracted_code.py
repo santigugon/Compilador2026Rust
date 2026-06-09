@@ -3,85 +3,68 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _pairwise_distance_kernel(x1_ptr, x2_ptr, out_ptr, n1: tl.constexpr, n2: tl.constexpr, 
-                             dim: tl.constexpr, p: tl.constexpr, eps: tl.constexpr, 
-                             BLOCK: tl.constexpr):
+def _pairwise_distance_kernel(x1_ptr, x2_ptr, out_ptr, n1: tl.constexpr, n2: tl.constexpr, d: tl.constexpr, p: tl.constexpr, eps: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     pid2 = tl.program_id(1)
     
-    if pid >= n1 or pid2 >= n2:
-        return
-    
-    # Compute pairwise distance
-    distance = 0.0
-    for i in range(0, dim, BLOCK):
-        offsets = i + tl.arange(0, BLOCK)
-        mask = offsets < dim
+    # Compute distances for one pair of vectors
+    if pid < n1 and pid2 < n2:
+        # Load x1 vector
+        x1_offsets = pid * d + tl.arange(0, BLOCK)
+        x1_mask = x1_offsets < n1 * d
+        x1_vals = tl.load(x1_ptr + x1_offsets, mask=x1_mask, other=0.0)
         
-        x1_vals = tl.load(x1_ptr + pid * dim + offsets, mask=mask, other=0.0)
-        x2_vals = tl.load(x2_ptr + pid2 * dim + offsets, mask=mask, other=0.0)
+        # Load x2 vector
+        x2_offsets = pid2 * d + tl.arange(0, BLOCK)
+        x2_mask = x2_offsets < n2 * d
+        x2_vals = tl.load(x2_ptr + x2_offsets, mask=x2_mask, other=0.0)
         
+        # Compute difference and accumulate
         diff = x1_vals - x2_vals
-        if p == 2.0:
-            distance += tl.sum(diff * diff)
-        else:
-            distance += tl.sum(tl.abs(diff) ** p)
-    
-    # Apply p-th root
-    if p == 2.0:
-        distance = tl.sqrt(distance + eps)
-    else:
-        distance = tl.pow(distance + eps, 1.0 / p)
-    
-    tl.store(out_ptr + pid * n2 + pid2, distance)
+        diff_pow = tl.power(tl.abs(diff), p)
+        sum_diff = tl.sum(diff_pow)
+        
+        # Add epsilon to avoid division by zero
+        distance = tl.sqrt(sum_diff + eps)
+        
+        # Store result
+        out_offsets = pid * n2 + pid2
+        tl.store(out_ptr + out_offsets, distance)
 
 @triton.jit
-def _normalize_kernel(x_ptr, out_ptr, n1: tl.constexpr, n2: tl.constexpr, 
-                      dim: tl.constexpr, p: tl.constexpr, eps: tl.constexpr, 
-                      BLOCK: tl.constexpr):
+def _normalize_kernel(x_ptr, out_ptr, n: tl.constexpr, dim: tl.constexpr, p: tl.constexpr, eps: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     
-    if pid >= n1:
-        return
-    
-    # Compute normalization factor along specified dimension
-    norm = 0.0
-    for i in range(0, n2, BLOCK):
-        offsets = i + tl.arange(0, BLOCK)
-        mask = offsets < n2
+    # Compute normalization for each row
+    if pid < n:
+        # Load row
+        offsets = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < n * BLOCK
+        vals = tl.load(x_ptr + offsets, mask=mask, other=0.0)
         
-        vals = tl.load(x_ptr + pid * n2 + offsets, mask=mask, other=0.0)
-        
+        # Compute norm
         if p == 2.0:
-            norm += tl.sum(vals * vals)
+            norm_vals = vals * vals
+            norm = tl.sqrt(tl.sum(norm_vals) + eps)
         else:
-            norm += tl.sum(tl.abs(vals) ** p)
-    
-    # Apply p-th root
-    if p == 2.0:
-        norm = tl.sqrt(norm + eps)
-    else:
-        norm = tl.pow(norm + eps, 1.0 / p)
-    
-    # Normalize
-    for i in range(0, n2, BLOCK):
-        offsets = i + tl.arange(0, BLOCK)
-        mask = offsets < n2
+            norm_vals = tl.power(tl.abs(vals), p)
+            norm = tl.power(tl.sum(norm_vals) + eps, 1.0 / p)
         
-        vals = tl.load(x_ptr + pid * n2 + offsets, mask=mask, other=0.0)
-        normalized_vals = vals / (norm + eps)
-        tl.store(out_ptr + pid * n2 + offsets, normalized_vals, mask=mask)
+        # Normalize
+        normalized = vals / norm
+        
+        # Store result
+        tl.store(out_ptr + offsets, normalized, mask=mask)
 
 def normalize_pairwise_distance(x1, x2, p_distance=2.0, eps_distance=1e-6, keepdim=False, p_norm=2, dim_norm=1, eps_norm=1e-12):
     # Validate inputs
     assert x1.shape == x2.shape, "x1 and x2 must have the same shape"
-    assert len(x1.shape) >= 2, "x1 and x2 must be at least 2D"
     
     # Get dimensions
     shape = x1.shape
     n1 = shape[0]
-    n2 = shape[0] if len(shape) == 2 else shape[1]
-    dim = shape[-1]
+    n2 = shape[0]  # Assuming x1 and x2 have same shape
+    d = shape[1]   # Assuming 2D tensors for simplicity
     
     # Compute pairwise distances
     out = torch.empty(n1, n2, device=x1.device, dtype=x1.dtype)
@@ -89,17 +72,30 @@ def normalize_pairwise_distance(x1, x2, p_distance=2.0, eps_distance=1e-6, keepd
     # Launch pairwise distance kernel
     block = 256
     grid = (triton.cdiv(n1, block), triton.cdiv(n2, block))
-    _pairwise_distance_kernel[grid](x1, x2, out, n1, n2, dim, p_distance, eps_distance, BLOCK=block)
+    
+    # For simplicity, we'll compute the full pairwise distance matrix
+    # In a real implementation, we might want to optimize this further
+    _pairwise_distance_kernel[grid](x1, x2, out, n1, n2, d, p_distance, eps_distance, BLOCK=block)
     
     # Normalize along specified dimension
     if dim_norm == 1:
         # Normalize each row
+        out = out.view(n1, n2)
         out_normalized = torch.empty_like(out)
+        
+        # Launch normalization kernel
         block = 256
         grid = (triton.cdiv(n1, block),)
-        _normalize_kernel[grid](out, out_normalized, n1, n2, dim, p_norm, eps_norm, BLOCK=block)
-        return out_normalized
+        _normalize_kernel[grid](out, out_normalized, n1, n2, p_norm, eps_norm, BLOCK=block)
+        
+        # Reshape back if needed
+        if keepdim:
+            out = out_normalized.view(n1, 1, n2)
+        else:
+            out = out_normalized
     else:
-        # For other dimensions, we need to handle differently
-        # This is a simplified version - in practice, you'd want to handle this more carefully
-        return out
+        # For other dimensions, we'll use PyTorch's native implementation
+        # This is a simplified approach - in practice, we'd want to handle this more carefully
+        out = torch.nn.functional.normalize(out, p=p_norm, dim=dim_norm, eps=eps_norm)
+    
+    return out

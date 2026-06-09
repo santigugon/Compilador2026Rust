@@ -8,9 +8,11 @@ def _adaptive_avg_pool2d_kernel(
     output_ptr, 
     input_shape, 
     output_shape,
-    H_in: tl.constexpr, 
+    input_strides,
+    output_strides,
+    H_in: tl.constexpr,
     W_in: tl.constexpr,
-    H_out: tl.constexpr, 
+    H_out: tl.constexpr,
     W_out: tl.constexpr,
     C: tl.constexpr,
     N: tl.constexpr,
@@ -19,103 +21,114 @@ def _adaptive_avg_pool2d_kernel(
     # Get the block index
     pid = tl.program_id(0)
     
-    # Calculate which output element this block handles
-    output_idx = pid * BLOCK_SIZE
+    # Each block handles one output element
+    # We need to handle the case where we have multiple output elements per block
+    # For simplicity, we'll handle one output element per block
+    output_idx = pid
     
-    # Handle the case where we have multiple output elements per block
-    for i in range(BLOCK_SIZE):
-        if output_idx + i >= H_out * W_out:
-            break
-            
-        # Calculate which output position (h, w) this block is handling
-        out_h = (output_idx + i) // W_out
-        out_w = (output_idx + i) % W_out
-        
-        # Calculate the input region for this output element
-        h_start = (out_h * H_in) // H_out
-        h_end = ((out_h + 1) * H_in + H_out - 1) // H_out
-        w_start = (out_w * W_in) // W_out
-        w_end = ((out_w + 1) * W_in + W_out - 1) // W_out
-        
-        # Calculate the number of elements in this region
-        h_size = h_end - h_start
-        w_size = w_end - w_start
-        
-        # Initialize sum
-        sum_val = 0.0
-        
-        # Accumulate values from the input region
-        for h in range(h_start, h_end):
-            for w in range(w_start, w_end):
-                # Calculate input index
-                input_idx = h * W_in + w
-                # Load input value
-                input_val = tl.load(input_ptr + input_idx, mask=True)
-                sum_val += input_val
-        
-        # Calculate average
-        avg_val = sum_val / (h_size * w_size)
-        
-        # Store result
-        output_idx_full = out_h * W_out + out_w
-        tl.store(output_ptr + output_idx_full, avg_val, mask=True)
+    # Calculate which output element this block is responsible for
+    if N > 0:
+        # 4D case: (N, C, H_out, W_out)
+        n = output_idx // (C * H_out * W_out)
+        c = (output_idx // (H_out * W_out)) % C
+        h = (output_idx // W_out) % H_out
+        w = output_idx % W_out
+    else:
+        # 3D case: (C, H_out, W_out)
+        c = output_idx // (H_out * W_out)
+        h = (output_idx // W_out) % H_out
+        w = output_idx % W_out
+        n = 0
+    
+    # Calculate the input region for this output element
+    # The input region is [start_h, end_h) x [start_w, end_w)
+    start_h = (h * H_in) // H_out
+    end_h = ((h + 1) * H_in + H_out - 1) // H_out
+    start_w = (w * W_in) // W_out
+    end_w = ((w + 1) * W_in + W_out - 1) // W_out
+    
+    # Calculate the sum of values in the input region
+    sum_val = 0.0
+    count = 0
+    
+    # Iterate over the input region
+    for ih in range(start_h, end_h):
+        for iw in range(start_w, end_w):
+            if N > 0:
+                input_offset = n * input_strides[0] + c * input_strides[1] + ih * input_strides[2] + iw * input_strides[3]
+            else:
+                input_offset = c * input_strides[0] + ih * input_strides[1] + iw * input_strides[2]
+            input_val = tl.load(input_ptr + input_offset, mask=True)
+            sum_val += input_val
+            count += 1
+    
+    # Calculate average
+    if count > 0:
+        avg_val = sum_val / count
+    else:
+        avg_val = 0.0
+    
+    # Store the result
+    if N > 0:
+        output_offset = n * output_strides[0] + c * output_strides[1] + h * output_strides[2] + w * output_strides[3]
+    else:
+        output_offset = c * output_strides[0] + h * output_strides[1] + w * output_strides[2]
+    tl.store(output_ptr + output_offset, avg_val)
 
 def adaptive_avg_pool2d(input, output_size):
-    # Handle different input shapes
+    # Handle the case where input is 3D (C, H_in, W_in) or 4D (N, C, H_in, W_in)
     if input.dim() == 3:
-        # (C, H_in, W_in)
-        N = 1
-        C = input.shape[0]
-        H_in = input.shape[1]
-        W_in = input.shape[2]
-        input_flat = input.view(-1)
+        N, C, H_in, W_in = 0, input.size(0), input.size(1), input.size(2)
+        input_shape = (C, H_in, W_in)
+        input_strides = (input.stride(0), input.stride(1), input.stride(2))
+    elif input.dim() == 4:
+        N, C, H_in, W_in = input.size(0), input.size(1), input.size(2), input.size(3)
+        input_shape = (N, C, H_in, W_in)
+        input_strides = (input.stride(0), input.stride(1), input.stride(2), input.stride(3))
     else:
-        # (N, C, H_in, W_in)
-        N = input.shape[0]
-        C = input.shape[1]
-        H_in = input.shape[2]
-        W_in = input.shape[3]
-        input_flat = input.view(-1)
+        raise ValueError("Input must be 3D or 4D")
     
-    # Handle output size
+    # Handle output_size
     if isinstance(output_size, int):
-        H_out = output_size
-        W_out = output_size
+        H_out, W_out = output_size, output_size
     elif isinstance(output_size, tuple) and len(output_size) == 2:
-        H_out = output_size[0]
-        W_out = output_size[1]
+        H_out, W_out = output_size
     else:
         raise ValueError("output_size must be an int or a tuple of two ints")
     
     # Create output tensor
-    if N == 1:
-        output = torch.empty((C, H_out, W_out), dtype=input.dtype, device=input.device)
+    if N > 0:
+        output = torch.empty(N, C, H_out, W_out, dtype=input.dtype, device=input.device)
+        output_shape = (N, C, H_out, W_out)
+        output_strides = (output.stride(0), output.stride(1), output.stride(2), output.stride(3))
     else:
-        output = torch.empty((N, C, H_out, W_out), dtype=input.dtype, device=input.device)
-    
-    # Flatten output for kernel
-    output_flat = output.view(-1)
-    
-    # Calculate total elements in output
-    total_elements = H_out * W_out
+        output = torch.empty(C, H_out, W_out, dtype=input.dtype, device=input.device)
+        output_shape = (C, H_out, W_out)
+        output_strides = (output.stride(0), output.stride(1), output.stride(2))
     
     # Launch kernel
+    if N > 0:
+        total_elements = N * C * H_out * W_out
+    else:
+        total_elements = C * H_out * W_out
+    
     block_size = 256
     grid_size = triton.cdiv(total_elements, block_size)
     
-    # Call kernel
     _adaptive_avg_pool2d_kernel[grid_size](
-        input_flat,
-        output_flat,
-        input.shape,
-        output.shape,
+        input, 
+        output,
+        input_shape,
+        output_shape,
+        input_strides,
+        output_strides,
         H_in,
         W_in,
         H_out,
         W_out,
         C,
         N,
-        block_size
+        BLOCK_SIZE=block_size
     )
     
     return output

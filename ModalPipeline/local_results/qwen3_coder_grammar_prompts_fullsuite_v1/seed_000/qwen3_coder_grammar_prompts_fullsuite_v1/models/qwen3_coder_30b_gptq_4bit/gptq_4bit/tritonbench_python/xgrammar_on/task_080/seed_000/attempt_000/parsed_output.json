@@ -1,0 +1,4 @@
+{
+  "instruction": "Solve the linear system Ax = b using QR decomposition. This function combines the QR decomposition with solving a linear system. Given a matrix A and a vector (or matrix) b, it performs the QR decomposition of A and computes the solution x using the formula x = R^{-1} (Q^T b).",
+  "predict": "import torch\nimport triton\nimport triton.language as tl\n\ndef fused_qr_solve(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:\n    m, n = A.shape\n    k = b.shape[1]\n    \n    # Perform QR decomposition using torch\n    Q, R = torch.linalg.qr(A)\n    \n    # Solve Rx = Q^T b\n    # First compute Q^T b\n    Qb = torch.matmul(Q.transpose(0, 1), b)\n    \n    # Then solve Rx = Q^T b using triangular solver\n    x = torch.triangular_solve(Qb, R, upper=True)[0]\n    \n    return x"
+}

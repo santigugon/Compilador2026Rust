@@ -12,8 +12,8 @@ def _signbit_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     # For IEEE 754 float32/64, the sign bit is the most significant bit
     # We can use bit manipulation to check this
     x_bits = tl.cast_to_shared(x, tl.int32)
-    sign_bits = (x_bits >> 31) & 1  # Extract sign bit for float32
-    tl.store(out_ptr + offsets, sign_bits, mask=mask)
+    sign_bit = (x_bits >> 31) & 1
+    tl.store(out_ptr + offsets, sign_bit, mask=mask)
 
 def signbit(input, *, out=None):
     if out is None:

@@ -10,101 +10,119 @@ def _qr_decomposition_kernel(A_ptr, R_ptr, Q_ptr, n: tl.constexpr, BLOCK: tl.con
     v = tl.shared_ptr(tl.zeros((BLOCK,), dtype=tl.float32), shape=(BLOCK,))
     
     for k in range(n):
-        # Compute the Householder reflector for column k
-        # Load the k-th column of A
-        col_offsets = k + tl.arange(0, BLOCK) * n
-        col_data = tl.load(A_ptr + col_offsets, mask=(k + tl.arange(0, BLOCK)) < n, other=0.0)
+        # Compute Householder reflector
+        # Load column k
+        for i in range(k, n):
+            v[i - k] = tl.load(A_ptr + i * n + k)
         
-        # Compute the norm of the column vector
-        norm_sq = tl.sum(col_data * col_data)
+        # Compute norm of v
+        norm_sq = tl.sum(v[:n-k] * v[:n-k])
         norm = tl.sqrt(norm_sq)
         
-        # Compute the Householder vector v
-        if k == 0:
-            v[0] = col_data[0] + tl.sign(col_data[0]) * norm
-        else:
-            v[0] = col_data[0]
-        for i in range(1, BLOCK):
-            if i + k < n:
-                v[i] = col_data[i]
-            else:
-                v[i] = 0.0
-        
-        # Normalize v
-        v_norm_sq = tl.sum(v * v)
-        v_norm = tl.sqrt(v_norm_sq)
-        v = v / (v_norm + 1e-12)  # Add small epsilon to avoid division by zero
-        
-        # Compute the Householder reflector H = I - 2 * v * v^T
-        # Apply H to the remaining columns of A
-        for j in range(k, n):
-            # Compute the dot product of v and column j
-            dot_product = 0.0
-            for i in range(BLOCK):
-                if i + k < n:
-                    dot_product += v[i] * tl.load(A_ptr + (i + k) + j * n, mask=(i + k) < n, other=0.0)
+        # Compute reflector
+        if norm > 1e-12:  # Avoid division by zero
+            v[0] = v[0] + tl.sign(v[0]) * norm
+            v[0] = v[0] / (2.0 * norm)
+            # Normalize v
+            v[0] = v[0] / tl.sqrt(v[0] * v[0] + tl.sum(v[1:n-k] * v[1:n-k]))
             
-            # Apply the reflector
-            for i in range(BLOCK):
-                if i + k < n:
-                    val = tl.load(A_ptr + (i + k) + j * n, mask=(i + k) < n, other=0.0)
-                    new_val = val - 2.0 * dot_product * v[i]
-                    tl.store(A_ptr + (i + k) + j * n, new_val, mask=(i + k) < n)
+            # Apply Householder transformation to A
+            for j in range(k, n):
+                # Compute dot product of v and column j
+                dot_prod = tl.sum(v[:n-k] * tl.load(A_ptr + (k + tl.arange(0, n-k)) * n + j))
+                # Apply transformation
+                for i in range(k, n):
+                    tl.store(A_ptr + i * n + j, 
+                            tl.load(A_ptr + i * n + j) - 2.0 * dot_prod * v[i-k])
+        
+        # Store R matrix
+        for i in range(k, n):
+            if i == k:
+                tl.store(R_ptr + k * n + k, tl.load(A_ptr + k * n + k))
+            else:
+                tl.store(R_ptr + i * n + k, tl.load(A_ptr + i * n + k))
+        
+        # Store Q matrix (simplified version)
+        if Q_ptr is not None:
+            for i in range(n):
+                if i == k:
+                    tl.store(Q_ptr + i * n + k, 1.0)
+                else:
+                    tl.store(Q_ptr + i * n + k, 0.0)
 
 @triton.jit
-def _determinant_kernel(R_ptr, det_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
-    # Compute the product of diagonal elements of R
+def _diagonal_product_kernel(R_ptr, det_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     
     # Load diagonal elements
-    diag_elements = tl.load(R_ptr + offsets * (n + 1), mask=mask, other=1.0)
+    diag = tl.load(R_ptr + offsets * n + offsets, mask=mask, other=1.0)
     
-    # Compute product of diagonal elements
-    det = tl.prod(diag_elements)
+    # Compute product
+    result = tl.prod(diag)
     
     # Store result
-    tl.store(det_ptr, det)
+    tl.store(det_ptr, result)
 
 def determinant_via_qr(A, *, mode='reduced', out=None):
-    if not torch.is_tensor(A):
-        raise TypeError("Input must be a tensor")
-    
-    if A.dim() != 2:
-        raise ValueError("Input must be a 2D tensor")
-    
-    if A.size(0) != A.size(1):
+    if A.dim() != 2 or A.size(0) != A.size(1):
         raise ValueError("Input must be a square matrix")
     
     n = A.size(0)
-    
-    # For small matrices, use PyTorch's implementation for numerical stability
-    if n <= 4:
-        return torch.linalg.det(A)
+    if n == 0:
+        return torch.tensor(1.0, dtype=A.dtype, device=A.device)
     
     # Create output tensor
     if out is not None:
-        if out.shape != torch.Size([]):
-            raise ValueError("Output tensor must be a scalar")
+        if out.shape != () or out.dtype != A.dtype:
+            raise ValueError("Output tensor must be a scalar with matching dtype")
         det = out
     else:
         det = torch.empty((), dtype=A.dtype, device=A.device)
     
-    # For larger matrices, we'll use a simplified approach
-    # In practice, a full QR decomposition would be more complex
-    # Here we use a simplified version that works for most cases
+    # For small matrices, use direct computation
+    if n <= 4:
+        return torch.det(A)
     
-    # Use PyTorch's QR decomposition for now
-    Q, R = torch.linalg.qr(A, mode=mode)
+    # For larger matrices, use QR decomposition approach
+    # Create a copy of A for QR decomposition
+    A_copy = A.clone()
     
-    # Compute determinant as product of diagonal elements of R
-    det_val = torch.prod(torch.diag(R))
+    # Perform QR decomposition using Householder reflections
+    # This is a simplified implementation - in practice, you'd want a more robust QR routine
+    R = torch.zeros_like(A_copy)
+    
+    # Simple QR decomposition for demonstration
+    # In a real implementation, this would be more complex
+    for k in range(n):
+        # Compute Householder reflector
+        x = A_copy[k:, k]
+        x_norm = torch.norm(x)
+        if x_norm > 1e-12:
+            v = x.clone()
+            v[0] = v[0] + torch.sign(v[0]) * x_norm
+            v = v / torch.norm(v)
+            
+            # Apply Householder transformation
+            for j in range(k, n):
+                dot_prod = torch.dot(v, A_copy[k:, j])
+                A_copy[k:, j] = A_copy[k:, j] - 2 * dot_prod * v
+    
+    # Extract diagonal elements of R
+    diag_elements = torch.diag(A_copy)
+    
+    # Compute determinant as product of diagonal elements
+    det_val = torch.prod(diag_elements)
+    
+    # Handle sign of determinant
+    # Count number of negative diagonal elements
+    neg_count = torch.sum(diag_elements < 0).item()
+    if neg_count % 2 == 1:
+        det_val = -det_val
     
     # Store result
-    if out is not None:
-        out.copy_(det_val)
-        return out
-    else:
-        return det_val
+    det.fill_(det_val)
+    
+    return det
 ```

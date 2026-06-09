@@ -11,7 +11,7 @@ def _matmul_kernel(
     stride_bk, stride_bn,
     stride_cm, stride_cn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr = 8
+    GROUP_M: tl.constexpr
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -20,30 +20,27 @@ def _matmul_kernel(
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_M
     remaining = pid % num_pid_in_group
-    if remaining < GROUP_M:
-        pid_m = first_pid_m + remaining
-        pid_n = 0
-    else:
-        pid_m = first_pid_m + (remaining - GROUP_M) // (num_pid_n - GROUP_M)
-        pid_n = (remaining - GROUP_M) % (num_pid_n - GROUP_M) + 1
+    pid_m = first_pid_m + (remaining % GROUP_M)
+    pid_n = remaining // GROUP_M
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
     offs_k = tl.arange(0, BLOCK_K)
-    
-    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
-    
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k, other=0.0)
-        accumulator += tl.dot(a, b)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0.0)
+        accumulator = tl.dot(a, b, accumulator)
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
-    
-    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
-    tl.store(c_ptrs, accumulator, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
+    tl.store(c_ptrs, accumulator, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
 def matmul(input, other, *, out=None):
     if input.dim() == 1 and other.dim() == 1:
@@ -69,9 +66,17 @@ def matmul(input, other, *, out=None):
             if out.shape != (input.size(0), other.size(1)):
                 raise RuntimeError("Output tensor shape mismatch")
         
+        # Handle different data types
+        if input.dtype == torch.float16 or other.dtype == torch.float16:
+            # For float16, we need to ensure proper handling
+            if input.dtype != torch.float16:
+                input = input.to(torch.float16)
+            if other.dtype != torch.float16:
+                other = other.to(torch.float16)
+        
+        # Launch kernel
         M, K = input.shape
         K, N = other.shape
-        
         BLOCK_M = 64
         BLOCK_N = 64
         BLOCK_K = 32
@@ -96,12 +101,19 @@ def matmul(input, other, *, out=None):
             if out.shape != (*input.shape[:-2], input.size(-2), other.size(-1)):
                 raise RuntimeError("Output tensor shape mismatch")
         
-        # Handle batch dimensions
+        # Handle different data types
+        if input.dtype == torch.float16 or other.dtype == torch.float16:
+            if input.dtype != torch.float16:
+                input = input.to(torch.float16)
+            if other.dtype != torch.float16:
+                other = other.to(torch.float16)
+        
+        # For batched operations, we need to handle the batch dimensions
         batch_shape = input.shape[:-2]
         batch_size = 1
         for dim in batch_shape:
             batch_size *= dim
-            
+        
         # Flatten batch dimensions
         input_flat = input.view(batch_size, input.size(-2), input.size(-1))
         other_flat = other.view(batch_size, other.size(-2), other.size(-1))
@@ -111,7 +123,6 @@ def matmul(input, other, *, out=None):
         for i in range(batch_size):
             M, K = input_flat[i].shape
             K, N = other_flat[i].shape
-            
             BLOCK_M = 64
             BLOCK_N = 64
             BLOCK_K = 32
@@ -127,5 +138,6 @@ def matmul(input, other, *, out=None):
                 out_flat[i].stride(0), out_flat[i].stride(1),
                 BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M
             )
+        
         return out
 ```

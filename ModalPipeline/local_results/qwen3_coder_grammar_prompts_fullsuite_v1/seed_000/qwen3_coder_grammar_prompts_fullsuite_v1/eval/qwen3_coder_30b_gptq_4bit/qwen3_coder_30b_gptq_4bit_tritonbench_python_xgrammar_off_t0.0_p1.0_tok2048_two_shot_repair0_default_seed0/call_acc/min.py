@@ -4,40 +4,42 @@ import triton.language as tl
 
 @triton.jit
 def _min_row_kernel(input_ptr, output_ptr, indices_ptr, n_rows: tl.constexpr, n_cols: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    if pid >= n_rows:
+    # Each program handles one row
+    row_id = tl.program_id(0)
+    if row_id >= n_rows:
         return
     
-    # Process one row at a time
-    row_offset = pid * n_cols
-    min_val = tl.full([1], float('inf'), dtype=tl.float32)
-    min_idx = tl.full([1], 0, dtype=tl.int64)
+    # Load the row
+    offsets = row_id * n_cols + tl.arange(0, BLOCK)
+    mask = offsets < n_rows * n_cols
     
-    # Load all elements in the row
+    # Initialize min and index
+    min_val = tl.full([1], float('inf'), dtype=tl.float32)
+    min_idx = tl.full([1], 0, dtype=tl.int32)
+    
+    # Process the row in chunks
     for i in range(0, n_cols, BLOCK):
-        offsets = i + tl.arange(0, BLOCK)
-        mask = offsets < n_cols
-        x = tl.load(input_ptr + row_offset + offsets, mask=mask, other=0.0)
+        # Compute offsets for this chunk
+        chunk_offsets = offsets + i
+        chunk_mask = chunk_offsets < n_rows * n_cols
+        
+        # Load values
+        values = tl.load(input_ptr + chunk_offsets, mask=chunk_mask, other=0.0)
         
         # Find min and index
         for j in range(BLOCK):
-            if offsets[j] < n_cols:
-                val = x[j]
+            if chunk_mask[j]:
+                val = values[j]
                 if val < min_val:
                     min_val = val
-                    min_idx = offsets[j]
+                    min_idx = chunk_offsets[j] - row_id * n_cols
     
     # Store results
-    tl.store(output_ptr + pid, min_val)
-    tl.store(indices_ptr + pid, min_idx)
+    tl.store(output_ptr + row_id, min_val)
+    tl.store(indices_ptr + row_id, min_idx)
 
 def min(input, dim, keepdim=False, *, out=None):
-    # Handle scalar input
-    if input.dim() == 0:
-        input = input.unsqueeze(0)
-        dim = 0
-    
-    # Normalize dim
+    # Handle negative dimension
     if dim < 0:
         dim = input.dim() + dim
     
@@ -49,88 +51,67 @@ def min(input, dim, keepdim=False, *, out=None):
     # Calculate number of rows and columns
     for i in range(len(shape)):
         if i == dim:
-            n_rows = shape[i]
+            n_cols = shape[i]
         else:
-            n_cols *= shape[i]
+            n_rows *= shape[i]
     
     # Create output tensors
     if out is not None:
-        output, indices = out
+        min_out, indices_out = out
     else:
         if keepdim:
             output_shape = list(shape)
             output_shape[dim] = 1
-            output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
-            indices = torch.empty(output_shape, dtype=torch.long, device=input.device)
         else:
-            output_shape = list(shape)
-            output_shape.pop(dim)
-            output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
-            indices = torch.empty(output_shape, dtype=torch.long, device=input.device)
+            output_shape = [shape[i] for i in range(len(shape)) if i != dim]
+        
+        min_out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+        indices_out = torch.empty(output_shape, dtype=torch.long, device=input.device)
     
-    # Handle special case of single element
-    if n_rows == 1:
+    # Handle special case where there's only one element
+    if n_rows == 1 and n_cols == 1:
+        min_out = input.clone()
+        indices_out = torch.zeros_like(indices_out)
         if out is not None:
-            output.copy_(input)
-            indices.fill_(0)
-        else:
-            return (input, torch.zeros_like(indices))
+            out[0].copy_(min_out)
+            out[1].copy_(indices_out)
+        return (min_out, indices_out)
     
-    # For small tensors, use PyTorch implementation
+    # For small tensors, use PyTorch's implementation
     if n_rows * n_cols <= 1024:
         if out is not None:
-            # Use PyTorch for small tensors
-            torch_out, torch_indices = torch.min(input, dim=dim, keepdim=keepdim)
-            output.copy_(torch_out)
-            indices.copy_(torch_indices)
+            torch.min(input, dim=dim, keepdim=keepdim, out=out)
+            return out
         else:
             return torch.min(input, dim=dim, keepdim=keepdim)
     
-    # Use Triton for larger tensors
+    # Use Triton kernel for larger tensors
     block = 256
-    grid = (triton.cdiv(n_rows, 1),)
+    grid = (n_rows,)
     
-    # Flatten input for easier processing
-    if dim == 0:
-        # If reducing along first dimension, we need to process each row
-        input_flat = input.view(n_rows, -1)
-        output_flat = output.view(n_rows, -1) if keepdim else output.view(-1)
-        indices_flat = indices.view(n_rows, -1) if keepdim else indices.view(-1)
-        
-        # Process each row
-        for i in range(n_rows):
-            row_input = input_flat[i]
-            row_output = output_flat[i] if keepdim else output_flat
-            row_indices = indices_flat[i] if keepdim else indices_flat
-            
-            # Find min in this row
-            min_val, min_idx = torch.min(row_input, dim=0, keepdim=False)
-            if keepdim:
-                output_flat[i] = min_val
-                indices_flat[i] = min_idx
-            else:
-                output_flat[i] = min_val
-                indices_flat[i] = min_idx
-    else:
-        # For other dimensions, use a more complex approach
-        # This is a simplified version that handles the most common case
-        input_flat = input.view(-1, shape[dim])
-        output_flat = output.view(-1, 1) if keepdim else output.view(-1)
-        indices_flat = indices.view(-1, 1) if keepdim else indices.view(-1)
-        
-        # Use PyTorch for now as it's more reliable for complex cases
-        if out is not None:
-            torch_out, torch_indices = torch.min(input, dim=dim, keepdim=keepdim)
-            output.copy_(torch_out)
-            indices.copy_(torch_indices)
+    # Ensure input is contiguous
+    input_contiguous = input.contiguous()
+    
+    # Allocate output tensors
+    if out is None:
+        if keepdim:
+            output_shape = list(shape)
+            output_shape[dim] = 1
         else:
-            return torch.min(input, dim=dim, keepdim=keepdim)
+            output_shape = [shape[i] for i in range(len(shape)) if i != dim]
+        
+        min_out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+        indices_out = torch.empty(output_shape, dtype=torch.long, device=input.device)
     
-    # Return results
+    # Launch kernel
+    _min_row_kernel[grid](input_contiguous, min_out, indices_out, n_rows, n_cols, BLOCK=block)
+    
     if out is not None:
-        return (output, indices)
+        out[0].copy_(min_out)
+        out[1].copy_(indices_out)
+        return out
     else:
-        return (output, indices)
+        return (min_out, indices_out)
 
 ##################################################################################################################################################
 

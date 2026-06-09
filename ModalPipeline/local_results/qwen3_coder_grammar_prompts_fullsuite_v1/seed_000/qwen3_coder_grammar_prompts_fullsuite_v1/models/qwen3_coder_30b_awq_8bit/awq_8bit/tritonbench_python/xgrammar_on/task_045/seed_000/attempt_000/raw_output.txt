@@ -1,0 +1,4 @@
+{
+  "instruction": "Reconstructs the input matrix `A` using its Singular Value Decomposition (SVD). This function combines the Singular Value Decomposition (SVD) with matrix reconstruction. Given a matrix `A`, it performs the following operations: 1. Compute the SVD of `A`: A = U Σ V^H, where `U` and `Vh` are unitary matrices and `S` contains the singular values of `A`. 2. Reconstruct `A` as A_reconstructed = U Σ V^H.",
+  "predict": "import torch\nimport triton\nimport triton.language as tl\n\ndef fused_svd_reconstruct(A):\n    # For this implementation, we'll use PyTorch's SVD function\n    # since Triton doesn't have a direct SVD implementation\n    # and the reconstruction is a simple matrix multiplication\n    U, S, Vh = torch.linalg.svd(A, full_matrices=False)\n    # Reconstruct A as U @ diag(S) @ Vh\n    return U @ torch.diag(S) @ Vh"
+}

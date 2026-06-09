@@ -20,7 +20,6 @@ def leaky_relu(input, negative_slope=0.01, inplace=False):
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
-    
     _leaky_relu_kernel[grid](input, out, n, negative_slope, BLOCK=block)
     return out
 

@@ -1,0 +1,4 @@
+{
+  "instruction": "Computes the solution `x` to the equation `Ax = b` using LU decomposition. Given matrix `A`, this function performs LU decomposition and then solves for `x` in `L @ U @ x = b`, where `P`, `L`, and `U` are derived from the LU decomposition.",
+  "predict": "import torch\nimport triton\nimport triton.language as tl\n\ndef fused_lu_solve(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:\n    n = A.shape[0]\n    \n    # Perform LU decomposition using torch's built-in function\n    # This is a safe fallback since Triton doesn't have a full LU decomposition kernel\n    lu, pivots = torch.lu(A)\n    \n    # Solve the system using the LU decomposition\n    # torch.lu_solve is not available in all versions, so we use torch.solve\n    # which internally uses LU decomposition\n    x = torch.solve(b.unsqueeze(1), A).solution.squeeze(1)\n    \n    return x"
+}

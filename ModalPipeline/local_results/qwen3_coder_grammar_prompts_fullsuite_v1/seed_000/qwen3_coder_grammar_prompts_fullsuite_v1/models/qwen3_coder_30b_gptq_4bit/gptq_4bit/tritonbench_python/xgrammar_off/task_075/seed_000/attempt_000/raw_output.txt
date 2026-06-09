@@ -77,21 +77,22 @@ def fused_cholesky_solve(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     # Allocate memory for L
     L = torch.empty(n, n, dtype=A.dtype, device=A.device)
     
+    # Copy A to L for Cholesky decomposition
+    L.copy_(A)
+    
     # Compute Cholesky decomposition
     block = 16
     grid = (n, 1, 1)
-    _cholesky_kernel[grid](A, L, n, BLOCK=block)
+    _cholesky_kernel[grid](L, L, n, BLOCK=block)
     
     # Copy b to x
     x.copy_(b)
     
     # Forward substitution: L * x = b
-    block = 16
     grid = (k, 1, 1)
     _forward_substitution_kernel[grid](L, b, x, n, k, BLOCK=block)
     
     # Backward substitution: L.T * x = x
-    block = 16
     grid = (k, 1, 1)
     _backward_substitution_kernel[grid](L, x, n, k, BLOCK=block)
     

@@ -20,20 +20,19 @@ def relu_sqrt(input, inplace=False, out=None):
         # and modify it in place
         if not input.is_contiguous():
             input = input.contiguous()
-        # Apply the operation in place
+        # Apply ReLU and sqrt in place
         n = input.numel()
         block = 256
         grid = (triton.cdiv(n, block),)
         _relu_sqrt_kernel[grid](input, input, n, BLOCK=block)
         return input
     else:
-        # For non-inplace operation, use the provided out tensor or create a new one
+        # For non-inplace operation, create output tensor
         if out is not None:
-            # Check if out tensor has the same shape as input
-            if out.shape != input.shape:
-                raise ValueError("Output tensor must have the same shape as input tensor")
-            out = out.contiguous()
+            # Use provided output tensor
+            out = torch.empty_like(out)
         else:
+            # Create new output tensor
             out = torch.empty_like(input)
         
         n = input.numel()

@@ -9,7 +9,7 @@ def _silu_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    # SiLU = x * sigmoid(x) = x / (1 + exp(-x))
+    # SiLU: x * sigmoid(x) = x / (1 + exp(-x))
     silu = x / (1.0 + tl.exp(-x))
     tl.store(out_ptr + offsets, silu, mask=mask)
 
@@ -48,9 +48,9 @@ def fused_silu_layer_norm_conv2d(x, weight, conv_weight, conv_bias=None,
                                 conv_stride=1, conv_padding=0, conv_dilation=1, 
                                 conv_groups=1, ln_eps=1e-5):
     # Perform convolution
-    conv_out = torch.nn.functional.conv2d(
-        x, conv_weight, conv_bias, conv_stride, conv_padding, conv_dilation, conv_groups
-    )
+    conv_out = torch.nn.functional.conv2d(x, conv_weight, conv_bias, 
+                                        stride=conv_stride, padding=conv_padding, 
+                                        dilation=conv_dilation, groups=conv_groups)
     
     # Layer normalization
     batch, channels, height, width = conv_out.shape
@@ -60,7 +60,7 @@ def fused_silu_layer_norm_conv2d(x, weight, conv_weight, conv_bias=None,
     norm_out = (conv_out - mean) / torch.sqrt(var + ln_eps)
     
     # Apply weight
-    norm_out = norm_out * weight.view(1, -1, 1, 1)
+    norm_out = norm_out * weight.view(1, channels, 1, 1)
     
     # Apply SiLU activation
     out = torch.empty_like(norm_out)

@@ -50,35 +50,44 @@ def fused_pairwise_distance_normalize(x1: torch.Tensor, x2: torch.Tensor, p_norm
     x1_flat = x1.view(-1, x1.size(-1))
     x2_flat = x2.view(-1, x2.size(-1))
     
-    n1 = x1_flat.numel()
-    n2 = x2_flat.numel()
-    dim_size = x1_flat.size(-1)
+    n1 = x1_flat.size(0)
+    n2 = x2_flat.size(0)
+    dim_size = x1_flat.size(1)
     
     # Normalize x1
     block = 256
-    grid1 = (triton.cdiv(n1, block),)
-    _normalize_kernel[grid1](x1_flat, x1_normalized.view(-1, dim_size), n1, dim_size, p_norm, eps_norm, BLOCK=block)
+    grid1 = (triton.cdiv(n1 * dim_size, block),)
+    _normalize_kernel[grid1](x1_flat, x1_normalized.view(-1, dim_size), n1 * dim_size, dim_size, p_norm, eps_norm, BLOCK=block)
     
     # Normalize x2
-    grid2 = (triton.cdiv(n2, block),)
-    _normalize_kernel[grid2](x2_flat, x2_normalized.view(-1, dim_size), n2, dim_size, p_norm, eps_norm, BLOCK=block)
+    grid2 = (triton.cdiv(n2 * dim_size, block),)
+    _normalize_kernel[grid2](x2_flat, x2_normalized.view(-1, dim_size), n2 * dim_size, dim_size, p_norm, eps_norm, BLOCK=block)
     
     # Compute pairwise distances
-    out = torch.empty(x1.size(0), x2.size(0), dtype=torch.float32, device=x1.device)
+    out = torch.empty(n1, n2, dtype=torch.float32, device=x1.device)
     
-    # Reshape for pairwise computation
-    x1_expanded = x1_normalized.unsqueeze(1)  # [batch1, 1, features]
-    x2_expanded = x2_normalized.unsqueeze(0)  # [1, batch2, features]
-    
-    # Compute distances using broadcasting
-    diff = x1_expanded - x2_expanded  # [batch1, batch2, features]
-    
-    if p_norm == 2.0:
-        distances = torch.sqrt(torch.sum(diff * diff, dim=-1) + eps_distance)
-    elif p_norm == 1.0:
-        distances = torch.sum(torch.abs(diff), dim=-1) + eps_distance
+    # For simplicity, we'll use a simple approach for computing pairwise distances
+    # This is a simplified version that works for small tensors
+    if n1 * n2 <= 10000:  # For small tensors, we can compute directly
+        for i in range(n1):
+            for j in range(n2):
+                diff = x1_normalized[i] - x2_normalized[j]
+                if p_norm == 2.0:
+                    dist = torch.sqrt(torch.sum(diff * diff) + eps_distance)
+                elif p_norm == 1.0:
+                    dist = torch.sum(torch.abs(diff)) + eps_distance
+                else:
+                    dist = torch.pow(torch.sum(torch.pow(torch.abs(diff), p_norm)) + eps_distance, 1.0 / p_norm)
+                out[i, j] = dist
     else:
-        distances = torch.pow(torch.sum(torch.pow(torch.abs(diff), p_norm), dim=-1) + eps_distance, 1.0 / p_norm)
+        # For larger tensors, use a more efficient approach
+        # This is a placeholder for a more complex kernel
+        out = torch.cdist(x1_normalized, x2_normalized, p=p_norm, compute_mode='use_mm_for_euclid_dist' if p_norm == 2.0 else 'donot_use_mm_for_euclid_dist')
+        if p_norm != 2.0:
+            out = torch.pow(out, p_norm) + eps_distance
+            out = torch.pow(out, 1.0 / p_norm)
+        else:
+            out = torch.sqrt(out * out + eps_distance)
     
-    return distances
+    return out
 ```

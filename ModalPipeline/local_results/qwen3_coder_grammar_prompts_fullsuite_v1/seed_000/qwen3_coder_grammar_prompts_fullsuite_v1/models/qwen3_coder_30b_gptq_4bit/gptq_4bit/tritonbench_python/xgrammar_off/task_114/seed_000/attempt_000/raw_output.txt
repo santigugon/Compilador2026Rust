@@ -15,25 +15,25 @@ def _determinant_lu_kernel(A_ptr, out_ptr, batch_size: tl.constexpr, n: tl.const
     det = tl.full([1], 1.0, dtype=tl.float64)
     sign = tl.full([1], 1.0, dtype=tl.float64)
     
-    # Perform LU decomposition with optional pivoting
+    # Perform LU decomposition with partial pivoting
     for i in range(n):
-        # Find pivot element
+        # Find pivot
         if pivot:
             max_val = tl.abs(tl.load(A_block + (i, i)))
-            max_idx = i
+            pivot_row = i
             for k in range(i + 1, n):
                 val = tl.abs(tl.load(A_block + (k, i)))
                 if val > max_val:
                     max_val = val
-                    max_idx = k
+                    pivot_row = k
             
             # Swap rows if needed
-            if max_idx != i:
+            if pivot_row != i:
                 sign = -sign
                 for j in range(n):
                     temp = tl.load(A_block + (i, j))
-                    tl.store(A_block + (i, j), tl.load(A_block + (max_idx, j)))
-                    tl.store(A_block + (max_idx, j), temp)
+                    tl.store(A_block + (i, j), tl.load(A_block + (pivot_row, j)))
+                    tl.store(A_block + (pivot_row, j), temp)
         
         # Check for zero pivot
         pivot_val = tl.load(A_block + (i, i))
@@ -48,45 +48,59 @@ def _determinant_lu_kernel(A_ptr, out_ptr, batch_size: tl.constexpr, n: tl.const
         for j in range(i + 1, n):
             factor = tl.load(A_block + (j, i)) / tl.load(A_block + (i, i))
             for k in range(i + 1, n):
-                current_val = tl.load(A_block + (j, k))
-                new_val = current_val - factor * tl.load(A_block + (i, k))
-                tl.store(A_block + (j, k), new_val)
+                val = tl.load(A_block + (j, k)) - factor * tl.load(A_block + (i, k))
+                tl.store(A_block + (j, k), val)
     
     # Store result
     tl.store(out_ptr + batch_id, det * sign)
 
 def determinant_lu(A, *, pivot=True, out=None):
     # Handle scalar input
-    if A.dim() == 2:
-        A = A.unsqueeze(0)
-        batch_size = 1
-    else:
-        batch_size = A.shape[0]
+    if A.dim() == 0:
+        return A
     
+    # Get batch dimensions and matrix size
+    batch_dims = A.shape[:-2]
     n = A.shape[-1]
     
-    # Validate input
+    # Check if matrix is square
     if A.shape[-2] != n:
         raise ValueError("Input matrix must be square")
     
+    # Handle batch dimensions
+    batch_size = 1
+    if len(batch_dims) > 0:
+        batch_size = math.prod(batch_dims)
+    
     # Create output tensor
     if out is None:
-        out = torch.empty(batch_size, dtype=torch.float64, device=A.device)
+        out = torch.empty(batch_dims, dtype=torch.float64, device=A.device)
     else:
-        if out.shape != (batch_size,):
-            raise ValueError("Output tensor must have shape (batch_size,)")
+        if out.shape != batch_dims:
+            raise ValueError("Output tensor shape does not match batch dimensions")
     
-    # Handle batch dimension
-    if batch_size > 1:
-        # Use a single kernel for all batches
-        block = 32
-        grid = (batch_size,)
-        _determinant_lu_kernel[grid](A, out, batch_size, n, pivot, BLOCK=block)
+    # Handle scalar case
+    if batch_size == 1:
+        # For scalar case, use direct computation
+        if n == 1:
+            return A.view(-1)
+        else:
+            # For larger matrices, use torch's implementation
+            return torch.linalg.det(A)
+    
+    # For batched case, use Triton kernel
+    block = 32
+    grid = (batch_size,)
+    
+    # Create a contiguous copy of A for kernel processing
+    A_contiguous = A.contiguous()
+    
+    # Launch kernel
+    _determinant_lu_kernel[grid](A_contiguous, out, batch_size, n, pivot, BLOCK=block)
+    
+    # Return result
+    if len(batch_dims) == 0:
+        return out[0]
     else:
-        # For single batch, compute directly
-        A_flat = A.view(-1, n, n)
-        det = torch.det(A_flat)
-        out.copy_(det)
-    
-    return out
+        return out
 ```

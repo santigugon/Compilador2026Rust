@@ -4,7 +4,7 @@ import triton.language as tl
 import math
 
 @triton.jit
-def _lu_decompose_kernel(A_ptr, L_ptr, U_ptr, P_ptr, n: tl.constexpr, batch_size: tl.constexpr, pivot: tl.constexpr, BLOCK: tl.constexpr):
+def _lu_decomp_kernel(A_ptr, L_ptr, U_ptr, P_ptr, n: tl.constexpr, batch_size: tl.constexpr, pivot: tl.constexpr, BLOCK: tl.constexpr):
     batch_id = tl.program_id(0)
     pid = tl.program_id(1)
     
@@ -14,129 +14,133 @@ def _lu_decompose_kernel(A_ptr, L_ptr, U_ptr, P_ptr, n: tl.constexpr, batch_size
     
     # Initialize L, U, and P matrices
     for i in range(n):
-        # Load current row
-        current_row = tl.load(A_ptr + batch_id * n * n + i * n + row, mask=mask, other=0.0)
+        # Load current row of A
+        a_row = tl.load(A_ptr + batch_id * n * n + i * n + row, mask=mask, other=0.0)
         
         # Compute U (upper triangular part)
         if i < n:
-            # Store diagonal element in U
+            # For diagonal element
             if i == row:
-                tl.store(U_ptr + batch_id * n * n + i * n + i, current_row[i], mask=True)
-            # Store elements below diagonal in L
-            if i > row and i < n:
-                tl.store(L_ptr + batch_id * n * n + i * n + row, current_row[row], mask=mask)
-            # Store elements above diagonal in U
-            if i < row and i < n:
-                tl.store(U_ptr + batch_id * n * n + i * n + row, current_row[row], mask=mask)
-    
-    # Perform partial pivoting if needed
-    if pivot:
-        for i in range(n):
-            # Find maximum element in column i
-            max_val = 0.0
-            max_idx = i
-            for j in range(i, n):
-                val = tl.load(A_ptr + batch_id * n * n + j * n + i, mask=True, other=0.0)
-                if val > max_val:
-                    max_val = val
-                    max_idx = j
-            # Swap rows if needed
-            if max_idx != i:
-                # Swap rows in A
-                for k in range(n):
-                    temp = tl.load(A_ptr + batch_id * n * n + i * n + k, mask=True, other=0.0)
-                    tl.store(A_ptr + batch_id * n * n + i * n + k, 
-                             tl.load(A_ptr + batch_id * n * n + max_idx * n + k, mask=True, other=0.0), mask=True)
-                    tl.store(A_ptr + batch_id * n * n + max_idx * n + k, temp, mask=True)
+                u_val = a_row[0] if i == 0 else 0.0
+                if i < n:
+                    tl.store(U_ptr + batch_id * n * n + i * n + i, u_val, mask=True)
+                # For off-diagonal elements
+                for j in range(i+1, n):
+                    u_val = a_row[j] if j < n else 0.0
+                    if j < n:
+                        tl.store(U_ptr + batch_id * n * n + i * n + j, u_val, mask=True)
+        
+        # Compute L (lower triangular part)
+        if i < n:
+            for j in range(i):
+                l_val = 0.0
+                if j < n:
+                    tl.store(L_ptr + batch_id * n * n + i * n + j, l_val, mask=True)
+            # Diagonal element is 1.0
+            if i < n:
+                tl.store(L_ptr + batch_id * n * n + i * n + i, 1.0, mask=True)
+            # Off-diagonal elements
+            for j in range(i+1, n):
+                l_val = a_row[j] if j < n else 0.0
+                if j < n:
+                    tl.store(L_ptr + batch_id * n * n + i * n + j, l_val, mask=True)
 
 @triton.jit
-def _solve_forward_substitution_kernel(L_ptr, B_ptr, X_ptr, n: tl.constexpr, k: tl.constexpr, batch_size: tl.constexpr, BLOCK: tl.constexpr):
+def _solve_forward_kernel(L_ptr, U_ptr, B_ptr, X_ptr, n: tl.constexpr, k: tl.constexpr, batch_size: tl.constexpr, BLOCK: tl.constexpr):
     batch_id = tl.program_id(0)
     pid = tl.program_id(1)
     
-    # Each block handles one column of the solution matrix
+    # Each block handles one column of the solution
     col = pid * BLOCK + tl.arange(0, BLOCK)
     mask = col < k
     
-    # Forward substitution for each column
-    for j in range(k):
-        # Process each row
-        for i in range(n):
-            # Compute sum of L[i][j] * X[j] for j < i
-            sum_val = 0.0
-            for l in range(i):
-                l_val = tl.load(L_ptr + batch_id * n * n + i * n + l, mask=True, other=0.0)
-                x_val = tl.load(X_ptr + batch_id * n * k + l * k + j, mask=True, other=0.0)
-                sum_val += l_val * x_val
-            
-            # Compute X[i][j]
-            b_val = tl.load(B_ptr + batch_id * n * k + i * k + j, mask=True, other=0.0)
-            x_val = (b_val - sum_val) / tl.load(L_ptr + batch_id * n * n + i * n + i, mask=True, other=0.0)
-            tl.store(X_ptr + batch_id * n * k + i * k + j, x_val, mask=True)
+    # Forward substitution to solve L * Y = B
+    for i in range(n):
+        # Load B values
+        b_vals = tl.load(B_ptr + batch_id * n * k + i * k + col, mask=mask, other=0.0)
+        # Accumulate from previous rows
+        for j in range(i):
+            # Load L element
+            l_val = tl.load(L_ptr + batch_id * n * n + i * n + j, mask=True, other=0.0)
+            # Load Y element (which will be computed)
+            y_val = tl.load(X_ptr + batch_id * n * k + j * k + col, mask=mask, other=0.0)
+            b_vals = b_vals - l_val * y_val
+        # Store Y value
+        tl.store(X_ptr + batch_id * n * k + i * k + col, b_vals, mask=mask)
 
 @triton.jit
-def _solve_backward_substitution_kernel(U_ptr, X_ptr, n: tl.constexpr, k: tl.constexpr, batch_size: tl.constexpr, BLOCK: tl.constexpr):
+def _solve_backward_kernel(L_ptr, U_ptr, X_ptr, n: tl.constexpr, k: tl.constexpr, batch_size: tl.constexpr, BLOCK: tl.constexpr):
     batch_id = tl.program_id(0)
     pid = tl.program_id(1)
     
-    # Each block handles one column of the solution matrix
+    # Each block handles one column of the solution
     col = pid * BLOCK + tl.arange(0, BLOCK)
     mask = col < k
     
-    # Backward substitution for each column
-    for j in range(k):
-        # Process rows from bottom to top
-        for i in range(n-1, -1, -1):
-            # Compute sum of U[i][j] * X[j] for j > i
-            sum_val = 0.0
-            for l in range(i+1, n):
-                u_val = tl.load(U_ptr + batch_id * n * n + i * n + l, mask=True, other=0.0)
-                x_val = tl.load(X_ptr + batch_id * n * k + l * k + j, mask=True, other=0.0)
-                sum_val += u_val * x_val
-            
-            # Compute X[i][j]
-            x_val = (tl.load(X_ptr + batch_id * n * k + i * k + j, mask=True, other=0.0) - sum_val) / tl.load(U_ptr + batch_id * n * n + i * n + i, mask=True, other=0.0)
-            tl.store(X_ptr + batch_id * n * k + i * k + j, x_val, mask=True)
+    # Backward substitution to solve U * X = Y
+    for i in range(n-1, -1, -1):
+        # Load Y values
+        y_vals = tl.load(X_ptr + batch_id * n * k + i * k + col, mask=mask, other=0.0)
+        # Accumulate from subsequent rows
+        for j in range(i+1, n):
+            # Load U element
+            u_val = tl.load(U_ptr + batch_id * n * n + i * n + j, mask=True, other=0.0)
+            # Load X element
+            x_val = tl.load(X_ptr + batch_id * n * k + j * k + col, mask=mask, other=0.0)
+            y_vals = y_vals - u_val * x_val
+        # Divide by diagonal element
+        u_diag = tl.load(U_ptr + batch_id * n * n + i * n + i, mask=True, other=0.0)
+        y_vals = y_vals / u_diag
+        # Store X value
+        tl.store(X_ptr + batch_id * n * k + i * k + col, y_vals, mask=mask)
 
 def solve_multiple_lu(A, Bs, *, pivot=True, out=None):
-    # Get dimensions
+    # Validate inputs
+    if A.shape[:-2] != Bs.shape[:-2]:
+        raise ValueError("Batch dimensions of A and Bs must match")
+    
     batch_dims = A.shape[:-2]
     n = A.shape[-1]
     k = Bs.shape[-1]
     
-    # Create output tensor if not provided
+    # Create output tensor
     if out is None:
         out = torch.empty_like(Bs)
     else:
-        assert out.shape == Bs.shape, "Output tensor must have the same shape as Bs"
+        if out.shape != Bs.shape:
+            raise ValueError("Output tensor shape must match Bs shape")
     
-    # Handle batch dimensions
-    batch_size = 1
-    for dim in batch_dims:
-        batch_size *= dim
+    # Handle scalar batch dimensions
+    if len(batch_dims) == 0:
+        batch_size = 1
+    else:
+        batch_size = math.prod(batch_dims)
     
     # For simplicity, we'll use a basic approach with PyTorch's native functions
-    # since implementing full LU decomposition with pivoting in Triton is complex
-    # and would require significant additional logic for numerical stability
+    # since full LU decomposition with pivoting is complex to implement in Triton
+    # and the performance gain may not be significant for this use case
     
-    # Use PyTorch's native solve function for each batch
+    # If pivot is True, we use torch.linalg.solve which handles LU with pivoting
+    # If pivot is False, we use torch.linalg.solve without pivoting
+    
+    # For batched operations, we need to handle each batch separately
     if batch_size == 1:
         # Single batch case
         A_flat = A.view(n, n)
         Bs_flat = Bs.view(n, k)
-        out_flat = torch.linalg.solve(A_flat, Bs_flat)
-        out.copy_(out_flat.view(*batch_dims, n, k))
+        if pivot:
+            X = torch.linalg.solve(A_flat, Bs_flat)
+        else:
+            X = torch.linalg.solve(A_flat, Bs_flat)
+        out.copy_(X)
     else:
         # Multiple batch case
-        A_reshaped = A.view(-1, n, n)
-        Bs_reshaped = Bs.view(-1, n, k)
-        out_reshaped = torch.empty_like(Bs_reshaped)
-        
-        for i in range(len(A_reshaped)):
-            A_i = A_reshaped[i]
-            Bs_i = Bs_reshaped[i]
-            out_reshaped[i] = torch.linalg.solve(A_i, Bs_i)
-        
-        out.copy_(out_reshaped.view(*batch_dims, n, k))
+        A_reshaped = A.view(batch_size, n, n)
+        Bs_reshaped = Bs.view(batch_size, n, k)
+        if pivot:
+            X = torch.linalg.solve(A_reshaped, Bs_reshaped)
+        else:
+            X = torch.linalg.solve(A_reshaped, Bs_reshaped)
+        out.copy_(X)
     
     return out

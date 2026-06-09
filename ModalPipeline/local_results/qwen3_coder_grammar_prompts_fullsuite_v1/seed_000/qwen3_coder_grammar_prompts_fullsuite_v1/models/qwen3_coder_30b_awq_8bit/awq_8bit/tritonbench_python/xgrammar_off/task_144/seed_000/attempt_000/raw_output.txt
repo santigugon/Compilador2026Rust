@@ -20,13 +20,16 @@ def _matrix_multiply_and_row_dot_kernel(
         dot_result = tl.zeros((1,), dtype=tl.float32)
         
         # Compute dot product of first two rows
-        for k in range(m):
-            a_val = tl.load(A_ptr + k)  # First row of A
-            b_val = tl.load(B_ptr + k * p)  # First row of B
-            dot_result += a_val * b_val
+        for k in range(0, p):
+            # Load elements from first row of C
+            c1 = tl.load(C_ptr + k, mask=k < p, other=0.0)
+            # Load elements from second row of C
+            c2 = tl.load(C_ptr + p + k, mask=k < p, other=0.0)
+            # Accumulate dot product
+            dot_result += c1 * c2
             
         # Store the result
-        tl.store(out_ptr, dot_result)
+        tl.store(out_ptr, dot_result[0])
 
 @triton.jit
 def _matrix_multiply_kernel(
@@ -38,20 +41,30 @@ def _matrix_multiply_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     
-    # Compute the matrix multiplication
+    # Initialize accumulator for matrix multiplication
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     
+    # Compute matrix multiplication
     for k in range(0, m, BLOCK_SIZE_K):
-        a = tl.load(A_ptr + pid_m * m + k)
-        b = tl.load(B_ptr + k * p + pid_n)
-        acc += a * b
+        # Load tiles
+        a_tile = tl.load(A_ptr + (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)[:, None]) * m + 
+                        (k + tl.arange(0, BLOCK_SIZE_K)[None, :]))
+        b_tile = tl.load(B_ptr + (k + tl.arange(0, BLOCK_SIZE_K)[:, None]) * p + 
+                        (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)[None, :]))
+        
+        # Matrix multiplication
+        acc += tl.dot(a_tile, b_tile)
     
     # Scale and add to C
-    c = tl.load(C_ptr + pid_m * p + pid_n)
-    result = alpha * acc + beta * c
+    c_tile = tl.load(C_ptr + (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)[:, None]) * p + 
+                    (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)[None, :]))
+    
+    # Apply alpha and beta
+    acc = alpha * acc + beta * c_tile
     
     # Store result
-    tl.store(C_ptr + pid_m * p + pid_n, result)
+    tl.store(C_ptr + (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)[:, None]) * p + 
+             (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)[None, :]), acc)
 
 def matrix_multiply_and_row_dot(A: torch.Tensor, B: torch.Tensor, alpha: float, beta: float, C: torch.Tensor) -> torch.Tensor:
     # Ensure inputs are contiguous
@@ -59,22 +72,28 @@ def matrix_multiply_and_row_dot(A: torch.Tensor, B: torch.Tensor, alpha: float, 
     B = B.contiguous()
     C = C.contiguous()
     
+    # Get dimensions
     n, m = A.shape
-    _, p = B.shape
+    m2, p = B.shape
+    
+    # Validate dimensions
+    if m != m2:
+        raise ValueError(f"Matrix dimensions incompatible: {A.shape} and {B.shape}")
     
     # Create output tensor
     out = torch.empty(1, dtype=torch.float32, device=A.device)
     
-    # Matrix multiplication part
+    # Define block sizes
     BLOCK_SIZE_M = 16
     BLOCK_SIZE_N = 16
     BLOCK_SIZE_K = 16
     
+    # Launch matrix multiplication kernel
     grid_m = triton.cdiv(n, BLOCK_SIZE_M)
     grid_n = triton.cdiv(p, BLOCK_SIZE_N)
     grid = (grid_m, grid_n)
     
-    # Launch matrix multiplication kernel
+    # First compute the matrix multiplication and update C
     _matrix_multiply_kernel[grid](
         A, B, C,
         n, m, p,
@@ -82,16 +101,13 @@ def matrix_multiply_and_row_dot(A: torch.Tensor, B: torch.Tensor, alpha: float, 
         BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
     )
     
-    # Compute dot product of first two rows
-    # For simplicity, we'll compute this on CPU for now
-    # In a more optimized version, this would be done in Triton
-    if n >= 2:
-        first_row = C[0]
-        second_row = C[1]
-        dot_product = torch.dot(first_row, second_row)
-        out[0] = dot_product.item()
-    else:
-        out[0] = 0.0
+    # Then compute the dot product of first two rows
+    _matrix_multiply_and_row_dot_kernel[1, 1](
+        A, B, C, out,
+        n, m, p,
+        alpha, beta,
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
+    )
     
     return out
 ```

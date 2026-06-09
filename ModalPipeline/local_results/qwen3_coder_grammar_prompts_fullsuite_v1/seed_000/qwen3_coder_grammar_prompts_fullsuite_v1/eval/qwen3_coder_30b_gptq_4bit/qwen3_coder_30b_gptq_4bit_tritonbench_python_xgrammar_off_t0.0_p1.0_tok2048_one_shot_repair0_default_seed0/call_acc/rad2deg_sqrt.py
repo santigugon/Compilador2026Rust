@@ -33,7 +33,7 @@ def rad2deg_sqrt(input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         output1_ptr=output1,
         output2_ptr=output2,
         n_elements=n_elements,
-        BLOCK_SIZE=BLOCK_SIZE
+        BLOCK_SIZE=BLOCK_SIZE,
     )
     return (output1, output2)
 

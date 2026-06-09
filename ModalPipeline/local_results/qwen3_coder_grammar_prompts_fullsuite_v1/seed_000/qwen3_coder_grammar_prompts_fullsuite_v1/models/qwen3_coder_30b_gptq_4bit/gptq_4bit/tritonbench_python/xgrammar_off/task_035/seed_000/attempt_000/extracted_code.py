@@ -9,50 +9,42 @@ def _fused_mv_sigmoid_sub_kernel(
     input_stride_0: tl.constexpr, input_stride_1: tl.constexpr,
     vec_stride: tl.constexpr,
     other_stride: tl.constexpr,
-    BLOCK: tl.constexpr
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
 ):
     pid = tl.program_id(0)
-    # Each block processes one row of the input matrix
-    row = pid
-    if row >= n:
-        return
+    pid_m = pid % (n // BLOCK_M)
+    pid_n = pid // (n // BLOCK_M)
     
-    # Initialize output for this row
-    out_row = tl.full((m,), 0.0, dtype=tl.float32)
+    # Load input matrix row
+    input_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = input_offsets < n
     
-    # Compute matrix-vector multiplication for this row
-    for i in range(0, m, BLOCK):
-        # Load vector elements
-        vec_offsets = i + tl.arange(0, BLOCK)
-        vec_mask = vec_offsets < m
-        vec_vals = tl.load(vec_ptr + vec_offsets, mask=vec_mask, other=0.0)
-        
-        # Load input elements for this row
-        input_offsets = row * input_stride_0 + vec_offsets * input_stride_1
-        input_mask = vec_offsets < m
-        input_vals = tl.load(input_ptr + input_offsets, mask=input_mask, other=0.0)
-        
-        # Accumulate dot product
-        out_row = tl.where(vec_mask, out_row + input_vals * vec_vals, out_row)
+    # Load vector
+    vec_offsets = tl.arange(0, BLOCK_N)
+    mask_n = vec_offsets < m
     
-    # Compute sigmoid of the result
-    sigmoid_out = 1.0 / (1.0 + tl.exp(-out_row))
+    # Compute matrix-vector multiplication
+    accumulator = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for i in range(0, m, BLOCK_N):
+        # Load input row and vector
+        input_row = tl.load(input_ptr + input_offsets * input_stride_0 + i * input_stride_1, mask=mask_m & (vec_offsets + i < m), other=0.0)
+        vec = tl.load(vec_ptr + vec_offsets + i, mask=mask_n & (vec_offsets + i < m), other=0.0)
+        accumulator += input_row * vec
     
-    # Load other tensor or scalar
-    other_val = tl.load(other_ptr, mask=True, other=0.0)
+    # Compute sigmoid
+    sigmoid_out = 1.0 / (1.0 + tl.exp(-accumulator))
     
-    # Apply alpha scaling to other
-    scaled_other = other_val * 1.0  # alpha is always 1 in this case
+    # Load other tensor
+    other = tl.load(other_ptr + pid_m * other_stride, mask=mask_m, other=0.0)
     
-    # Subtract scaled other from sigmoid output
-    final_out = sigmoid_out - scaled_other
+    # Apply alpha scaling and subtraction
+    result = sigmoid_out - other * 1.0  # alpha is always 1
     
     # Store result
-    out_offsets = row * input_stride_0 + vec_offsets * input_stride_1
-    tl.store(out_ptr + out_offsets, final_out, mask=vec_mask)
+    tl.store(out_ptr + input_offsets, result, mask=mask_m)
 
 def fused_mv_sigmoid_sub(input, vec, other, alpha=1, *, out=None):
-    # Validate input dimensions
+    # Validate inputs
     assert input.dim() == 2, "input must be a 2D tensor"
     assert vec.dim() == 1, "vec must be a 1D tensor"
     assert input.size(1) == vec.size(0), "input and vec dimensions must match"
@@ -63,48 +55,36 @@ def fused_mv_sigmoid_sub(input, vec, other, alpha=1, *, out=None):
     if not torch.is_tensor(other):
         other = torch.tensor(other, dtype=input.dtype, device=input.device)
     
-    # Ensure other is a tensor with correct shape for broadcasting
+    # Ensure other has the right shape for broadcasting
     if other.dim() == 0:
-        other = other.expand_as(input)
+        other = other.expand(n)
     elif other.dim() == 1:
-        # If other is 1D, it should match the number of rows in input
-        if other.size(0) == n:
-            # Expand to match input shape for broadcasting
-            other = other.unsqueeze(1)
+        if other.size(0) == 1:
+            other = other.expand(n)
         else:
-            # If other is 1D but doesn't match n, it's an error
-            raise ValueError("other tensor must be scalar or have size matching input rows")
-    
-    # Expand other to match input shape for broadcasting
-    if other.shape[0] == 1 and other.shape[1] == 1:
-        # Scalar case
-        other = other.expand(n, m)
-    elif other.shape[0] == n and other.shape[1] == 1:
-        # Broadcast along columns
-        other = other.expand(n, m)
-    elif other.shape == (n, m):
-        # Already correct shape
-        pass
-    else:
-        raise ValueError("other tensor shape is incompatible with input")
+            assert other.size(0) == n, "other must be scalar or have size n"
     
     # Create output tensor
     if out is None:
-        out = torch.empty_like(input)
+        out = torch.empty(n, dtype=input.dtype, device=input.device)
     else:
-        assert out.shape == input.shape, "out tensor must have the same shape as input"
+        assert out.shape == (n,), "out must have shape (n,)"
+        assert out.dtype == input.dtype, "out must have the same dtype as input"
+        assert out.device == input.device, "out must be on the same device as input"
+    
+    # Set up grid and block sizes
+    BLOCK_M = 32
+    BLOCK_N = 32
+    grid = (triton.cdiv(n, BLOCK_M),)
     
     # Launch kernel
-    block = 256
-    grid = (n,)
-    
     _fused_mv_sigmoid_sub_kernel[grid](
         input, vec, other, out,
         n, m,
         input.stride(0), input.stride(1),
         vec.stride(0),
         other.stride(0),
-        BLOCK=block
+        BLOCK_M, BLOCK_N
     )
     
     return out

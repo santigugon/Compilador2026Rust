@@ -9,58 +9,54 @@ def _qr_solve_kernel(A_ptr, b_ptr, x_ptr, m: tl.constexpr, n: tl.constexpr, k: t
                      x_stride_0: tl.constexpr, x_stride_1: tl.constexpr,
                      BLOCK: tl.constexpr):
     # Compute Q^T * b
-    pid = tl.program_id(0)
-    if pid < k:
-        for i in range(n):
-            acc = 0.0
-            for j in range(m):
-                a_val = tl.load(A_ptr + j * A_stride_0 + i * A_stride_1)
-                b_val = tl.load(b_ptr + j * b_stride_0 + pid * b_stride_1)
+    for i in range(k):
+        for j in range(n):
+            acc = tl.zeros([BLOCK], dtype=tl.float32)
+            for l in range(m):
+                a_val = tl.load(A_ptr + l * A_stride_0 + j * A_stride_1)
+                b_val = tl.load(b_ptr + l * b_stride_0 + i * b_stride_1)
                 acc += a_val * b_val
-            tl.store(x_ptr + i * x_stride_0 + pid * x_stride_1, acc)
+            # Store intermediate result in x
+            tl.store(x_ptr + j * x_stride_0 + i * x_stride_1, acc)
     
-    # Solve R * x = Q^T * b using back substitution
-    if pid < k:
-        for i in range(n - 1, -1, -1):
-            acc = tl.load(x_ptr + i * x_stride_0 + pid * x_stride_1)
-            for j in range(i + 1, n):
-                r_val = tl.load(A_ptr + i * A_stride_0 + j * A_stride_1)
-                x_val = tl.load(x_ptr + j * x_stride_0 + pid * x_stride_1)
-                acc -= r_val * x_val
-            r_diag = tl.load(A_ptr + i * A_stride_0 + i * A_stride_1)
-            tl.store(x_ptr + i * x_stride_0 + pid * x_stride_1, acc / r_diag)
+    # Solve Rx = Q^T * b using back substitution
+    for i in range(k):
+        for j in range(n - 1, -1, -1):
+            # Load the value from x
+            x_val = tl.load(x_ptr + j * x_stride_0 + i * x_stride_1)
+            # Back substitution
+            for l in range(j + 1, n):
+                r_val = tl.load(A_ptr + j * A_stride_0 + l * A_stride_1)
+                x_val -= r_val * tl.load(x_ptr + l * x_stride_0 + i * x_stride_1)
+            # Divide by diagonal element
+            r_diag = tl.load(A_ptr + j * A_stride_0 + j * A_stride_1)
+            x_val = x_val / r_diag
+            # Store result
+            tl.store(x_ptr + j * x_stride_0 + i * x_stride_1, x_val)
 
 def fused_qr_solve(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     m, n = A.shape
-    k = b.shape[1] if len(b.shape) > 1 else 1
+    k = b.shape[1]
     
-    # Perform QR decomposition using torch's built-in function
-    Q, R = torch.linalg.qr(A, mode='reduced')
+    # Create output tensor
+    x = torch.empty(n, k, dtype=A.dtype, device=A.device)
     
-    # Compute Q^T * b
-    Qt_b = torch.matmul(Q.t(), b)
-    
-    # Solve R * x = Q^T * b using back substitution
-    x = torch.zeros((n, k), dtype=A.dtype, device=A.device)
-    
-    # Use Triton kernel for solving
-    block = 256
-    grid = (triton.cdiv(k, block),)
-    
-    # Create a temporary tensor for the result
-    out = torch.empty_like(Qt_b)
-    
-    # Copy Qt_b to out for the kernel
-    out.copy_(Qt_b)
+    # Ensure tensors are contiguous for easier indexing
+    A_contiguous = A.contiguous()
+    b_contiguous = b.contiguous()
+    x_contiguous = x.contiguous()
     
     # Launch kernel
+    block = 16
+    grid = (triton.cdiv(n, block), triton.cdiv(k, block))
+    
     _qr_solve_kernel[grid](
-        R, out, x,
+        A_contiguous, b_contiguous, x_contiguous,
         m, n, k,
-        R.stride(0), R.stride(1),
-        out.stride(0), out.stride(1),
-        x.stride(0), x.stride(1),
+        A_contiguous.stride(0), A_contiguous.stride(1),
+        b_contiguous.stride(0), b_contiguous.stride(1),
+        x_contiguous.stride(0), x_contiguous.stride(1),
         BLOCK=block
     )
     
-    return x
+    return x_contiguous

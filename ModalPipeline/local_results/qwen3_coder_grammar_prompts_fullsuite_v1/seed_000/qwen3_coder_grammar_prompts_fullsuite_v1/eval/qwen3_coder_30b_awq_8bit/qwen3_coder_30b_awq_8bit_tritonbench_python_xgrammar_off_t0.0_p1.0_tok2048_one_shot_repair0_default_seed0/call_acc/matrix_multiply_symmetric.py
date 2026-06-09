@@ -91,12 +91,12 @@ def matrix_multiply_symmetric(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
     )
     
     # Second operation: C = alpha * torch.mm(C, C.T) + beta * C
-    grid2 = (
+    grid = (
         triton.cdiv(n, 16),
         triton.cdiv(n, 16)
     )
     
-    _matrix_multiply_symmetric_update_kernel[grid2](
+    _matrix_multiply_symmetric_update_kernel[grid](
         C, C,
         C.stride(0), C.stride(1),
         C.stride(0), C.stride(1),

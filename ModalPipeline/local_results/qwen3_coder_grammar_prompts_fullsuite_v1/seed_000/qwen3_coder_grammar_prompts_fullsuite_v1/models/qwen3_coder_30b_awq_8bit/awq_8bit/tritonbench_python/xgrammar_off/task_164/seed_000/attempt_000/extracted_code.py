@@ -8,53 +8,66 @@ def _spectral_norm_eig_kernel(A_ptr, out_ptr, batch_size: tl.constexpr, n: tl.co
     # Get batch index
     batch_idx = tl.program_id(0)
     
-    # Each block handles one matrix
-    # Load matrix A
-    A_block = tl.zeros((BLOCK, BLOCK), dtype=tl.float32)
-    for i in range(0, n, BLOCK):
-        for j in range(0, n, BLOCK):
-            if i + tl.arange(0, BLOCK) < n and j + tl.arange(0, BLOCK) < n:
-                row_offsets = batch_idx * n * n + (i + tl.arange(0, BLOCK)) * n
-                col_offsets = j + tl.arange(0, BLOCK)
-                mask = (i + tl.arange(0, BLOCK) < n)[:, None] & (j + tl.arange(0, BLOCK) < n)[None, :]
-                A_block = tl.where(mask, tl.load(A_ptr + row_offsets[:, None] + col_offsets[None, :]), A_block)
+    # Each program handles one batch
+    if batch_idx >= batch_size:
+        return
     
-    # For simplicity, we'll use a basic approach for eigenvalue computation
-    # In practice, this would require a more sophisticated algorithm like QR iteration
-    # Here we'll compute the maximum absolute eigenvalue using power iteration
+    # Calculate the offset for this batch
+    batch_offset = batch_idx * n * n
     
-    # Initialize v (random vector)
-    v = tl.zeros((BLOCK, 1), dtype=tl.float32)
-    for i in range(BLOCK):
-        v[i, 0] = tl.random.normal(tl.program_id(0) * 1000 + i, 1.0)
+    # Load matrix A for this batch
+    a_offsets = batch_offset + tl.arange(0, n)[:, None] * n + tl.arange(0, n)[None, :]
+    a_block = tl.load(A_ptr + a_offsets, mask=(tl.arange(0, n)[:, None] < n) & (tl.arange(0, n)[None, :] < n))
     
-    # Power iteration to find dominant eigenvalue
-    max_iter = 100
-    for _ in range(max_iter):
-        # A * v
-        Av = tl.zeros((BLOCK, 1), dtype=tl.float32)
-        for i in range(BLOCK):
-            for j in range(BLOCK):
-                Av[i, 0] += A_block[i, j] * v[j, 0]
+    # For spectral norm computation, we need to compute the largest singular value
+    # This is equivalent to the largest eigenvalue of A^T * A for real matrices
+    # or the largest eigenvalue of A^H * A for complex matrices
+    
+    # For simplicity in this implementation, we'll compute the largest absolute eigenvalue
+    # using power iteration method
+    
+    # Initialize x vector (random initialization)
+    x = tl.randn(12345 + batch_idx, n)  # Simple seed based on batch
+    x = x / tl.sqrt(tl.sum(x * x))
+    
+    # Power iteration for 10 iterations (can be made adaptive)
+    for _ in range(10):
+        # Compute A * x
+        Ax = tl.zeros((n,), dtype=tl.float32)
+        for i in range(n):
+            temp = tl.zeros((), dtype=tl.float32)
+            for j in range(n):
+                temp += a_block[i, j] * x[j]
+            Ax[i] = temp
         
-        # Compute norm of Av
-        norm_Av = tl.sqrt(tl.sum(Av * Av))
+        # Compute x^T * A * x
+        xTAx = tl.sum(x * Ax)
         
-        # Normalize v
-        v = Av / (norm_Av + 1e-12)
+        # Compute A^T * x (for real matrices, A^T = A)
+        ATx = tl.zeros((n,), dtype=tl.float32)
+        for i in range(n):
+            temp = tl.zeros((), dtype=tl.float32)
+            for j in range(n):
+                temp += a_block[j, i] * x[j]
+            ATx[i] = temp
+        
+        # Compute x^T * A^T * x
+        xTATx = tl.sum(x * ATx)
+        
+        # Update x
+        x = Ax
+        x = x / tl.sqrt(tl.sum(x * x))
     
-    # Compute the spectral norm (largest eigenvalue)
-    # This is a simplified version - in practice, more sophisticated methods are needed
-    # For now, we'll return the norm of the matrix as a proxy
-    spectral_norm = tl.sqrt(tl.sum(A_block * A_block))
+    # Compute the final eigenvalue estimate
+    eigenvalue = tl.sqrt(tl.abs(xTAx))
     
     # Store result
-    tl.store(out_ptr + batch_idx, spectral_norm)
+    tl.store(out_ptr + batch_idx, eigenvalue)
 
 def spectral_norm_eig(A, *, out=None):
-    # Handle scalar input
+    # Handle scalar input case
     if A.dim() < 2:
-        raise ValueError("Input must be at least 2D")
+        raise ValueError("Input tensor must have at least 2 dimensions")
     
     # Get batch dimensions and matrix size
     batch_dims = A.shape[:-2]
@@ -62,9 +75,9 @@ def spectral_norm_eig(A, *, out=None):
     
     # Check if matrix is square
     if A.shape[-2] != n:
-        raise ValueError("Input must be square matrices")
+        raise ValueError("Input tensor must contain square matrices")
     
-    # Handle batched matrices
+    # Compute total batch size
     batch_size = 1
     for dim in batch_dims:
         batch_size *= dim
@@ -74,83 +87,12 @@ def spectral_norm_eig(A, *, out=None):
         out = torch.empty(batch_dims, dtype=torch.float32, device=A.device)
     else:
         if out.shape != batch_dims:
-            raise ValueError("Output tensor must have shape matching batch dimensions")
+            raise ValueError("Output tensor shape does not match batch dimensions")
     
-    # For simplicity, we'll use PyTorch's implementation for now
-    # This is a placeholder that would need a proper Triton implementation
-    # of eigenvalue computation for full correctness
-    
-    # Use PyTorch's built-in function for now
-    if batch_size == 1:
-        # Single matrix case
-        return torch.linalg.eigvals(A).abs().max().real
-    else:
-        # Batch case - compute for each matrix
-        result = torch.empty(batch_size, dtype=torch.float32, device=A.device)
-        for i in range(batch_size):
-            if len(batch_dims) == 0:
-                matrix = A
-            else:
-                # Extract the i-th matrix from batch
-                indices = [i] if len(batch_dims) == 1 else [i // (batch_size // n) % n, i % n]
-                matrix = A[tuple(indices)]
-            result[i] = torch.linalg.eigvals(matrix).abs().max().real
-        return result.view(batch_dims)
-
-# Since the full Triton implementation of eigenvalue computation is complex,
-# we'll provide a simplified version that uses PyTorch for the actual computation
-# but maintains the interface and structure for Triton integration
-
-def spectral_norm_eig(A, *, out=None):
-    # Handle scalar input
-    if A.dim() < 2:
-        raise ValueError("Input must be at least 2D")
-    
-    # Get batch dimensions and matrix size
-    batch_dims = A.shape[:-2]
-    n = A.shape[-1]
-    
-    # Check if matrix is square
-    if A.shape[-2] != n:
-        raise ValueError("Input must be square matrices")
-    
-    # Handle batched matrices
-    batch_size = 1
-    for dim in batch_dims:
-        batch_size *= dim
-    
-    # Create output tensor
-    if out is None:
-        out = torch.empty(batch_dims, dtype=torch.float32, device=A.device)
-    else:
-        if out.shape != batch_dims:
-            raise ValueError("Output tensor must have shape matching batch dimensions")
-    
-    # For now, we'll compute using PyTorch's eigenvalue computation
-    # This is a placeholder for a full Triton implementation
-    if batch_size == 1:
-        # Single matrix case
-        eigenvals = torch.linalg.eigvals(A)
-        out = eigenvals.abs().max().real
-    else:
-        # Batch case - compute for each matrix
-        for i in range(batch_size):
-            # Extract the i-th matrix from batch
-            if len(batch_dims) == 0:
-                matrix = A
-            elif len(batch_dims) == 1:
-                matrix = A[i]
-            else:
-                # For multi-dimensional batch, we need to handle indexing properly
-                indices = []
-                temp = i
-                for dim in reversed(batch_dims):
-                    indices.append(temp % dim)
-                    temp //= dim
-                indices.reverse()
-                matrix = A[tuple(indices)]
-            
-            eigenvals = torch.linalg.eigvals(matrix)
-            out[tuple(indices)] = eigenvals.abs().max().real
+    # Launch kernel
+    if batch_size > 0:
+        block = 256
+        grid = (batch_size,)
+        _spectral_norm_eig_kernel[grid](A, out, batch_size, n, BLOCK=block)
     
     return out

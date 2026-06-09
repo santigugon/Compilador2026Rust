@@ -3,40 +3,51 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _addmm_kernel(input_ptr, mat1_ptr, mat2_ptr, out_ptr, n: tl.constexpr, m: tl.constexpr, p: tl.constexpr, beta: tl.constexpr, alpha: tl.constexpr, input_stride_0: tl.constexpr, input_stride_1: tl.constexpr, mat1_stride_0: tl.constexpr, mat1_stride_1: tl.constexpr, mat2_stride_0: tl.constexpr, mat2_stride_1: tl.constexpr, out_stride_0: tl.constexpr, out_stride_1: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+def _addmm_kernel(
+    mat1_ptr, mat2_ptr, input_ptr, out_ptr,
+    m: tl.constexpr, n: tl.constexpr, p: tl.constexpr,
+    stride_mat1_m: tl.constexpr, stride_mat1_k: tl.constexpr,
+    stride_mat2_k: tl.constexpr, stride_mat2_p: tl.constexpr,
+    stride_input_m: tl.constexpr, stride_input_p: tl.constexpr,
+    stride_out_m: tl.constexpr, stride_out_p: tl.constexpr,
+    alpha: tl.constexpr, beta: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     
-    # Compute the starting indices for this block
+    # Compute block offsets
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
     
-    # Create masks for valid indices
-    mask_m = offs_m < n
-    mask_n = offs_n < p
-    mask_k = offs_k < m
+    # Initialize accumulator
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     
-    # Load input matrix
-    input = tl.load(input_ptr + offs_m[:, None] * input_stride_0 + offs_n[None, :] * input_stride_1, mask=mask_m[:, None] & mask_n[None, :], other=0.0)
-    
-    # Initialize output with input
-    out = input * beta
-    
-    # Compute mat1 @ mat2
-    for k in range(0, m, BLOCK_K):
-        # Load blocks of mat1 and mat2
-        mat1_block = tl.load(mat1_ptr + offs_m[:, None] * mat1_stride_0 + (k + offs_k[None, :]) * mat1_stride_1, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
-        mat2_block = tl.load(mat2_ptr + (k + offs_k[:, None]) * mat2_stride_0 + offs_n[None, :] * mat2_stride_1, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+    # Loop over K dimension
+    for k in range(0, n, BLOCK_K):
+        # Load mat1 and mat2 with proper masking
+        mat1_mask = (offs_m[:, None] < m) & (offs_k[None, :] < n)
+        mat2_mask = (offs_k[:, None] < n) & (offs_n[None, :] < p)
         
-        # Compute partial dot product
-        partial = tl.dot(mat1_block, mat2_block)
+        mat1 = tl.load(mat1_ptr + offs_m[:, None] * stride_mat1_m + offs_k[None, :] * stride_mat1_k, mask=mat1_mask, other=0.0)
+        mat2 = tl.load(mat2_ptr + offs_k[:, None] * stride_mat2_k + offs_n[None, :] * stride_mat2_p, mask=mat2_mask, other=0.0)
         
-        # Accumulate into output
-        out += alpha * partial
+        # Matrix multiplication
+        accumulator += tl.dot(mat1, mat2)
+    
+    # Scale and add input
+    out = accumulator * alpha
+    
+    # Load input with proper masking
+    input_mask = (offs_m[:, None] < m) & (offs_n[None, :] < p)
+    if beta != 0.0:
+        input = tl.load(input_ptr + offs_m[:, None] * stride_input_m + offs_n[None, :] * stride_input_p, mask=input_mask, other=0.0)
+        out += input * beta
     
     # Store result
-    tl.store(out_ptr + offs_m[:, None] * out_stride_0 + offs_n[None, :] * out_stride_1, out, mask=mask_m[:, None] & mask_n[None, :])
+    out_mask = (offs_m[:, None] < m) & (offs_n[None, :] < p)
+    tl.store(out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :] * stride_out_p, out, mask=out_mask)
 
 def addmm(input, mat1, mat2, *, beta=1, alpha=1, out=None):
     # Handle scalar alpha and beta
@@ -49,47 +60,55 @@ def addmm(input, mat1, mat2, *, beta=1, alpha=1, out=None):
     n, m = mat1.shape
     m2, p = mat2.shape
     
-    # Check if dimensions are compatible
+    # Check dimensions
     if m != m2:
         raise ValueError("mat1 and mat2 must have compatible dimensions for matrix multiplication")
     
-    # Check if input is broadcastable with output
-    if input.shape != (n, p):
-        # Try to broadcast input
+    # Handle broadcasting for input tensor
+    if input.shape == (n, p):
+        input_broadcast = input
+    elif input.shape == (1, p) and n == 1:
+        input_broadcast = input.expand(n, p)
+    elif input.shape == (n, 1) and p == 1:
+        input_broadcast = input.expand(n, p)
+    elif input.shape == (1, 1) and n == 1 and p == 1:
+        input_broadcast = input.expand(n, p)
+    else:
+        # Try to broadcast
         try:
-            input = input.expand(n, p)
+            input_broadcast = input.expand(n, p)
         except RuntimeError:
-            raise ValueError("input tensor is not broadcastable with the expected output shape")
+            raise ValueError("input tensor cannot be broadcast to (n, p) shape")
     
     # Create output tensor
     if out is not None:
-        out = torch.empty_like(out)
+        out_tensor = out
     else:
-        out = torch.empty(n, p, dtype=mat1.dtype, device=mat1.device)
+        out_tensor = torch.empty(n, p, dtype=mat1.dtype, device=mat1.device)
     
-    # Determine block sizes
-    BLOCK_M = 32
-    BLOCK_N = 32
+    # Set up grid and block sizes
+    BLOCK_M = 16
+    BLOCK_N = 16
     BLOCK_K = 32
     
-    # Calculate grid size
+    # Calculate grid dimensions
     grid_m = triton.cdiv(n, BLOCK_M)
     grid_n = triton.cdiv(p, BLOCK_N)
     grid = (grid_m, grid_n)
     
     # Launch kernel
     _addmm_kernel[grid](
-        input, mat1, mat2, out,
+        mat1, mat2, input_broadcast, out_tensor,
         n, m, p,
-        beta, alpha,
-        input.stride(0), input.stride(1),
         mat1.stride(0), mat1.stride(1),
         mat2.stride(0), mat2.stride(1),
-        out.stride(0), out.stride(1),
+        input_broadcast.stride(0), input_broadcast.stride(1),
+        out_tensor.stride(0), out_tensor.stride(1),
+        alpha, beta,
         BLOCK_M, BLOCK_N, BLOCK_K
     )
     
-    return out
+    return out_tensor
 
 ##################################################################################################################################################
 

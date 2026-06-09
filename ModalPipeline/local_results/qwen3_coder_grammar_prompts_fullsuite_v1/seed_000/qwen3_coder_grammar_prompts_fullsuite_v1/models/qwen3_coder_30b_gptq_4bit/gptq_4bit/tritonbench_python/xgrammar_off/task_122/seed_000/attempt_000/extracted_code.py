@@ -13,26 +13,31 @@ def _pow_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(out_ptr + offsets, result, mask=mask)
 
 def pow(input, exponent, *, out=None):
+    if out is None:
+        out = torch.empty_like(input)
+    else:
+        assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
+    
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    
     # Handle scalar exponent case
     if not torch.is_tensor(exponent):
         # Convert scalar to tensor with same shape as input
         exponent = torch.tensor(exponent, dtype=input.dtype, device=input.device)
     
-    # Ensure exponent has the same number of elements as input
-    if exponent.numel() != input.numel():
-        # If exponent is a scalar tensor, broadcast it
-        if exponent.numel() == 1:
-            exponent = exponent.expand_as(input)
-        else:
-            raise ValueError("exponent tensor must have the same number of elements as input tensor or be a scalar")
+    # Expand exponent to match input shape for broadcasting
+    if exponent.shape != input.shape:
+        # Use torch's broadcasting rules to expand exponent
+        try:
+            exponent = torch.broadcast_tensors(input, exponent)[1]
+        except RuntimeError:
+            # If broadcasting fails, use the original exponent tensor
+            pass
     
-    # Handle broadcasting
-    out_shape = torch.broadcast_tensors(input, exponent)[0].shape
-    out = torch.empty(out_shape, dtype=input.dtype, device=input.device)
-    
-    n = input.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    # Ensure exponent has the same device and dtype as input
+    exponent = exponent.to(input.device, dtype=input.dtype)
     
     _pow_kernel[grid](input, exponent, out, n, BLOCK=block)
     return out

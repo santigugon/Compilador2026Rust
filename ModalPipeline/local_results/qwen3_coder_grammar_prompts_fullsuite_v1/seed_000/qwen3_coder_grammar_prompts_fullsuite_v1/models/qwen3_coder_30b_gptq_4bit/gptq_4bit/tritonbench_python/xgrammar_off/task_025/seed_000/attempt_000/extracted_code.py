@@ -13,47 +13,74 @@ def _qr_decomposition_kernel(A_ptr, R_ptr, Q_ptr, n: tl.constexpr, BLOCK: tl.con
             for j in range(n):
                 if i >= j:
                     tl.store(R_ptr + i * n + j, 0.0)
+                else:
+                    tl.store(R_ptr + i * n + j, 0.0)
         
         # Copy A to R
         for i in range(n):
             for j in range(n):
-                tl.store(R_ptr + i * n + j, tl.load(A_ptr + i * n + j))
+                if i >= j:
+                    tl.store(R_ptr + i * n + j, tl.load(A_ptr + i * n + j))
+    
+    # Synchronize all threads
+    tl.sync()
+    
+    # Compute QR decomposition using Givens rotations
+    for k in range(n):
+        # Compute the norm of the k-th column starting from row k
+        if k == 0:
+            # For first column, compute norm of entire column
+            norm = 0.0
+            for i in range(k, n):
+                val = tl.load(R_ptr + i * n + k)
+                norm += val * val
+            norm = tl.sqrt(norm)
+        else:
+            # For other columns, compute norm of remaining elements
+            norm = 0.0
+            for i in range(k, n):
+                val = tl.load(R_ptr + i * n + k)
+                norm += val * val
+            norm = tl.sqrt(norm)
         
-        # QR decomposition using Givens rotations
-        for k in range(n):
-            # Zero out elements below diagonal
-            for j in range(k+1, n):
-                # Compute Givens rotation
-                r_kk = tl.load(R_ptr + k * n + k)
-                r_jk = tl.load(R_ptr + j * n + k)
-                
-                # Handle case where r_kk is zero
-                if r_kk == 0.0:
-                    continue
-                    
-                # Compute cosine and sine
-                norm = tl.sqrt(r_kk * r_kk + r_jk * r_jk)
-                if norm == 0.0:
-                    continue
-                    
-                c = r_kk / norm
-                s = r_jk / norm
-                
-                # Apply rotation to rows k and j
-                for i in range(n):
-                    r_ki = tl.load(R_ptr + k * n + i)
-                    r_ji = tl.load(R_ptr + j * n + i)
-                    tl.store(R_ptr + k * n + i, c * r_ki + s * r_ji)
-                    tl.store(R_ptr + j * n + i, -s * r_ki + c * r_ji)
-                    
-                    # Update Q matrix
-                    q_ki = tl.load(Q_ptr + k * n + i)
-                    q_ji = tl.load(Q_ptr + j * n + i)
-                    tl.store(Q_ptr + k * n + i, c * q_ki + s * q_ji)
-                    tl.store(Q_ptr + j * n + i, -s * q_ki + c * q_ji)
+        # Handle case where norm is zero
+        if norm == 0.0:
+            continue
+            
+        # Compute cosine and sine for Givens rotation
+        c = tl.load(R_ptr + k * n + k) / norm
+        s = -norm / (norm + 1e-12)  # Avoid division by zero
+        
+        # Apply Givens rotation to R
+        for j in range(k, n):
+            # Get current and next elements
+            a = tl.load(R_ptr + k * n + j)
+            b = tl.load(R_ptr + (k+1) * n + j)
+            
+            # Apply rotation
+            new_a = c * a - s * b
+            new_b = s * a + c * b
+            
+            # Store results
+            tl.store(R_ptr + k * n + j, new_a)
+            tl.store(R_ptr + (k+1) * n + j, new_b)
+        
+        # Apply Givens rotation to Q
+        for i in range(n):
+            # Get current and next elements
+            a = tl.load(Q_ptr + i * n + k)
+            b = tl.load(Q_ptr + i * n + (k+1))
+            
+            # Apply rotation
+            new_a = c * a - s * b
+            new_b = s * a + c * b
+            
+            # Store results
+            tl.store(Q_ptr + i * n + k, new_a)
+            tl.store(Q_ptr + i * n + (k+1), new_b)
 
 @triton.jit
-def _determinant_from_r_kernel(R_ptr, det_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+def _determinant_kernel(R_ptr, det_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     if pid == 0:
         # Compute determinant as product of diagonal elements
@@ -65,18 +92,22 @@ def _determinant_from_r_kernel(R_ptr, det_ptr, n: tl.constexpr, BLOCK: tl.conste
 
 def determinant_via_qr(A, *, mode='reduced', out=None):
     # Validate input
+    if not torch.is_tensor(A):
+        raise TypeError("A must be a tensor")
+    
     if A.dim() != 2:
-        raise ValueError("Input must be a 2D tensor")
+        raise ValueError("A must be a 2D tensor")
+    
     if A.size(0) != A.size(1):
-        raise ValueError("Input must be a square matrix")
+        raise ValueError("A must be a square matrix")
     
     n = A.size(0)
     
     # Create output tensor
     if out is None:
-        out = torch.empty(1, dtype=torch.float64, device=A.device)
+        out = torch.empty((), dtype=torch.float64, device=A.device)
     else:
-        if out.shape != (1,) or out.dtype != torch.float64:
+        if out.shape != () or out.dtype != torch.float64:
             raise ValueError("out must be a scalar tensor with dtype=torch.float64")
     
     # For small matrices, use direct computation
@@ -89,41 +120,31 @@ def determinant_via_qr(A, *, mode='reduced', out=None):
             raise ValueError("Invalid matrix size")
     
     # For larger matrices, use QR decomposition
-    # Create identity matrix for Q
+    # Create Q and R matrices
     Q = torch.eye(n, dtype=A.dtype, device=A.device)
-    R = A.clone().to(A.dtype)
+    R = A.clone().to(dtype=torch.float64)
     
     # Perform QR decomposition using Givens rotations
-    for k in range(n):
-        for j in range(k+1, n):
-            # Compute Givens rotation
-            r_kk = R[k, k]
-            r_jk = R[j, k]
+    for k in range(n - 1):
+        # Compute Givens rotation
+        if abs(R[k, k]) < 1e-12:
+            continue
             
-            # Handle case where r_kk is zero
-            if abs(r_kk) < 1e-12:
-                continue
-                
-            # Compute cosine and sine
-            norm = math.sqrt(r_kk * r_kk + r_jk * r_jk)
-            if abs(norm) < 1e-12:
-                continue
-                
-            c = r_kk / norm
-            s = r_jk / norm
-            
-            # Apply rotation to rows k and j
-            for i in range(n):
-                r_ki = R[k, i]
-                r_ji = R[j, i]
-                R[k, i] = c * r_ki + s * r_ji
-                R[j, i] = -s * r_ki + c * r_ji
-                
-                # Update Q matrix
-                q_ki = Q[k, i]
-                q_ji = Q[j, i]
-                Q[k, i] = c * q_ki + s * q_ji
-                Q[j, i] = -s * q_ki + c * q_ji
+        # Compute cosine and sine
+        c = R[k, k] / (abs(R[k, k]) + 1e-12)
+        s = -R[k+1, k] / (abs(R[k+1, k]) + 1e-12)
+        
+        # Apply rotation to R
+        for j in range(k, n):
+            temp = R[k, j]
+            R[k, j] = c * temp - s * R[k+1, j]
+            R[k+1, j] = s * temp + c * R[k+1, j]
+        
+        # Apply rotation to Q
+        for i in range(n):
+            temp = Q[i, k]
+            Q[i, k] = c * temp - s * Q[i, k+1]
+            Q[i, k+1] = s * temp + c * Q[i, k+1]
     
     # Compute determinant as product of diagonal elements of R
     det = 1.0
@@ -132,5 +153,4 @@ def determinant_via_qr(A, *, mode='reduced', out=None):
     
     # Store result
     out.fill_(det)
-    
     return out

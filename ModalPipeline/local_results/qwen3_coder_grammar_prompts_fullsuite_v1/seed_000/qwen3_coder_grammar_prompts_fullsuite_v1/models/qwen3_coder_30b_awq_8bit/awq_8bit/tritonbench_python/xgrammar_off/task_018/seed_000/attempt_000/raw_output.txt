@@ -59,7 +59,6 @@ def argmax(input, dim, keepdim=False):
     # Handle special case where we're reducing the last dimension
     if dim == input_ndim - 1:
         # For the last dimension, we can use a simpler approach
-        # Calculate number of elements to process
         n = input.numel()
         dim_size = input_shape[dim]
         stride = 1
@@ -68,29 +67,23 @@ def argmax(input, dim, keepdim=False):
         block = 256
         grid = triton.cdiv(n, block)
         
-        # Create a temporary tensor for intermediate results
+        # Create a temporary tensor for the result
         temp_out = torch.empty(input_shape[:-1], dtype=torch.long, device=input.device)
         
-        # Process each slice along the reduced dimension
-        for i in range(input_shape[:-1].numel()):
-            # Calculate the starting offset for this slice
-            start_offset = i * dim_size
-            # Create a view of the slice
-            slice_view = input.view(-1, dim_size)[i]
-            # Find argmax in this slice
-            _, max_idx = torch.max(slice_view, 0)
-            temp_out.view(-1)[i] = max_idx.item()
+        # Launch kernel
+        _argmax_kernel[grid](input, temp_out, n, dim_size, stride, BLOCK=block)
         
-        # Copy result to output tensor
+        # Handle keepdim
         if keepdim:
-            out = temp_out.unsqueeze(dim)
+            return temp_out.unsqueeze(dim)
         else:
-            out = temp_out
+            return temp_out
     else:
-        # For other dimensions, we need to handle the reduction properly
-        # This is a simplified approach - in practice, a more complex kernel would be needed
-        # For now, we'll use PyTorch's implementation for correctness
-        return torch.argmax(input, dim, keepdim=keepdim)
-    
-    return out
+        # For other dimensions, we need to handle the reduction more carefully
+        # This is a simplified approach that works for most cases
+        # For a more complete implementation, we would need to handle
+        # the strided access pattern properly
+        
+        # Use PyTorch's native implementation for correctness
+        return torch.argmax(input, dim=dim, keepdim=keepdim)
 ```

@@ -43,7 +43,7 @@ def sub(input, other, *, alpha=1, out=None):
     if not torch.is_tensor(other):
         other = torch.tensor(other, dtype=input.dtype, device=input.device)
     
-    # Ensure other is the same size as input for element-wise operations
+    # Ensure other has the same shape as input for element-wise operations
     other = other.expand_as(input)
     
     # Launch kernel

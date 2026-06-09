@@ -51,10 +51,10 @@ def elu_linear(input, weight, bias=None, alpha=1.0, inplace=False):
     if input.size(1) != weight.size(1):
         raise ValueError("Input size and weight size mismatch")
     if bias is not None and bias.size(0) != weight.size(0):
-        raise ValueError("Bias size must match weight output size")
+        raise ValueError("Bias size mismatch with weight size")
     
-    # Get dimensions
-    n_rows, n_features = input.shape
+    # Prepare output tensor
+    n_rows = input.size(0)
     n_cols = weight.size(0)
     
     # Create output tensor
@@ -62,27 +62,29 @@ def elu_linear(input, weight, bias=None, alpha=1.0, inplace=False):
     
     # Handle inplace operation
     if inplace:
-        out = input
-    
-    # Set up kernel launch parameters
-    BLOCK_SIZE = 256
-    grid = (n_rows,)
+        # For inplace, we need to ensure the output tensor is the same as input
+        # But since we're doing a linear transformation, we can't do true inplace
+        # We'll just use the same tensor for output
+        out = torch.empty_like(input)
+        # This is a simplified approach - in practice, inplace would require
+        # a different approach to handle the transformation properly
+        # For now, we'll proceed with the standard approach
+        pass
     
     # Launch kernel
-    if bias is not None:
-        _elu_linear_kernel[grid](
-            input, weight, bias, out,
-            n_rows, n_cols, n_features,
-            alpha, BLOCK_SIZE
-        )
-    else:
-        # Create a zero bias tensor for the kernel
-        zero_bias = torch.zeros(n_cols, dtype=weight.dtype, device=weight.device)
-        _elu_linear_kernel[grid](
-            input, weight, zero_bias, out,
-            n_rows, n_cols, n_features,
-            alpha, BLOCK_SIZE
-        )
+    block_size = 256
+    grid_size = triton.cdiv(n_rows, 1)
     
-    return out
+    # Create a temporary tensor for the linear transformation result
+    temp_out = torch.empty(n_rows, n_cols, dtype=input.dtype, device=input.device)
+    
+    # Launch the kernel
+    _elu_linear_kernel[grid_size](
+        input, weight, bias, temp_out,
+        n_rows, n_cols, input.size(1),
+        alpha, BLOCK_SIZE=block_size
+    )
+    
+    # Return the result
+    return temp_out
 ```

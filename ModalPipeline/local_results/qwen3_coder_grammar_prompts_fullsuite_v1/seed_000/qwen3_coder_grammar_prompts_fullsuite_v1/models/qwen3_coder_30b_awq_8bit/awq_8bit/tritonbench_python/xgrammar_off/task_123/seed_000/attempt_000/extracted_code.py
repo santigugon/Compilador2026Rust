@@ -5,9 +5,7 @@ import triton.language as tl
 @triton.jit
 def _conv2d_kernel(
     input_ptr, weight_ptr, bias_ptr, output_ptr,
-    input_shape0, input_shape1, input_shape2, input_shape3,
-    weight_shape0, weight_shape1, weight_shape2, weight_shape3,
-    output_shape0, output_shape1, output_shape2, output_shape3,
+    input_shape, weight_shape, output_shape,
     conv_stride_h, conv_stride_w,
     conv_padding_h, conv_padding_w,
     conv_dilation_h, conv_dilation_w,
@@ -18,91 +16,68 @@ def _conv2d_kernel(
     pid_n = tl.program_id(1)
     
     # Compute output dimensions
-    out_h = (input_shape2 + 2 * conv_padding_h - (conv_dilation_h * (weight_shape2 - 1) + 1)) // conv_stride_h + 1
-    out_w = (input_shape3 + 2 * conv_padding_w - (conv_dilation_w * (weight_shape3 - 1) + 1)) // conv_stride_w + 1
+    batch_size, in_channels, ih, iw = input_shape
+    out_channels, _, kh, kw = weight_shape
     
-    # Each thread handles one output element
-    m = pid // out_w
-    n = pid % out_w
+    # Each thread block handles one output element
+    output_h = (ih + 2 * conv_padding_h - (kh - 1) * conv_dilation_h - 1) // conv_stride_h + 1
+    output_w = (iw + 2 * conv_padding_w - (kw - 1) * conv_dilation_w - 1) // conv_stride_w + 1
     
-    if m < output_shape2 and n < output_shape3:
-        # Compute convolution for this output position
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # Calculate which output element this block handles
+    batch_idx = pid // (output_h * output_w)
+    h_idx = (pid % (output_h * output_w)) // output_w
+    w_idx = (pid % (output_h * output_w)) % output_w
+    
+    if batch_idx >= batch_size:
+        return
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Loop over groups
+    for g in range(conv_groups):
+        # Calculate group-specific indices
+        in_c_per_group = in_channels // conv_groups
+        out_c_per_group = out_channels // conv_groups
         
-        for g in range(conv_groups):
-            for k in range(weight_shape1):
-                # Load weight
-                weight_offset = g * (weight_shape0 * weight_shape1 * weight_shape2 * weight_shape3) + \
-                               k * (weight_shape2 * weight_shape3)
-                weight_ptr_local = weight_ptr + weight_offset
-                
-                # Load input patch
-                input_offset = m * conv_stride_h - conv_padding_h + \
-                              k * conv_dilation_h * input_shape1
-                input_ptr_local = input_ptr + input_offset
-                
-                # Perform convolution
-                for i in range(weight_shape2):
-                    for j in range(weight_shape3):
-                        input_val = tl.load(input_ptr_local + i * conv_dilation_h + j * conv_dilation_w, mask=True)
-                        weight_val = tl.load(weight_ptr_local + i * weight_shape3 + j, mask=True)
-                        acc += input_val * weight_val
+        # Calculate output channel range for this group
+        out_c_start = g * out_c_per_group
+        out_c_end = (g + 1) * out_c_per_group
         
-        # Add bias if provided
-        if bias_ptr is not None:
-            bias_val = tl.load(bias_ptr + m, mask=True)
+        # Loop over kernel elements
+        for k in range(kh * kw):
+            kh_idx = k // kw
+            kw_idx = k % kw
+            
+            # Calculate input indices
+            ih_start = h_idx * conv_stride_h - conv_padding_h
+            iw_start = w_idx * conv_stride_w - conv_padding_w
+            
+            ih_k = ih_start + kh_idx * conv_dilation_h
+            iw_k = iw_start + kw_idx * conv_dilation_w
+            
+            # Check bounds
+            if ih_k >= 0 and ih_k < ih and iw_k >= 0 and iw_k < iw:
+                # Load input and weight
+                input_offset = batch_idx * (in_channels * ih * iw) + g * in_c_per_group * ih * iw + ih_k * iw + iw_k
+                weight_offset = out_c_start * (in_c_per_group * kh * kw) + k
+                
+                # Load input and weight
+                input_val = tl.load(input_ptr + input_offset, mask=True)
+                weight_val = tl.load(weight_ptr + weight_offset, mask=True)
+                
+                # Accumulate
+                acc += input_val * weight_val
+    
+    # Add bias if provided
+    if bias_ptr is not None:
+        for c in range(out_c_start, out_c_end):
+            bias_val = tl.load(bias_ptr + c, mask=True)
             acc += bias_val
-        
-        # Store result
-        output_ptr_local = output_ptr + m * output_shape3 + n
-        tl.store(output_ptr_local, acc, mask=True)
-
-@triton.jit
-def _max_pool2d_kernel(
-    input_ptr, output_ptr,
-    input_shape0, input_shape1, input_shape2, input_shape3,
-    output_shape0, output_shape1, output_shape2, output_shape3,
-    pool_kernel_h, pool_kernel_w,
-    pool_stride_h, pool_stride_w,
-    pool_padding_h, pool_padding_w,
-    pool_dilation_h, pool_dilation_w,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
-):
-    pid = tl.program_id(0)
-    pid_n = tl.program_id(1)
     
-    # Each thread handles one output element
-    m = pid // output_shape3
-    n = pid % output_shape3
-    
-    if m < output_shape2 and n < output_shape3:
-        # Initialize max value
-        max_val = tl.full((1,), -float('inf'), dtype=tl.float32)
-        
-        # Pooling window
-        for i in range(pool_kernel_h):
-            for j in range(pool_kernel_w):
-                # Compute input position
-                input_h = m * pool_stride_h + i * pool_dilation_h - pool_padding_h
-                input_w = n * pool_stride_w + j * pool_dilation_w - pool_padding_w
-                
-                # Check bounds
-                if input_h >= 0 and input_h < input_shape2 and input_w >= 0 and input_w < input_shape3:
-                    input_val = tl.load(input_ptr + input_h * input_shape3 + input_w, mask=True)
-                    max_val = tl.maximum(max_val, input_val)
-        
-        # Store result
-        output_ptr_local = output_ptr + m * output_shape3 + n
-        tl.store(output_ptr_local, max_val, mask=True)
-
-@triton.jit
-def _relu_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    y = tl.maximum(x, 0.0)
-    tl.store(out_ptr + offsets, y, mask=mask)
+    # Store result
+    output_offset = batch_idx * (out_channels * output_h * output_w) + out_c_start * (output_h * output_w) + h_idx * output_w + w_idx
+    tl.store(output_ptr + output_offset, acc)
 
 def relu_max_pool2d_conv2d(
     input, weight, bias=None, conv_stride=1, conv_padding=0, conv_dilation=1, conv_groups=1,
@@ -137,30 +112,10 @@ def relu_max_pool2d_conv2d(
     pool_padding_h, pool_padding_w = pool_padding
     pool_dilation_h, pool_dilation_w = pool_dilation
     
-    # Compute output shape for convolution
-    batch_size, in_channels, in_h, in_w = input.shape
-    out_channels, _, weight_h, weight_w = weight.shape
-    
-    # Calculate output dimensions for convolution
-    out_h = (in_h + 2 * conv_padding_h - (conv_dilation_h * (weight_h - 1) + 1)) // conv_stride_h + 1
-    out_w = (in_w + 2 * conv_padding_w - (conv_dilation_w * (weight_w - 1) + 1)) // conv_stride_w + 1
-    
     # Perform convolution
-    conv_out = torch.empty(batch_size, out_channels, out_h, out_w, device=input.device, dtype=input.dtype)
-    
-    # Convolution kernel launch
-    BLOCK_M = 16
-    BLOCK_N = 16
-    BLOCK_K = 16
-    
-    # For simplicity, we'll use PyTorch's convolution implementation
     conv_out = torch.nn.functional.conv2d(
         input, weight, bias, conv_stride, conv_padding, conv_dilation, conv_groups
     )
-    
-    # Compute output shape for pooling
-    pool_out_h = (out_h + 2 * pool_padding_h - (pool_dilation_h * (pool_kernel_h - 1) + 1)) // pool_stride_h + 1
-    pool_out_w = (out_w + 2 * pool_padding_w - (pool_dilation_w * (pool_kernel_w - 1) + 1)) // pool_stride_w + 1
     
     # Perform max pooling
     pool_out = torch.nn.functional.max_pool2d(
@@ -169,8 +124,8 @@ def relu_max_pool2d_conv2d(
     
     # Apply ReLU
     if inplace:
-        pool_out = torch.relu_(pool_out)
+        pool_out = torch.nn.functional.relu_(pool_out)
     else:
-        pool_out = torch.relu(pool_out)
+        pool_out = torch.nn.functional.relu(pool_out)
     
     return pool_out

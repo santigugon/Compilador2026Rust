@@ -54,7 +54,7 @@ def fused_cosine_embedding_loss_with_normalization(
     block = 256
     grid = (triton.cdiv(n, block),)
     
-    # L2 normalize both inputs
+    # L2 normalize inputs
     _l2_normalize_kernel[grid](input1, input1_norm, n, BLOCK=block)
     _l2_normalize_kernel[grid](input2, input2_norm, n, BLOCK=block)
     

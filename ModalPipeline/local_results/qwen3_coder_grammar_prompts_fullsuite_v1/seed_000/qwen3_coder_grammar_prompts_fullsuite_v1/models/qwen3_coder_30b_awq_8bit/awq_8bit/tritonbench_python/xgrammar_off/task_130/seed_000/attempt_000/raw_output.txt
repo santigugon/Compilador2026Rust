@@ -10,12 +10,12 @@ def _rand_kernel(out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     # Generate random numbers using a simple linear congruential generator
-    # Using a fixed seed for reproducibility in the kernel
-    state = offsets + 12345  # Simple seed
-    # Simple hash to generate pseudo-random numbers
+    # Using constants from the standard LCG formula
+    state = offsets + 1  # Initialize with offset to avoid zero
+    # Simple hash-like transformation to generate pseudo-random numbers
     state = (state * 1103515245 + 12345) & 0x7fffffff
-    # Convert to float in [0, 1)
-    rand_val = (state & 0x1fffff) / 0x200000
+    # Convert to float in [0, 1) range
+    rand_val = state * (1.0 / 2147483648.0)
     tl.store(out_ptr + offsets, rand_val, mask=mask)
 
 def rand(*size, generator=None, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False, pin_memory=False):
@@ -41,8 +41,8 @@ def rand(*size, generator=None, out=None, dtype=None, layout=torch.strided, devi
             raise ValueError(f"Output tensor device {out.device} does not match requested device {device}")
         if layout != torch.strided:
             raise ValueError("Only strided layout is supported")
-        if pin_memory:
-            raise ValueError("pin_memory is not supported for provided output tensor")
+        if pin_memory and not out.is_cpu():
+            raise ValueError("pin_memory only works with CPU tensors")
     else:
         # Create a new tensor with the specified properties
         if dtype is None:
@@ -51,10 +51,9 @@ def rand(*size, generator=None, out=None, dtype=None, layout=torch.strided, devi
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         if layout != torch.strided:
             raise ValueError("Only strided layout is supported")
-        if pin_memory:
-            raise ValueError("pin_memory is not supported in this implementation")
-        
-        out = torch.empty(shape, dtype=dtype, layout=layout, device=device, requires_grad=requires_grad)
+        out = torch.empty(shape, dtype=dtype, device=device, requires_grad=requires_grad)
+        if pin_memory and out.is_cpu():
+            out = out.pin_memory()
     
     # Fill the tensor with random numbers
     if out.numel() > 0:

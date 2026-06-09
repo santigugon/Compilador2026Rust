@@ -13,8 +13,8 @@ def _cos_signbit_kernel(x_ptr, cos_out_ptr, signbit_out_ptr, n: tl.constexpr, BL
     # Compute cosine
     cos_x = tl.cos(x)
     
-    # Compute sign bit (1 if negative, 0 if positive or zero)
-    signbit = tl.where(cos_x < 0, 1.0, 0.0)
+    # Compute sign bit (1.0 if negative, 0.0 if positive or zero)
+    signbit = tl.where(cos_x < 0.0, 1.0, 0.0)
     
     tl.store(cos_out_ptr + offsets, cos_x, mask=mask)
     tl.store(signbit_out_ptr + offsets, signbit, mask=mask)
@@ -28,4 +28,4 @@ def cos_signbit(input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     grid = (triton.cdiv(n, block),)
     
     _cos_signbit_kernel[grid](input, out_cos, out_signbit, n, BLOCK=block)
-    return out_cos, out_signbit
+    return (out_cos, out_signbit)

@@ -5,7 +5,7 @@ import triton.language as tl
 
 @triton.jit
 def _svd_reconstruct_kernel(u_ptr, s_ptr, vh_ptr, out_ptr, m: tl.constexpr, n: tl.constexpr, k: tl.constexpr, 
-                          u_stride_0: tl.constexpr, u_stride_1: tl.constexpr, 
+                          u_stride_0: tl.constexpr, u_stride_1: tl.constexpr,
                           s_stride: tl.constexpr,
                           vh_stride_0: tl.constexpr, vh_stride_1: tl.constexpr,
                           out_stride_0: tl.constexpr, out_stride_1: tl.constexpr,
@@ -25,51 +25,52 @@ def _svd_reconstruct_kernel(u_ptr, s_ptr, vh_ptr, out_ptr, m: tl.constexpr, n: t
     # Initialize output element
     out = tl.zeros((BLOCK, BLOCK), dtype=tl.float32)
     
-    # Compute the reconstruction: U @ diag(s) @ Vh
-    # For each element (i,j) of the output, we compute:
-    # out[i,j] = sum_k U[i,k] * s[k] * Vh[k,j]
+    # Compute the matrix multiplication U * S * V^H
+    # For each singular value
+    for i in range(k):
+        # Load u values for this singular value
+        u_offsets = row * u_stride_0 + i * u_stride_1
+        u_vals = tl.load(u_ptr + u_offsets, mask=row_mask, other=0.0)
+        
+        # Load s value
+        s_val = tl.load(s_ptr + i * s_stride, mask=tl.full((1,), True), other=0.0)
+        
+        # Load vh values for this singular value
+        vh_offsets = i * vh_stride_0 + col * vh_stride_1
+        vh_vals = tl.load(vh_ptr + vh_offsets, mask=col_mask, other=0.0)
+        
+        # Compute outer product and accumulate
+        u_vals = u_vals[:, None]  # (BLOCK, 1)
+        vh_vals = vh_vals[None, :]  # (1, BLOCK)
+        out += s_val * u_vals * vh_vals
     
-    # Loop over the singular values dimension
-    for k in range(k):
-        # Load U[i,k] for all rows in this block
-        u_vals = tl.load(u_ptr + row * u_stride_0 + k * u_stride_1, mask=row_mask[:, None], other=0.0)
-        
-        # Load s[k]
-        s_val = tl.load(s_ptr + k * s_stride, mask=k < k, other=0.0)
-        
-        # Load Vh[k,j] for all columns in this block
-        vh_vals = tl.load(vh_ptr + k * vh_stride_0 + col * vh_stride_1, mask=col_mask[None, :], other=0.0)
-        
-        # Compute the outer product and accumulate
-        # u_vals is (BLOCK, 1), vh_vals is (1, BLOCK)
-        # s_val is a scalar
-        out += u_vals * s_val * vh_vals
-    
-    # Store the result
-    tl.store(out_ptr + row * out_stride_0 + col * out_stride_1, out, mask=mask)
+    # Store result
+    out_offsets = row * out_stride_0 + col * out_stride_1
+    tl.store(out_ptr + out_offsets, out, mask=mask)
 
 def fused_svd_reconstruct(A):
-    # Perform SVD
+    # Compute SVD
     U, S, Vh = torch.linalg.svd(A, full_matrices=False)
     
     # Reconstruct the matrix
+    # A_reconstructed = U @ torch.diag(S) @ Vh
     m, n = A.shape
-    k = S.shape[0]
+    k = min(m, n)
     
     # Create output tensor
     out = torch.empty_like(A)
     
-    # Get strides
-    u_stride_0, u_stride_1 = U.stride()
-    s_stride = S.stride(0) if S.dim() > 0 else 1
-    vh_stride_0, vh_stride_1 = Vh.stride()
-    out_stride_0, out_stride_1 = out.stride()
-    
     # Launch kernel
-    BLOCK = 16
-    grid_m = triton.cdiv(m, BLOCK)
-    grid_n = triton.cdiv(n, BLOCK)
+    block = 16
+    grid_m = triton.cdiv(m, block)
+    grid_n = triton.cdiv(n, block)
     grid = (grid_m, grid_n)
+    
+    # Get strides
+    u_stride_0, u_stride_1 = U.stride(0), U.stride(1)
+    s_stride = S.stride(0)
+    vh_stride_0, vh_stride_1 = Vh.stride(0), Vh.stride(1)
+    out_stride_0, out_stride_1 = out.stride(0), out.stride(1)
     
     _svd_reconstruct_kernel[grid](
         U, S, Vh, out,
@@ -78,7 +79,7 @@ def fused_svd_reconstruct(A):
         s_stride,
         vh_stride_0, vh_stride_1,
         out_stride_0, out_stride_1,
-        BLOCK=BLOCK
+        BLOCK=block
     )
     
     return out

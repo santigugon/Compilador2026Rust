@@ -25,10 +25,10 @@ def _qr_solve_kernel(
 
 @triton.jit
 def _back_substitution_kernel(
-    R_ptr, b_ptr, x_ptr,
+    R_ptr, Qb_ptr, x_ptr,
     m: tl.constexpr, n: tl.constexpr, k: tl.constexpr,
     stride_R_row, stride_R_col,
-    stride_b_row, stride_b_col,
+    stride_Qb_row, stride_Qb_col,
     stride_x_row, stride_x_col,
     BLOCK: tl.constexpr
 ):
@@ -40,53 +40,53 @@ def _back_substitution_kernel(
                 r_val = tl.load(R_ptr + j * stride_R_row + l * stride_R_col)
                 x_val = tl.load(x_ptr + l * stride_x_row + i * stride_x_col)
                 sum = sum + r_val * x_val
-            b_val = tl.load(b_ptr + j * stride_b_row + i * stride_b_col)
+            q_val = tl.load(Qb_ptr + j * stride_Qb_row + i * stride_Qb_col)
             r_diag = tl.load(R_ptr + j * stride_R_row + j * stride_R_col)
-            x_val = (b_val - sum) / r_diag
-            tl.store(x_ptr + j * stride_x_row + i * stride_x_col, x_val)
+            result = (q_val - sum) / r_diag
+            tl.store(x_ptr + j * stride_x_row + i * stride_x_col, result)
 
 def fused_qr_solve(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     # QR decomposition using torch
     Q, R = torch.linalg.qr(A)
     
     # Compute Q^T * b
-    Q_T_b = torch.matmul(Q.transpose(0, 1), b)
+    Qb = torch.matmul(Q.transpose(0, 1), b)
     
     # Solve R * x = Q^T * b using back substitution
     # Create output tensor
     x = torch.empty(R.shape[1], b.shape[1], dtype=A.dtype, device=A.device)
     
-    # For small matrices, use direct computation
-    if R.shape[0] <= 128 and R.shape[1] <= 128 and b.shape[1] <= 128:
-        # Use torch's built-in solver for better numerical stability
-        x = torch.linalg.solve(R, Q_T_b)
-    else:
-        # Use Triton for larger matrices
-        m, n = A.shape
-        k = b.shape[1]
-        
-        # Allocate output tensor
-        x = torch.empty(n, k, dtype=A.dtype, device=A.device)
-        
-        # Compute Q^T * b using Triton
-        block = 256
-        grid = (triton.cdiv(n, block), triton.cdiv(k, block))
-        
-        # Create temporary tensor for Q^T * b
-        temp = torch.empty(n, k, dtype=A.dtype, device=A.device)
-        
-        # Compute Q^T * b
-        for i in range(k):
-            for j in range(n):
-                sum_val = 0.0
-                for l in range(m):
-                    sum_val += Q[l, j] * b[l, i]
-                temp[j, i] = sum_val
-        
-        # Back substitution using Triton
-        # This is a simplified version - in practice, you'd want to implement
-        # the full back substitution in Triton with proper indexing
-        x = torch.linalg.solve(R, temp)
+    # Use Triton for back substitution
+    m, n = R.shape
+    k = b.shape[1]
+    
+    # Create a temporary tensor for Q^T * b
+    Qb_torch = torch.empty(n, k, dtype=A.dtype, device=A.device)
+    
+    # Copy Q^T * b to the temporary tensor
+    Qb_torch.copy_(Qb)
+    
+    # Launch back substitution kernel
+    BLOCK = 32
+    grid = (triton.cdiv(n, BLOCK), triton.cdiv(k, BLOCK))
+    
+    # Create strides for Triton kernel
+    stride_R_row = R.stride(0)
+    stride_R_col = R.stride(1)
+    stride_Qb_row = Qb_torch.stride(0)
+    stride_Qb_col = Qb_torch.stride(1)
+    stride_x_row = x.stride(0)
+    stride_x_col = x.stride(1)
+    
+    # Launch kernel
+    _back_substitution_kernel[grid](
+        R, Qb_torch, x,
+        m, n, k,
+        stride_R_row, stride_R_col,
+        stride_Qb_row, stride_Qb_col,
+        stride_x_row, stride_x_col,
+        BLOCK=BLOCK
+    )
     
     return x
 ```

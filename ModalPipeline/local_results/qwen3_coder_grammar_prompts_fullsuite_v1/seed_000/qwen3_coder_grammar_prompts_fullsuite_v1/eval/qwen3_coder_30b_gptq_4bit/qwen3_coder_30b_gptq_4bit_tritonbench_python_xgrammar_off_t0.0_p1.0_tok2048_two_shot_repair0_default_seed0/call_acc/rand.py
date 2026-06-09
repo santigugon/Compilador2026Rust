@@ -12,7 +12,7 @@ def _rand_kernel(out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     # Using a fixed seed for reproducibility
     seed = 12345
     # Simple hash-like function to generate pseudo-random numbers
-    # This is a basic implementation - in practice, a more sophisticated RNG would be used
+    # This is a basic implementation - in practice, a more sophisticated PRNG would be used
     x = (offsets * 1103515245 + 12345) & 0x7fffffff
     # Convert to float in [0, 1) range
     y = x * (1.0 / (2**31))

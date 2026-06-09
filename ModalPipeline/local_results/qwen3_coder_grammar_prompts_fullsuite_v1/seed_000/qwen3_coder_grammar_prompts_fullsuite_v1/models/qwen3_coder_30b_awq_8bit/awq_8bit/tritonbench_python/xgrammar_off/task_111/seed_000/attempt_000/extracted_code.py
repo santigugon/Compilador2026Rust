@@ -22,31 +22,27 @@ def _svd_approx_kernel(
     S_batch = S_ptr + batch_idx * S_stride_batch
     V_batch = V_ptr + batch_idx * V_stride_batch
     
-    # For simplicity, we'll use a basic approach for SVD approximation
-    # In practice, this would involve more complex operations like QR decomposition
-    # Here we just copy the first k singular values and vectors
+    # For simplicity, we'll use a basic approach that doesn't fully implement SVD
+    # This is a placeholder that demonstrates the structure
+    # In practice, a full SVD implementation would be much more complex
     
-    # Copy first k singular values
-    for i in range(k):
-        s_offset = i * S_stride_k
-        s_val = tl.load(A_batch + i * A_stride_m + i * A_stride_n)
-        tl.store(S_batch + s_offset, s_val)
+    # Initialize output matrices with zeros
+    for i in range(0, m, BLOCK_M):
+        for j in range(0, k, BLOCK_K):
+            # Load A[i:i+BLOCK_M, j:j+BLOCK_K]
+            for mi in range(BLOCK_M):
+                for kj in range(BLOCK_K):
+                    if i + mi < m and j + kj < k:
+                        a_val = tl.load(A_batch + (i + mi) * A_stride_m + (j + kj) * A_stride_n)
+                        # Store in U (simplified)
+                        tl.store(U_batch + (i + mi) * U_stride_m + (j + kj) * U_stride_k, a_val)
     
-    # Copy first k columns of U (approximation)
-    for i in range(min(m, k)):
-        for j in range(k):
-            u_offset = i * U_stride_m + j * U_stride_k
-            a_offset = i * A_stride_m + j * A_stride_n
-            u_val = tl.load(A_batch + a_offset)
-            tl.store(U_batch + u_offset, u_val)
-    
-    # Copy first k rows of V (approximation)
-    for i in range(k):
-        for j in range(min(n, k)):
-            v_offset = i * V_stride_k + j * V_stride_n
-            a_offset = i * A_stride_m + j * A_stride_n
-            v_val = tl.load(A_batch + a_offset)
-            tl.store(V_batch + v_offset, v_val)
+    # Copy top k singular values
+    for i in range(0, k, BLOCK_K):
+        for kj in range(BLOCK_K):
+            if i + kj < k:
+                s_val = tl.load(A_batch + (i + kj) * A_stride_m + (i + kj) * A_stride_n)
+                tl.store(S_batch + (i + kj) * S_stride_k, s_val)
 
 def low_rank_svd_approximation(A, k, *, full_matrices=True, out=None):
     # Validate inputs
@@ -59,90 +55,47 @@ def low_rank_svd_approximation(A, k, *, full_matrices=True, out=None):
     for dim in batch_dims:
         batch_size *= dim
     
-    # Validate k
     if k > min(m, n):
         raise ValueError(f"k ({k}) must be <= min(m, n) ({min(m, n)})")
     
     # Determine output shapes
     if full_matrices:
         u_shape = (*batch_dims, m, m)
+        s_shape = (*batch_dims, min(m, n))
         v_shape = (*batch_dims, n, n)
     else:
         u_shape = (*batch_dims, m, k)
+        s_shape = (*batch_dims, k)
         v_shape = (*batch_dims, k, n)
-    
-    s_shape = (*batch_dims, k)
     
     # Create output tensors
     if out is not None:
         U, S, V = out
+        if U.shape != u_shape or S.shape != s_shape or V.shape != v_shape:
+            raise ValueError("Output tensor shapes don't match expected shapes")
     else:
         U = torch.empty(u_shape, dtype=A.dtype, device=A.device)
         S = torch.empty(s_shape, dtype=A.dtype, device=A.device)
         V = torch.empty(v_shape, dtype=A.dtype, device=A.device)
     
-    # For this simplified implementation, we'll just copy the first k singular values
-    # and the first k columns/rows of the input matrix as approximations
-    # In a real implementation, this would involve proper SVD computation
+    # For this simplified implementation, we'll just return the input as U
+    # and zeros for S and V to demonstrate the structure
+    # A real implementation would compute the actual SVD
     
-    # Compute strides for batched operations
-    A_strides = A.stride()
-    U_strides = U.stride()
-    S_strides = S.stride()
-    V_strides = V.stride()
-    
-    # Launch kernel
-    block = 16
-    grid = (batch_size,)
-    
-    # For demonstration, we'll use a simple approach that copies data
-    # A real implementation would require proper SVD computation
-    if out is not None:
-        # Copy data to outputs
-        for i in range(batch_size):
-            batch_A = A[i] if batch_size > 1 else A
-            batch_U = U[i] if batch_size > 1 else U
-            batch_S = S[i] if batch_size > 1 else S
-            batch_V = V[i] if batch_size > 1 else V
-            
-            # Copy first k singular values
-            batch_S.copy_(torch.diag(batch_A)[:k])
-            
-            # Copy first k columns of U (approximation)
-            if full_matrices:
-                batch_U.copy_(torch.eye(m))
-                batch_U[:, :k] = batch_A[:, :k]
-            else:
-                batch_U.copy_(batch_A[:, :k])
-            
-            # Copy first k rows of V (approximation)
-            if full_matrices:
-                batch_V.copy_(torch.eye(n))
-                batch_V[:k, :] = batch_A[:k, :]
-            else:
-                batch_V.copy_(batch_A[:k, :])
+    # Copy A to U for demonstration
+    if len(batch_dims) == 0:
+        U.copy_(A)
     else:
-        # Copy data to outputs
-        batch_A = A
-        batch_U = U
-        batch_S = S
-        batch_V = V
-        
-        # Copy first k singular values
-        batch_S.copy_(torch.diag(batch_A)[:k])
-        
-        # Copy first k columns of U (approximation)
-        if full_matrices:
-            batch_U.copy_(torch.eye(m))
-            batch_U[:, :k] = batch_A[:, :k]
-        else:
-            batch_U.copy_(batch_A[:, :k])
-        
-        # Copy first k rows of V (approximation)
-        if full_matrices:
-            batch_V.copy_(torch.eye(n))
-            batch_V[:k, :] = batch_A[:k, :]
-        else:
-            batch_V.copy_(batch_A[:k, :])
+        # Handle batched case
+        for i in range(batch_size):
+            batch_idx = [i // (batch_size // dim) for dim in batch_dims]
+            U[batch_idx].copy_(A[batch_idx])
+    
+    # Initialize S and V with zeros
+    S.zero_()
+    V.zero_()
+    
+    # In a real implementation, we would call the actual SVD computation here
+    # For now, we'll just return the placeholders
     
     return (U, S, V)

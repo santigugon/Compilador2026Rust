@@ -26,89 +26,141 @@ def _combined_activation_kernel(
     acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
     
     # Load input
-    input_vals = tl.load(input_ptr + input_offsets, mask=input_mask, other=0.0)
+    input_block = tl.load(input_ptr + input_offsets, mask=input_mask, other=0.0)
     
     # Compute matrix multiplication with weight1
-    for i in range(0, input_din, BLOCK_SIZE):
-        weight1_offsets = i * input_dout + tl.arange(0, BLOCK_SIZE)
-        weight1_mask = weight1_offsets < input_din * input_dout
+    for k in range(0, input_din, BLOCK_SIZE):
+        # Load weight1 column
+        weight1_offsets = k + tl.arange(0, BLOCK_SIZE)
+        weight1_mask = weight1_offsets < input_din
         
-        # Load weight1
-        weight1_vals = tl.load(weight1_ptr + weight1_offsets, mask=weight1_mask, other=0.0)
+        # Load weight1 values
+        weight1_block = tl.load(weight1_ptr + weight1_offsets, mask=weight1_mask, other=0.0)
         
         # Compute dot product
-        for j in range(BLOCK_SIZE):
-            if i + j < input_din:
-                acc += input_vals[j] * weight1_vals[j * input_dout]
+        acc += input_block * weight1_block
+    
+    # Convert to output size
+    output_offsets = batch_id * seq_len * input_dout + seq_id * input_dout + tl.arange(0, input_dout)
+    output_mask = output_offsets < (batch_id + 1) * seq_len * input_dout
     
     # Apply sigmoid and tanh
-    sigmoid_vals = 1.0 / (1.0 + tl.exp(-acc))
-    tanh_vals = 2.0 / (1.0 + tl.exp(-2.0 * acc)) - 1.0
+    output_block = tl.sigmoid(acc) * tl.tanh(acc)
     
-    # Element-wise multiplication with weight2
-    # weight2 is broadcastable, so we'll compute it per element
-    weight2_offsets = tl.arange(0, BLOCK_SIZE)
+    # Apply element-wise multiplication with weight2
+    weight2_offsets = tl.arange(0, input_dout)
     weight2_mask = weight2_offsets < input_dout
-    weight2_vals = tl.load(weight2_ptr + weight2_offsets, mask=weight2_mask, other=0.0)
-    
-    # Combine sigmoid and tanh
-    combined = sigmoid_vals * tanh_vals
-    
-    # Element-wise multiplication with weight2
-    result = combined * weight2_vals
+    weight2_block = tl.load(weight2_ptr + weight2_offsets, mask=weight2_mask, other=0.0)
+    output_block *= weight2_block
     
     # Add bias
-    bias_offsets = tl.arange(0, BLOCK_SIZE)
+    bias_offsets = tl.arange(0, input_dout)
     bias_mask = bias_offsets < input_dout
-    bias_vals = tl.load(bias_ptr + bias_offsets, mask=bias_mask, other=0.0)
-    result += bias_vals
+    bias_block = tl.load(bias_ptr + bias_offsets, mask=bias_mask, other=0.0)
+    output_block += bias_block
     
     # Store result
-    out_offsets = batch_id * seq_len * input_dout + seq_id * input_dout + tl.arange(0, BLOCK_SIZE)
-    out_mask = out_offsets < (batch_id + 1) * seq_len * input_dout
-    tl.store(out_ptr + out_offsets, result, mask=out_mask)
+    tl.store(out_ptr + output_offsets, output_block, mask=output_mask)
 
 def combined_activation(input, weight1, weight2, bias, *, out=None):
-    # Validate input dimensions
-    assert input.dim() >= 2, "input must have at least 2 dimensions"
-    assert weight1.dim() == 2, "weight1 must be 2-dimensional"
-    assert weight1.shape[1] == input.shape[-1], "weight1's second dimension must match input's last dimension"
+    # Validate dimensions
+    batch_dims = input.shape[:-2]
+    seq_len, input_din = input.shape[-2:]
+    output_dout = weight1.shape[-1]
     
-    # Get batch dimensions
-    batch_shape = input.shape[:-2]
-    seq_len = input.shape[-2]
-    input_din = input.shape[-1]
-    input_dout = weight1.shape[1]
+    # Check compatibility
+    assert input_din == weight1.shape[0], "Input dimension mismatch with weight1"
+    assert weight2.shape[-1] == output_dout, "Weight2 dimension mismatch with output"
+    assert bias.shape[-1] == output_dout, "Bias dimension mismatch with output"
     
-    # Validate weight2 and bias shapes for broadcasting
-    assert weight2.shape[-1] == input_dout, "weight2's last dimension must match weight1's second dimension"
-    assert bias.shape[-1] == input_dout, "bias's last dimension must match weight1's second dimension"
+    # Compute output shape
+    output_shape = batch_dims + (seq_len, output_dout)
     
-    # Prepare output tensor
+    # Create output tensor
     if out is None:
-        out_shape = batch_shape + (seq_len, input_dout)
-        out = torch.empty(out_shape, dtype=input.dtype, device=input.device)
+        out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
     else:
-        assert out.shape == batch_shape + (seq_len, input_dout), "out tensor has incorrect shape"
+        assert out.shape == output_shape, "Output shape mismatch"
     
-    # Launch kernel
-    block_size = 256
+    # Handle batch dimensions
     batch_size = 1
-    for dim in batch_shape:
+    for dim in batch_dims:
         batch_size *= dim
     
+    # Launch kernel
+    BLOCK_SIZE = 256
     grid = (batch_size, seq_len)
     
     # Flatten input for kernel processing
     input_flat = input.view(-1, input_din)
-    out_flat = out.view(-1, input_dout)
+    out_flat = out.view(-1, output_dout)
+    
+    # Create a kernel that handles the full computation
+    @triton.jit
+    def _combined_activation_kernel_v2(
+        input_ptr, weight1_ptr, weight2_ptr, bias_ptr, out_ptr,
+        n_elements: tl.constexpr, 
+        input_din: tl.constexpr,
+        output_dout: tl.constexpr,
+        batch_size: tl.constexpr,
+        seq_len: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr
+    ):
+        pid = tl.program_id(0)
+        batch_id = pid // seq_len
+        seq_id = pid % seq_len
+        
+        # Calculate input offset
+        input_offset = batch_id * seq_len * input_din + seq_id * input_din
+        output_offset = batch_id * seq_len * output_dout + seq_id * output_dout
+        
+        # Process each output dimension
+        for i in range(0, output_dout, BLOCK_SIZE):
+            # Load input
+            input_offsets = input_offset + tl.arange(0, BLOCK_SIZE)
+            input_mask = input_offsets < (batch_id + 1) * seq_len * input_din
+            
+            # Load input block
+            input_block = tl.load(input_ptr + input_offsets, mask=input_mask, other=0.0)
+            
+            # Compute output for this dimension
+            acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+            for k in range(0, input_din, BLOCK_SIZE):
+                # Load weight1
+                weight1_offsets = k + tl.arange(0, BLOCK_SIZE)
+                weight1_mask = weight1_offsets < input_din
+                
+                # Load weight1 values
+                weight1_block = tl.load(weight1_ptr + weight1_offsets, mask=weight1_mask, other=0.0)
+                
+                # Compute dot product
+                acc += input_block * weight1_block
+            
+            # Apply activation functions
+            output_block = tl.sigmoid(acc) * tl.tanh(acc)
+            
+            # Apply element-wise multiplication with weight2
+            weight2_offsets = i + tl.arange(0, BLOCK_SIZE)
+            weight2_mask = weight2_offsets < output_dout
+            weight2_block = tl.load(weight2_ptr + weight2_offsets, mask=weight2_mask, other=0.0)
+            output_block *= weight2_block
+            
+            # Add bias
+            bias_offsets = i + tl.arange(0, BLOCK_SIZE)
+            bias_mask = bias_offsets < output_dout
+            bias_block = tl.load(bias_ptr + bias_offsets, mask=bias_mask, other=0.0)
+            output_block += bias_block
+            
+            # Store result
+            output_offsets = output_offset + i + tl.arange(0, BLOCK_SIZE)
+            output_mask = output_offsets < (batch_id + 1) * seq_len * output_dout
+            tl.store(out_ptr + output_offsets, output_block, mask=output_mask)
     
     # Launch kernel
-    _combined_activation_kernel[grid](
-        input_flat, weight1, weight2, bias, out_flat,
-        input_din, input_din, input_dout,
-        batch_size, seq_len,
-        BLOCK_SIZE=block_size
+    grid_size = batch_size * seq_len
+    _combined_activation_kernel_v2[grid_size](
+        input, weight1, weight2, bias, out,
+        input.numel(), input_din, output_dout, batch_size, seq_len, BLOCK_SIZE
     )
     
     return out

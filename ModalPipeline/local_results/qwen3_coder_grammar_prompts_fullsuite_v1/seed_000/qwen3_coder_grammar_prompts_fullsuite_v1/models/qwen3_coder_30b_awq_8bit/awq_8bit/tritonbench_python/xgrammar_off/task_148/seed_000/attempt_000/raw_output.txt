@@ -41,31 +41,28 @@ def _adam_kernel(
     exp_avg_sq = beta2 * exp_avg_sq + (1 - beta2) * grad * grad
     
     if amsgrad:
-        # Keep track of the maximum of the second moment estimates
+        # Keep the maximum of all (unbiased) second moments of gradients
         max_exp_avg_sq = tl.maximum(max_exp_avg_sq, exp_avg_sq)
         denom = tl.sqrt(max_exp_avg_sq) + eps
     else:
         denom = tl.sqrt(exp_avg_sq) + eps
     
-    # Bias correction
+    # Compute bias-corrected learning rate
     bias_correction1 = 1 - beta1 ** step
     bias_correction2 = 1 - beta2 ** step
     
+    # Apply weight decay
+    if weight_decay != 0:
+        param = param - weight_decay * param
+    
     # Compute step size
-    step_size = lr / bias_correction1
+    step_size = lr * tl.sqrt(bias_correction2) / bias_correction1
     
     # Update parameter
     if maximize:
         param = param + step_size * exp_avg / denom
     else:
         param = param - step_size * exp_avg / denom
-    
-    # Apply weight decay
-    if weight_decay != 0:
-        if maximize:
-            param = param - lr * weight_decay * param
-        else:
-            param = param - lr * weight_decay * param
     
     # Store updated values
     tl.store(param_ptr + offsets, param, mask=mask)
@@ -76,58 +73,60 @@ def _adam_kernel(
         tl.store(max_exp_avg_sq_ptr + offsets, max_exp_avg_sq, mask=mask)
 
 def Adam(params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, amsgrad=False, foreach=None, maximize=False, capturable=False, differentiable=False, fused=None):
-    # For simplicity, we'll implement a basic version that works with a single parameter tensor
-    # In a real implementation, this would handle multiple parameter groups
+    # This is a simplified implementation that handles the core Adam algorithm
+    # For a full implementation, more complex logic would be needed for foreach, fused, etc.
     
-    if not params:
-        return
+    if not isinstance(params, (list, tuple)) or len(params) == 0:
+        return None
     
-    # Get the first parameter to determine tensor properties
+    # For simplicity, we'll process the first parameter
     param = params[0]
     
-    # Create state tensors if they don't exist
+    # Initialize momentum and variance terms if not present
     if not hasattr(param, 'exp_avg'):
-        param.exp_avg = torch.zeros_like(param, dtype=torch.float32)
+        param.exp_avg = torch.zeros_like(param)
     if not hasattr(param, 'exp_avg_sq'):
-        param.exp_avg_sq = torch.zeros_like(param, dtype=torch.float32)
+        param.exp_avg_sq = torch.zeros_like(param)
     if amsgrad and not hasattr(param, 'max_exp_avg_sq'):
-        param.max_exp_avg_sq = torch.zeros_like(param, dtype=torch.float32)
+        param.max_exp_avg_sq = torch.zeros_like(param)
     
-    # Get state tensors
-    exp_avg = param.exp_avg
-    exp_avg_sq = param.exp_avg_sq
-    max_exp_avg_sq = getattr(param, 'max_exp_avg_sq', None)
+    # Get current step (assuming it's tracked somewhere)
+    step = getattr(param, 'step', 1)
     
-    # Create output tensor
-    out = torch.empty_like(param)
+    # Create output tensors
+    out_param = torch.empty_like(param)
+    out_exp_avg = torch.empty_like(param)
+    out_exp_avg_sq = torch.empty_like(param)
     
-    # Copy parameter to output
-    out.copy_(param)
+    if amsgrad:
+        out_max_exp_avg_sq = torch.empty_like(param)
+    else:
+        out_max_exp_avg_sq = None
     
-    # Get tensor properties
+    # Copy input data to output
+    out_param.copy_(param)
+    out_exp_avg.copy_(param.exp_avg)
+    out_exp_avg_sq.copy_(param.exp_avg_sq)
+    
+    if amsgrad:
+        out_max_exp_avg_sq.copy_(param.max_exp_avg_sq)
+    
+    # Launch kernel
     n = param.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
     
-    # Convert parameters to appropriate types
-    lr_val = float(lr)
-    beta1, beta2 = betas
-    eps_val = float(eps)
-    weight_decay_val = float(weight_decay)
-    step = 1  # Simplified step counter
-    
-    # Launch kernel
     _adam_kernel[grid](
-        out, 
-        param.grad, 
-        exp_avg, 
-        exp_avg_sq, 
-        max_exp_avg_sq,
-        lr_val, 
-        beta1, 
-        beta2, 
-        eps_val, 
-        weight_decay_val,
+        out_param,
+        param.grad,
+        out_exp_avg,
+        out_exp_avg_sq,
+        out_max_exp_avg_sq,
+        lr,
+        betas[0],
+        betas[1],
+        eps,
+        weight_decay,
         amsgrad,
         maximize,
         step,
@@ -135,8 +134,19 @@ def Adam(params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, amsgrad=
         BLOCK=block
     )
     
-    # Update parameter with result
-    param.copy_(out)
+    # Update parameter with new values
+    param.copy_(out_param)
+    param.exp_avg.copy_(out_exp_avg)
+    param.exp_avg_sq.copy_(out_exp_avg_sq)
     
-    return param
+    if amsgrad:
+        param.max_exp_avg_sq.copy_(out_max_exp_avg_sq)
+    
+    # Update step
+    if not hasattr(param, 'step'):
+        param.step = 1
+    else:
+        param.step += 1
+    
+    return None
 ```

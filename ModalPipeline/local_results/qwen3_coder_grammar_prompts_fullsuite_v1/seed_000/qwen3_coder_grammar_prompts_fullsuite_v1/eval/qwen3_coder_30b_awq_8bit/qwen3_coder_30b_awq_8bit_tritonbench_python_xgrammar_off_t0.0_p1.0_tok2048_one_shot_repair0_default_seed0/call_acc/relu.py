@@ -5,18 +5,17 @@ import triton.language as tl
 @triton.jit
 def relu_kernel(X, Y, N, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < N
     x = tl.load(X + offsets, mask=mask)
     y = tl.where(x > 0, x, 0)
     tl.store(Y + offsets, y, mask=mask)
 
 def relu(input, inplace=False):
-    if inplace:
-        output = input
-    else:
+    if not inplace:
         output = torch.empty_like(input)
+    else:
+        output = input
     
     if input.numel() == 0:
         return output

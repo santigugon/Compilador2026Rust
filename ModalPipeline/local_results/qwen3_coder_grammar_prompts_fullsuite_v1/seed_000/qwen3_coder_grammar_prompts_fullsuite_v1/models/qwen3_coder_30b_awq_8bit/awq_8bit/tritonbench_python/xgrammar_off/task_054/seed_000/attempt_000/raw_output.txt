@@ -33,7 +33,7 @@ def gelu_conv2d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.
             # This is a simplified version - in practice, you'd compute based on input/output sizes
             pad_h = pad_w = 0
         else:
-            raise ValueError("Padding must be 'valid', 'same', or an integer/tuple")
+            raise ValueError(f"Unsupported padding string: {padding}")
     elif isinstance(padding, int):
         pad_h = pad_w = padding
     else:
@@ -45,22 +45,16 @@ def gelu_conv2d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.
     else:
         dilation_h, dilation_w = dilation
     
-    # Compute output shape
-    batch_size, in_channels, iH, iW = input.shape
-    out_channels, _, kH, kW = weight.shape
-    
-    # Calculate output dimensions
-    oH = (iH + 2 * pad_h - (dilation_h * (kH - 1) + 1)) // stride_h + 1
-    oW = (iW + 2 * pad_w - (dilation_w * (kW - 1) + 1)) // stride_w + 1
-    
-    # Create output tensor
-    if out is None:
-        out = torch.empty(batch_size, out_channels, oH, oW, device=input.device, dtype=input.dtype)
-    
     # Perform convolution using PyTorch's built-in function
-    conv_out = torch.conv2d(input, weight, bias, stride, padding, dilation, groups)
+    conv_out = torch.nn.functional.conv2d(
+        input, weight, bias, stride, padding, dilation, groups
+    )
     
-    # Apply GELU activation using Triton kernel
+    # Apply GELU activation
+    if out is None:
+        out = torch.empty_like(conv_out)
+    
+    # Apply GELU using Triton kernel
     n = conv_out.numel()
     block = 256
     grid = (triton.cdiv(n, block),)

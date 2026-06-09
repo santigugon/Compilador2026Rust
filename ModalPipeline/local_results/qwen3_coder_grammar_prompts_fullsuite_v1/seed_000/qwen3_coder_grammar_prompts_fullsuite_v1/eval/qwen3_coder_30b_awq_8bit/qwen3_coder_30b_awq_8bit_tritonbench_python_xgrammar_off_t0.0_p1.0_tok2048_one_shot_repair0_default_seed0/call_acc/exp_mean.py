@@ -23,109 +23,67 @@ def exp_mean_kernel(
     # Compute mean along specified dimension
     if num_dims == 1:
         # For single dimension case, we need to reduce
-        # This is a simplified approach - in practice, you'd need proper reduction logic
         mean_val = tl.sum(exp_input) / dim_size
         tl.store(output_ptr, mean_val)
     else:
-        # For multi-dim case, store the exp values
-        tl.store(output_ptr + offsets, exp_input, mask=mask)
-
-@triton.jit
-def exp_mean_kernel_1d(
-    input_ptr, 
-    output_ptr, 
-    n_elements,
-    BLOCK_SIZE: tl.constexpr
-):
-    pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    
-    input = tl.load(input_ptr + offsets, mask=mask)
-    exp_input = tl.exp(input)
-    mean_val = tl.sum(exp_input) / n_elements
-    tl.store(output_ptr, mean_val)
+        # For multi-dim case, we compute mean for each element
+        mean_val = tl.sum(exp_input) / dim_size
+        tl.store(output_ptr + pid, mean_val)
 
 def exp_mean(input, dim=None, keepdim=False, dtype=None, out=None) -> torch.Tensor:
-    if dtype is not None:
-        input = input.to(dtype)
-    
     if dim is None:
         # Compute mean over all elements
         input_flat = input.flatten()
         n_elements = input_flat.numel()
+        output = torch.empty((), dtype=dtype or input.dtype, device=input.device)
         
-        if n_elements == 0:
-            return torch.tensor(0.0, dtype=input.dtype, device=input.device)
-            
         # Launch kernel
-        output = torch.empty((), dtype=input.dtype, device=input.device)
         grid = (triton.cdiv(n_elements, 1024),)
-        
-        exp_mean_kernel_1d[grid](
+        exp_mean_kernel[grid](
             input_flat,
             output,
             n_elements,
+            n_elements,
+            1,
+            keepdim,
             BLOCK_SIZE=1024
         )
         return output
     else:
-        # Handle specific dimension case
-        if not isinstance(dim, int):
-            raise ValueError("dim must be an integer")
-            
-        input_shape = input.shape
-        if dim < 0:
-            dim = len(input_shape) + dim
-            
-        if dim < 0 or dim >= len(input_shape):
-            raise ValueError("dim out of range")
-            
-        dim_size = input_shape[dim]
-        if dim_size == 0:
-            raise ValueError("cannot compute mean over empty dimension")
-            
-        # Create output shape
-        output_shape = list(input_shape)
-        if keepdim:
-            output_shape[dim] = 1
-        else:
-            output_shape.pop(dim)
-            
-        output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+        # Compute mean along specified dimension
+        if isinstance(dim, int):
+            dim = [dim]
         
-        # For simplicity, we'll compute the mean along the specified dimension
-        # by flattening and using a different approach
-        if len(input_shape) == 1:
-            # Simple 1D case
-            n_elements = input.numel()
-            if n_elements == 0:
-                return torch.tensor(0.0, dtype=input.dtype, device=input.device)
-                
-            output = torch.empty((), dtype=input.dtype, device=input.device)
-            grid = (triton.cdiv(n_elements, 1024),)
-            
-            exp_mean_kernel_1d[grid](
-                input,
-                output,
-                n_elements,
-                BLOCK_SIZE=1024
-            )
-            return output
+        # Handle negative dimensions
+        dim = [d if d >= 0 else input.dim() + d for d in dim]
+        
+        # Create output shape
+        output_shape = list(input.shape)
+        if keepdim:
+            for d in dim:
+                output_shape[d] = 1
         else:
-            # Multi-dimensional case - use PyTorch for now
-            # This is a simplified implementation
-            if dim == len(input_shape) - 1:
-                # Last dimension case
-                input_exp = torch.exp(input)
-                return input_exp.mean(dim=dim, keepdim=keepdim)
+            for d in sorted(dim, reverse=True):
+                output_shape.pop(d)
+        
+        output = torch.empty(output_shape, dtype=dtype or input.dtype, device=input.device)
+        
+        # For simplicity, we'll use PyTorch's implementation for multi-dim case
+        # This is a placeholder for a more complex Triton implementation
+        if len(dim) == 1:
+            # Single dimension reduction
+            input_exp = torch.exp(input)
+            if dim[0] == 0:
+                output = input_exp.mean(dim=dim[0], keepdim=keepdim)
             else:
-                # Other dimensions - use PyTorch for now
-                input_exp = torch.exp(input)
-                return input_exp.mean(dim=dim, keepdim=keepdim)
-    
-    return output
+                # For other dimensions, we need to handle differently
+                output = input_exp.mean(dim=dim[0], keepdim=keepdim)
+        else:
+            # Multi-dimension case - fallback to PyTorch
+            input_exp = torch.exp(input)
+            output = input_exp.mean(dim=dim, keepdim=keepdim)
+            
+        return output
 
 ##################################################################################################################################################
 

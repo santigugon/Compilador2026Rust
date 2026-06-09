@@ -30,7 +30,7 @@ def mul_relu(input, other, inplace=False, out=None):
     # Determine output tensor
     if inplace:
         if out is not None:
-            raise ValueError("Cannot specify both 'inplace=True' and 'out'")
+            raise ValueError("Cannot specify both inplace=True and out parameter")
         out = input
     elif out is None:
         out = torch.empty_like(input)
@@ -42,12 +42,18 @@ def mul_relu(input, other, inplace=False, out=None):
     block = 256
     grid = (triton.cdiv(n, block),)
     
-    # Handle the case where we're doing in-place operation
-    if inplace:
-        _mul_relu_kernel[grid](input, other, input, n, True, BLOCK=block)
-    else:
-        _mul_relu_kernel[grid](input, other, out, n, False, BLOCK=block)
+    # Handle the case where we're doing in-place operation on a scalar
+    if inplace and input.numel() == 1:
+        # For scalar in-place, we need to handle it specially
+        if torch.is_tensor(other):
+            result = input * other
+        else:
+            result = input * other
+        out.fill_(torch.relu(result).item())
+        return out
     
+    # For regular case, launch kernel
+    _mul_relu_kernel[grid](input, other, out, n, inplace, BLOCK=block)
     return out
 
 ##################################################################################################################################################

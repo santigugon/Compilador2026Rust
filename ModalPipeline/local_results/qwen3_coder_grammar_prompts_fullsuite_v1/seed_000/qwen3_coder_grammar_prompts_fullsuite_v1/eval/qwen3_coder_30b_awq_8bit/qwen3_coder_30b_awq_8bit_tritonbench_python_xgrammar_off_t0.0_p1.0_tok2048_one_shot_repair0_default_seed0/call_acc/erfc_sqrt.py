@@ -10,30 +10,35 @@ def erfc_sqrt_kernel(
     n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
     input = tl.load(input_ptr + offsets, mask=mask)
     
     # Compute erfc
-    # Using approximation for erfc: erfc(x) ≈ 1 - erf(x)
+    # Using approximation for erfc: erfc(x) = 1 - erf(x)
     # For simplicity, using a basic approximation
     # A more accurate implementation would use the full erfc computation
     x = input
-    # Approximation for erf: erf(x) ≈ sign(x) * (1 - exp(-x^2 * (4/π + a*x^2)/(1 + a*x^2)))
-    # Using a = 0.147 for reasonable accuracy
-    a = 0.147
-    sign_x = tl.where(x >= 0, 1.0, -1.0)
-    x2 = x * x
-    erf_approx = sign_x * (1.0 - tl.exp(-x2 * (4.0 / 3.14159 + a * x2) / (1.0 + a * x2)))
+    # Approximation for erf: erf(x) ≈ 1 - exp(-x^2 * (a1*x^3 + a2*x^2 + a3*x + a4))
+    # Using coefficients for a reasonable approximation
+    a1 = 0.278393
+    a2 = 0.230389
+    a3 = 0.000972
+    a4 = 0.078108
+    t = 1.0 / (1.0 + 0.332626 * tl.abs(x))
+    erf_approx = 1.0 - t * tl.exp(-x * x * (a1 * t * t + a2 * t + a3 + a4 * t * t * t))
     erfc = 1.0 - erf_approx
     
+    # Handle negative x properly for erf
+    erfc = tl.where(x < 0, 2.0 - erfc, erfc)
+    
     # Compute sqrt
-    sqrt_val = tl.sqrt(input)
+    sqrt = tl.sqrt(input)
     
     tl.store(erfc_ptr + offsets, erfc, mask=mask)
-    tl.store(sqrt_ptr + offsets, sqrt_val, mask=mask)
+    tl.store(sqrt_ptr + offsets, sqrt, mask=mask)
 
 def erfc_sqrt(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     assert input.is_contiguous(), "Input tensor must be contiguous"

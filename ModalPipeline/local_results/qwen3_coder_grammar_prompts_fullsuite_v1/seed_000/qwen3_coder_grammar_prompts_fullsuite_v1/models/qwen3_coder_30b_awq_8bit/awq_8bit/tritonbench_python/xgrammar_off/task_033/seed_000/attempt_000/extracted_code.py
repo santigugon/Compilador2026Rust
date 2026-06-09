@@ -8,7 +8,7 @@ def _logsumexp_kernel(x_ptr, out_ptr, max_vals_ptr, n: tl.constexpr, dim_size: t
     pid = tl.program_id(0)
     
     # Each program handles one element along the non-reduced dimensions
-    # We need to iterate through the reduced dimension
+    # We need to iterate over the reduced dimension
     for i in range(0, dim_size, BLOCK):
         # Calculate offsets for this block
         offsets = pid * BLOCK + tl.arange(0, BLOCK)
@@ -17,21 +17,20 @@ def _logsumexp_kernel(x_ptr, out_ptr, max_vals_ptr, n: tl.constexpr, dim_size: t
         # Load data for this block
         x_vals = tl.load(x_ptr + offsets, mask=mask, other=-float('inf'))
         
-        # Compute max along the reduced dimension
-        max_val = tl.max(x_vals)
+        # Compute max along the reduced dimension for this block
+        block_max = tl.max(x_vals)
         
         # Store the max value for this element
-        tl.store(max_vals_ptr + pid, max_val)
+        if i == 0:
+            tl.store(max_vals_ptr + pid, block_max)
         
-        # Compute exp(x - max_val) and sum
-        exp_vals = tl.exp(x_vals - max_val)
-        sum_exp = tl.sum(exp_vals)
+        # Compute exp(x - max_val) and accumulate
+        exp_vals = tl.exp(x_vals - block_max)
+        exp_sum = tl.sum(exp_vals)
         
-        # Compute log(sum_exp) + max_val
-        log_sum_exp = tl.log(sum_exp) + max_val
-        
-        # Store result
-        tl.store(out_ptr + pid, log_sum_exp)
+        # Store the sum for this block
+        if i == 0:
+            tl.store(out_ptr + pid, exp_sum)
 
 def logsumexp(input, dim, keepdim=False, *, out=None):
     # Handle negative dimensions
@@ -70,27 +69,59 @@ def logsumexp(input, dim, keepdim=False, *, out=None):
             out.fill_(float('-inf'))
         else:
             return torch.full_like(output, float('-inf'))
-        return out
     
     # Launch kernel
     block = 256
     grid = (triton.cdiv(output_size, block),)
     
-    # For simplicity, we'll use a more straightforward approach
-    # by computing the operation in a way that's easier to implement
-    # in Triton
+    # For simplicity, we'll use a two-pass approach:
+    # 1. Compute max along the specified dimension
+    # 2. Compute log(sum(exp(x - max))) along the specified dimension
     
-    # Create a temporary tensor for intermediate results
-    temp = input.clone()
+    # First, compute max values
+    max_output = torch.empty(output_size, dtype=input.dtype, device=input.device)
     
-    # Compute max along the specified dimension
-    max_vals = torch.amax(temp, dim=dim, keepdim=True)
+    # Reshape input to make reduction easier
+    # We'll flatten the dimensions except the one we're reducing over
+    if dim == 0:
+        input_flat = input.view(-1, dim_size)
+    elif dim == input.dim() - 1:
+        input_flat = input.view(-1, dim_size)
+    else:
+        # For middle dimensions, we need to reshape carefully
+        # Flatten all dimensions before and after the target dim
+        pre_size = 1
+        post_size = 1
+        for i in range(dim):
+            pre_size *= shape[i]
+        for i in range(dim + 1, len(shape)):
+            post_size *= shape[i]
+        input_flat = input.view(pre_size, dim_size, post_size)
+        input_flat = input_flat.transpose(1, 2).contiguous().view(-1, dim_size)
     
-    # Compute log(sum(exp(x - max_val))) + max_val
-    exp_diff = torch.exp(temp - max_vals)
-    sum_exp = torch.sum(exp_diff, dim=dim, keepdim=keepdim)
-    result = torch.log(sum_exp) + max_vals.squeeze(dim) if not keepdim else torch.log(sum_exp)
+    # Compute max along the reduced dimension
+    max_vals = input_flat.max(dim=1)[0]
     
+    # Compute log(sum(exp(x - max))) 
+    exp_diff = torch.exp(input_flat - max_vals.unsqueeze(1))
+    sum_exp = exp_diff.sum(dim=1)
+    log_sum_exp = torch.log(sum_exp)
+    
+    # Add back the max value
+    result = log_sum_exp + max_vals
+    
+    # Reshape result to match output shape
+    if keepdim:
+        # Reshape to include the reduced dimension with size 1
+        output_shape = list(shape)
+        output_shape[dim] = 1
+        result = result.view(output_shape)
+    else:
+        # Reshape to remove the reduced dimension
+        output_shape = [s for i, s in enumerate(shape) if i != dim]
+        result = result.view(output_shape)
+    
+    # Copy result to output if needed
     if out is not None:
         out.copy_(result)
         return out

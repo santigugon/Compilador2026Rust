@@ -5,69 +5,75 @@ from typing import Union, Tuple
 
 @triton.jit
 def _sigmoid_adaptive_avg_pool2d_kernel(
-    input_ptr, 
+    input_ptr,
     output_ptr,
-    input_height, 
-    input_width,
-    output_height, 
-    output_width,
     input_batch,
-    input_channels,
+    input_height,
+    input_width,
+    output_height,
+    output_width,
+    input_batch_stride,
+    input_height_stride,
+    input_width_stride,
+    output_batch_stride,
+    output_height_stride,
+    output_width_stride,
     BLOCK_H: tl.constexpr,
     BLOCK_W: tl.constexpr
 ):
-    # Get the batch and channel indices
-    batch_idx = tl.program_id(0)
-    channel_idx = tl.program_id(1)
+    batch_id = tl.program_id(0)
+    h_id = tl.program_id(1)
+    w_id = tl.program_id(2)
     
-    # Calculate the starting position for this block
-    output_h_start = tl.program_id(2) * BLOCK_H
-    output_w_start = tl.program_id(3) * BLOCK_W
+    # Calculate output indices
+    output_h = h_id * BLOCK_H + tl.arange(0, BLOCK_H)
+    output_w = w_id * BLOCK_W + tl.arange(0, BLOCK_W)
     
-    # Calculate the actual output dimensions for this block
-    output_h_end = tl.minimum(output_h_start + BLOCK_H, output_height)
-    output_w_end = tl.minimum(output_w_start + BLOCK_W, output_width)
+    # Create masks for valid output indices
+    h_mask = output_h < output_height
+    w_mask = output_w < output_width
+    mask = h_mask[:, None] & w_mask[None, :]
     
-    # Loop over the output dimensions
-    for output_h in range(output_h_start, output_h_end):
-        for output_w in range(output_w_start, output_w_end):
-            # Calculate the input region boundaries
-            h_start = (output_h * input_height) // output_height
-            h_end = ((output_h + 1) * input_height + output_height - 1) // output_height
-            w_start = (output_w * input_width) // output_width
-            w_end = ((output_w + 1) * input_width + output_width - 1) // output_width
-            
-            # Calculate the number of elements in the region
-            num_elements = (h_end - h_start) * (w_end - w_start)
-            
-            # Initialize sum
-            sum_val = 0.0
-            
-            # Accumulate the values in the region
-            for h in range(h_start, h_end):
-                for w in range(w_start, w_end):
-                    # Calculate the input index
-                    input_idx = batch_idx * (input_height * input_width * input_channels) + \
-                                channel_idx * (input_height * input_width) + \
-                                h * input_width + w
-                    sum_val += tl.load(input_ptr + input_idx)
-            
-            # Calculate the average
-            avg_val = sum_val / num_elements
-            
-            # Apply sigmoid
-            sigmoid_val = 1.0 / (1.0 + tl.exp(-avg_val))
-            
-            # Calculate the output index
-            output_idx = batch_idx * (output_height * output_width * input_channels) + \
-                         channel_idx * (output_height * output_width) + \
-                         output_h * output_width + output_w
-            
-            # Store the result
-            tl.store(output_ptr + output_idx, sigmoid_val)
+    # Calculate input region boundaries
+    h_start = (output_h * input_height) // output_height
+    h_end = ((output_h + 1) * input_height + output_height - 1) // output_height
+    w_start = (output_w * input_width) // output_width
+    w_end = ((output_w + 1) * input_width + output_width - 1) // output_width
+    
+    # Calculate average pooling
+    avg_sum = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
+    count = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
+    
+    for h in range(BLOCK_H):
+        for w in range(BLOCK_W):
+            if h_mask[h] and w_mask[w]:
+                h_s = h_start[h]
+                h_e = h_end[h]
+                w_s = w_start[w]
+                w_e = w_end[w]
+                region_count = (h_e - h_s) * (w_e - w_s)
+                if region_count > 0:
+                    # Compute sum over the region
+                    region_sum = 0.0
+                    for ih in range(h_s, h_e):
+                        for iw in range(w_s, w_e):
+                            input_idx = batch_id * input_batch_stride + ih * input_height_stride + iw * input_width_stride
+                            region_sum += tl.load(input_ptr + input_idx, mask=True)
+                    avg_sum[h, w] = region_sum
+                    count[h, w] = region_count
+    
+    # Compute average
+    avg = avg_sum / count
+    
+    # Apply sigmoid
+    sigmoid_result = 1.0 / (1.0 + tl.exp(-avg))
+    
+    # Store result
+    output_idx = batch_id * output_batch_stride + h_id * BLOCK_H * output_height_stride + w_id * BLOCK_W * output_width_stride
+    tl.store(output_ptr + output_idx, sigmoid_result, mask=mask)
 
 def sigmoid_adaptive_avg_pool2d(input: torch.Tensor, output_size: Union[int, Tuple[int, int]]) -> torch.Tensor:
-    # Handle the case where output_size is an integer
+    # Handle output_size
     if isinstance(output_size, int):
         output_height = output_size
         output_width = output_size
@@ -75,10 +81,10 @@ def sigmoid_adaptive_avg_pool2d(input: torch.Tensor, output_size: Union[int, Tup
         output_height, output_width = output_size
     
     # Get input dimensions
-    input_batch, input_channels, input_height, input_width = input.shape
+    batch_size, channels, input_height, input_width = input.shape
     
     # Create output tensor
-    output = torch.empty(input_batch, input_channels, output_height, output_width, device=input.device, dtype=input.dtype)
+    output = torch.empty(batch_size, channels, output_height, output_width, dtype=input.dtype, device=input.device)
     
     # Define block size
     BLOCK_H = 16
@@ -86,21 +92,29 @@ def sigmoid_adaptive_avg_pool2d(input: torch.Tensor, output_size: Union[int, Tup
     
     # Launch kernel
     grid = (
-        input_batch,      # batch dimension
-        input_channels,   # channel dimension
-        triton.cdiv(output_height, BLOCK_H),  # height blocks
-        triton.cdiv(output_width, BLOCK_W)    # width blocks
+        batch_size,
+        triton.cdiv(output_height, BLOCK_H),
+        triton.cdiv(output_width, BLOCK_W)
     )
+    
+    # Get strides
+    input_batch_stride, input_channel_stride, input_height_stride, input_width_stride = input.stride()
+    output_batch_stride, output_channel_stride, output_height_stride, output_width_stride = output.stride()
     
     _sigmoid_adaptive_avg_pool2d_kernel[grid](
         input,
         output,
+        batch_size,
         input_height,
         input_width,
         output_height,
         output_width,
-        input_batch,
-        input_channels,
+        input_batch_stride,
+        input_height_stride,
+        input_width_stride,
+        output_batch_stride,
+        output_height_stride,
+        output_width_stride,
         BLOCK_H=BLOCK_H,
         BLOCK_W=BLOCK_W
     )

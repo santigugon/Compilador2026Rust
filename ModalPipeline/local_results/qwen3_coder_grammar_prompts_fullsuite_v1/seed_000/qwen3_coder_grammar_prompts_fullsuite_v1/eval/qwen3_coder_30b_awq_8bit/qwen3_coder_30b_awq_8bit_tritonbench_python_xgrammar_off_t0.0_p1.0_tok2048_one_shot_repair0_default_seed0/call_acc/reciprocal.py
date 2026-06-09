@@ -24,7 +24,7 @@ def reciprocal(input, *, out=None):
         if out.shape != input.shape:
             raise ValueError("Output tensor must have the same shape as input tensor")
         if out.dtype != torch.float32:
-            raise ValueError("Output tensor must have dtype float32")
+            raise ValueError("Output tensor must have dtype torch.float32")
     
     n_elements = input.numel()
     BLOCK_SIZE = 1024

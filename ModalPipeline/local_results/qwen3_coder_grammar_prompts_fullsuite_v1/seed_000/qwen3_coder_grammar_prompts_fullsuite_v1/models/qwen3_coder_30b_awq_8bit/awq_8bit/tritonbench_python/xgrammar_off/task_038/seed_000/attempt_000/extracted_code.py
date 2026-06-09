@@ -33,7 +33,7 @@ def _layer_norm_kernel(x_ptr, weight_ptr, bias_ptr, out_ptr, mean_ptr, var_ptr,
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     mean = tl.sum(x, axis=0) / n
-    var = tl.sum((x - mean) * (x - mean), axis=0) / n
+    var = tl.sum((x - mean) ** 2, axis=0) / n
     x_norm = (x - mean) / tl.sqrt(var + eps)
     weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0)
     bias = tl.load(bias_ptr + offsets, mask=mask, other=0.0)
@@ -43,58 +43,44 @@ def _layer_norm_kernel(x_ptr, weight_ptr, bias_ptr, out_ptr, mean_ptr, var_ptr,
     tl.store(var_ptr + pid, var, mask=pid < 1)
 
 def fused_transformer_block(input, weight1, weight2, residual, dropout_p=0.1, eps=1e-5, *, out=None):
-    # Matrix multiplication 1: Z_1 = input @ weight1
-    Z_1 = torch.matmul(input, weight1)
+    # Compute Z1 = input @ weight1
+    Z1 = torch.matmul(input, weight1)
     
-    # Softmax: Z_2 = softmax(Z_1)
-    Z_2 = torch.empty_like(Z_1)
-    n = Z_1.numel()
+    # Compute Z2 = softmax(Z1)
+    Z2 = torch.empty_like(Z1)
+    n = Z1.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
-    _softmax_kernel[grid](Z_1, Z_2, n, BLOCK=block)
+    _softmax_kernel[grid](Z1, Z2, n, BLOCK=block)
     
-    # Dropout: Z_3 = dropout(Z_2)
-    Z_3 = torch.empty_like(Z_2)
-    _dropout_kernel[grid](Z_2, Z_3, n, dropout_p, BLOCK=block)
+    # Compute Z3 = dropout(Z2)
+    Z3 = torch.empty_like(Z2)
+    _dropout_kernel[grid](Z2, Z3, n, dropout_p, BLOCK=block)
     
-    # Matrix multiplication 2: Z_4 = Z_3 @ weight2
-    Z_4 = torch.matmul(Z_3, weight2)
+    # Compute Z4 = Z3 @ weight2
+    Z4 = torch.matmul(Z3, weight2)
     
-    # Add residual: Z_5 = Z_4 + residual
-    Z_5 = Z_4 + residual
+    # Add residual to Z4
+    Z4 = Z4 + residual
     
-    # Layer normalization: output = layer_norm(Z_5)
-    output = torch.empty_like(Z_5)
-    n = Z_5.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    # Compute layer normalization
+    # For layer norm, we need to compute mean and variance over the last dimension
+    # Assuming the last dimension is D_out, we need to reshape for proper computation
+    input_shape = Z4.shape
+    D_out = input_shape[-1]
+    Z4_flat = Z4.view(-1, D_out)
     
-    # For layer norm, we need to compute mean and variance
-    # This is a simplified version that assumes the last dimension is the feature dimension
-    # and we're normalizing across that dimension
-    if len(Z_5.shape) > 1:
-        # Compute mean and variance for each sample
-        batch_size = Z_5.shape[0]
-        feature_size = Z_5.shape[-1]
-        mean = torch.empty(batch_size, device=Z_5.device, dtype=torch.float32)
-        var = torch.empty(batch_size, device=Z_5.device, dtype=torch.float32)
-        
-        # For simplicity, we'll compute layer norm per sample
-        for i in range(batch_size):
-            sample = Z_5[i]
-            sample_mean = sample.mean(dim=-1, keepdim=True)
-            sample_var = sample.var(dim=-1, keepdim=True, unbiased=False)
-            sample_norm = (sample - sample_mean) / torch.sqrt(sample_var + eps)
-            output[i] = sample_norm * 1.0 + 0.0  # Assuming weight=1, bias=0 for simplicity
-    else:
-        # For 1D case, just compute directly
-        mean = Z_5.mean(dim=-1, keepdim=True)
-        var = Z_5.var(dim=-1, keepdim=True, unbiased=False)
-        output = (Z_5 - mean) / torch.sqrt(var + eps)
+    # Compute mean and variance
+    mean = Z4_flat.mean(dim=1, keepdim=True)
+    var = Z4_flat.var(dim=1, keepdim=True, unbiased=False)
     
-    # If out is provided, copy to it
+    # Layer normalization
+    Z5 = (Z4_flat - mean) / torch.sqrt(var + eps)
+    Z5 = Z5.view(input_shape)
+    
+    # Final output
     if out is not None:
-        out.copy_(output)
+        out.copy_(Z5)
         return out
-    
-    return output
+    else:
+        return Z5

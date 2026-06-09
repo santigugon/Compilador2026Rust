@@ -12,7 +12,7 @@ def _mean_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(out_ptr, mean)
 
 @triton.jit
-def _var_kernel(x_ptr, mean_ptr, out_ptr, n: tl.constexpr, correction: tl.constexpr, BLOCK: tl.constexpr):
+def _var_kernel(x_ptr, mean_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
@@ -20,7 +20,7 @@ def _var_kernel(x_ptr, mean_ptr, out_ptr, n: tl.constexpr, correction: tl.conste
     mean = tl.load(mean_ptr)
     diff = x - mean
     squared_diff = diff * diff
-    var = tl.sum(squared_diff) / (n - correction)
+    var = tl.sum(squared_diff) / (n - 1) if n > 1 else 0.0
     tl.store(out_ptr, var)
 
 @triton.jit
@@ -32,13 +32,15 @@ def _std_kernel(x_ptr, mean_ptr, out_ptr, n: tl.constexpr, correction: tl.conste
     mean = tl.load(mean_ptr)
     diff = x - mean
     squared_diff = diff * diff
-    var = tl.sum(squared_diff) / (n - correction)
+    var = tl.sum(squared_diff) / (n - correction) if n > correction else 0.0
     std = tl.sqrt(var)
     tl.store(out_ptr + offsets, std, mask=mask)
 
 def std(input, dim=None, *, correction=1, keepdim=False, out=None):
     # Handle scalar input
     if input.dim() == 0:
+        if out is not None:
+            out.fill_(0.0)
         return torch.tensor(0.0, dtype=input.dtype, device=input.device)
     
     # Handle case where dim is None (reduce all dimensions)
@@ -47,6 +49,8 @@ def std(input, dim=None, *, correction=1, keepdim=False, out=None):
         flat_input = input.flatten()
         n = flat_input.numel()
         if n == 0:
+            if out is not None:
+                out.fill_(0.0)
             return torch.tensor(0.0, dtype=input.dtype, device=input.device)
         
         # Calculate mean
@@ -55,62 +59,53 @@ def std(input, dim=None, *, correction=1, keepdim=False, out=None):
         grid = (triton.cdiv(n, block),)
         _mean_kernel[grid](flat_input, mean_out, n, BLOCK=block)
         
-        # Calculate variance
-        var_out = torch.empty((), dtype=input.dtype, device=input.device)
-        _var_kernel[grid](flat_input, mean_out, var_out, n, correction, BLOCK=block)
+        # Calculate std
+        std_out = torch.empty_like(flat_input)
+        _std_kernel[grid](flat_input, mean_out, std_out, n, correction, BLOCK=block)
         
-        # Take square root to get standard deviation
-        result = torch.sqrt(var_out)
-        
+        # Return scalar result
+        result = torch.sqrt(torch.mean((flat_input - mean_out) ** 2))
         if out is not None:
             out.copy_(result)
             return out
         return result
     
-    # Handle case where dim is a single dimension or list of dimensions
-    if not isinstance(dim, (tuple, list)):
-        dim = [dim]
+    # Handle case where dim is a single dimension or tuple of dimensions
+    if not isinstance(dim, tuple):
+        dim = (dim,) if isinstance(dim, int) else ()
     
     # Normalize negative dimensions
-    dim = [d if d >= 0 else input.dim() + d for d in dim]
-    
-    # Validate dimensions
+    normalized_dims = []
     for d in dim:
-        if d < 0 or d >= input.dim():
-            raise IndexError(f"Dimension {d} is out of range for tensor with {input.dim()} dimensions")
+        if d < 0:
+            d = input.dim() + d
+        normalized_dims.append(d)
     
     # Create output shape
     output_shape = list(input.shape)
     if keepdim:
-        for d in dim:
+        for d in normalized_dims:
             output_shape[d] = 1
     else:
-        for d in sorted(dim, reverse=True):
+        # Remove dimensions in reverse order to maintain correct indices
+        for d in sorted(normalized_dims, reverse=True):
             output_shape.pop(d)
     
     # Create output tensor
     if out is not None:
-        if out.shape != torch.Size(output_shape):
-            raise ValueError(f"Output tensor shape {out.shape} does not match expected shape {output_shape}")
         result = out
     else:
         result = torch.empty(output_shape, dtype=input.dtype, device=input.device)
     
-    # For multi-dimensional reduction, we need to handle it differently
-    # This is a simplified approach that works for most cases
-    # For complex cases, we fall back to PyTorch operations
+    # For now, fall back to PyTorch for complex reduction cases
+    # This is a simplified implementation that works for basic cases
+    if len(normalized_dims) == 0:
+        # No dimensions to reduce
+        if out is not None:
+            out.copy_(input)
+            return out
+        return input
     
-    # Check if we can use a simple approach
-    if len(dim) == 1 and not keepdim:
-        # Simple single dimension reduction
-        d = dim[0]
-        if d == input.dim() - 1:
-            # Last dimension - can use a more efficient approach
-            # But for simplicity, we'll use PyTorch's implementation
-            pass
-        else:
-            # For other dimensions, fall back to PyTorch
-            pass
-    
-    # Fall back to PyTorch for complex cases
+    # For multi-dimensional reduction, use PyTorch's implementation
+    # This is a more robust approach for complex cases
     return torch.std(input, dim=dim, correction=correction, keepdim=keepdim, out=out)

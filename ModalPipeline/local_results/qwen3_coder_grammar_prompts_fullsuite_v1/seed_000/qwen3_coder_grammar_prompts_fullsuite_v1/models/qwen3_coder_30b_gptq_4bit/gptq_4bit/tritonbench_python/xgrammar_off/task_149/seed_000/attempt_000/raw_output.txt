@@ -38,25 +38,25 @@ def fused_hstack_div(tensors, divisor, *, rounding_mode=None, out=None):
     # Stack tensors horizontally
     stacked = torch.hstack(tensors)
     
-    # Ensure divisor is broadcastable
-    if divisor.dim() == 0:
-        divisor = divisor.expand_as(stacked)
-    else:
-        # Handle broadcasting
-        divisor = divisor.expand_as(stacked)
-    
-    # Prepare output tensor
+    # Handle output tensor
     if out is not None:
         out = out
     else:
         out = torch.empty_like(stacked)
     
-    # Get total number of elements
+    # Determine the number of elements
     n = stacked.numel()
     
-    # Set block size and grid
+    # Set block size
     block = 256
     grid = (triton.cdiv(n, block),)
+    
+    # Handle rounding mode
+    rounding_mode_enum = None
+    if rounding_mode == 'trunc':
+        rounding_mode_enum = 'trunc'
+    elif rounding_mode == 'floor':
+        rounding_mode_enum = 'floor'
     
     # Launch kernel
     _fused_hstack_div_kernel[grid](
@@ -64,7 +64,7 @@ def fused_hstack_div(tensors, divisor, *, rounding_mode=None, out=None):
         divisor, 
         out, 
         n, 
-        rounding_mode, 
+        rounding_mode_enum, 
         BLOCK=block
     )
     

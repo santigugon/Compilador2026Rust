@@ -51,16 +51,16 @@ def fused_lu_solve(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     assert b.dim() == 1 and b.shape[0] == A.shape[0], "b must be a vector with same size as A"
     
     n = A.shape[0]
-    x = torch.empty_like(b)
-    
     # Create a copy of A and b to avoid modifying the original tensors
     A_copy = A.clone()
     b_copy = b.clone()
+    x = torch.empty_like(b)
     
-    # Use Triton kernel for LU solve
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    # Use a simple block size for this implementation
+    block = 32
+    grid = (1,)
     
+    # Launch kernel
     _lu_solve_kernel[grid](A_copy, b_copy, x, n, BLOCK=block)
     
     return x

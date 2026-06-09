@@ -36,28 +36,28 @@ def _fractional_max_pool2d_kernel(
     start_w = pid_w * kernel_width
     
     # Calculate the actual pooling window size (may be smaller at the edges)
-    actual_h = tl.minimum(kernel_height, input_height - start_h)
-    actual_w = tl.minimum(kernel_width, input_width - start_w)
+    end_h = tl.minimum(start_h + kernel_height, input_height)
+    end_w = tl.minimum(start_w + kernel_width, input_width)
     
     # Initialize max value and index
     max_val = tl.full([1], -float('inf'), dtype=tl.float32)
     max_idx = tl.full([1], 0, dtype=tl.int32)
     
-    # Perform max pooling within the window
-    for h in range(actual_h):
-        for w in range(actual_w):
-            input_idx = (start_h + h) * input_width + (start_w + w)
-            val = tl.load(input_ptr + input_idx)
-            # Update max if current value is greater
-            if val > max_val:
-                max_val = val
-                max_idx = input_idx
+    # Iterate through the pooling window
+    for h in range(start_h, end_h):
+        for w in range(start_w, end_w):
+            input_offset = h * input_width + w
+            val = tl.load(input_ptr + input_offset)
+            # Update max value and index
+            mask = val > max_val
+            max_val = tl.where(mask, val, max_val)
+            max_idx = tl.where(mask, input_offset, max_idx)
     
     # Store output and indices
-    output_idx = pid_h * output_width + pid_w
-    tl.store(output_ptr + output_idx, max_val)
+    output_offset = pid_h * output_width + pid_w
+    tl.store(output_ptr + output_offset, max_val)
     if indices_ptr is not None:
-        tl.store(indices_ptr + output_idx, max_idx)
+        tl.store(indices_ptr + output_offset, max_idx)
 
 def fused_fractional_max_pool2d_with_relu(
     input: torch.Tensor, 
@@ -68,18 +68,9 @@ def fused_fractional_max_pool2d_with_relu(
 ) -> torch.Tensor:
     # Handle input tensor
     if input.dim() != 4:
-        raise ValueError("Input tensor must be 4-dimensional (N, C, H, W)")
+        raise ValueError("Input tensor must be 4D (N, C, H, W)")
     
     N, C, H, W = input.shape
-    input_flat = input.view(-1)
-    
-    # Apply ReLU
-    relu_out = torch.empty_like(input_flat)
-    n = input_flat.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    _relu_kernel[grid](input_flat, relu_out, n, BLOCK=block)
-    relu_out = relu_out.view(N, C, H, W)
     
     # Handle kernel size
     if isinstance(kernel_size, int):
@@ -96,32 +87,39 @@ def fused_fractional_max_pool2d_with_relu(
         output_height = int(H * ratio_h)
         output_width = int(W * ratio_w)
     else:
-        # Default: use kernel size to determine output size
-        output_height = (H + kernel_height - 1) // kernel_height
-        output_width = (W + kernel_width - 1) // kernel_width
+        # Default to fractional max pooling with kernel size
+        output_height = H // kernel_height
+        output_width = W // kernel_width
     
-    # Create output tensor
+    # Apply ReLU
+    relu_out = torch.empty_like(input)
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _relu_kernel[grid](input, relu_out, n, BLOCK=block)
+    
+    # Prepare output tensors
     output = torch.empty(N, C, output_height, output_width, device=input.device, dtype=input.dtype)
     
-    # Create indices tensor if needed
-    indices = None
     if return_indices:
         indices = torch.empty(N, C, output_height, output_width, device=input.device, dtype=torch.int32)
+    else:
+        indices = None
     
-    # Perform fractional max pooling
+    # Apply fractional max pooling
     if output_height > 0 and output_width > 0:
-        grid = (triton.cdiv(output_height, 16), triton.cdiv(output_width, 16))
+        grid = (output_height, output_width)
         _fractional_max_pool2d_kernel[grid](
-            relu_out,
-            output,
+            relu_out, 
+            output, 
             indices,
-            H,
-            W,
-            output_height,
+            H, 
+            W, 
+            output_height, 
             output_width,
-            kernel_height,
+            kernel_height, 
             kernel_width,
-            BLOCK=256
+            BLOCK=1
         )
     
     if return_indices:

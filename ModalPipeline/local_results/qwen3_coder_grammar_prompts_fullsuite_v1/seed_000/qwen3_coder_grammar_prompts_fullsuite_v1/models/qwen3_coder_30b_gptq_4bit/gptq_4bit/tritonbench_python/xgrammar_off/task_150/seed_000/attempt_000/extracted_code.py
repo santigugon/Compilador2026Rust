@@ -3,17 +3,11 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _broadcast_tensors_kernel(
-    input_ptr, 
-    output_ptr, 
-    size: tl.constexpr, 
-    stride: tl.constexpr, 
-    BLOCK: tl.constexpr
-):
+def _broadcast_tensors_kernel(input_ptr, output_ptr, size: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < size
-    x = tl.load(input_ptr + offsets * stride, mask=mask, other=0.0)
+    x = tl.load(input_ptr + offsets, mask=mask, other=0.0)
     tl.store(output_ptr + offsets, x, mask=mask)
 
 def broadcast_tensors(*tensors):
@@ -25,25 +19,23 @@ def broadcast_tensors(*tensors):
     broadcast_shape = torch.broadcast_shapes(*shapes)
     
     # Create output tensors with the broadcasted shape
-    outputs = []
-    for i, t in enumerate(tensors):
+    result = []
+    for tensor in tensors:
         # Create output tensor with same dtype and device
-        out = torch.empty(broadcast_shape, dtype=t.dtype, device=t.device)
-        outputs.append(out)
+        out = torch.empty(broadcast_shape, dtype=tensor.dtype, device=tensor.device)
+        # Copy data using Triton kernel
+        n = out.numel()
+        block = 256
+        grid = (triton.cdiv(n, block),)
+        
+        # For scalar tensors, we need to handle differently
+        if tensor.numel() == 1:
+            # Scalar broadcast - fill the entire output with the scalar value
+            out.fill_(tensor.item())
+        else:
+            # Non-scalar tensor - use Triton kernel to copy
+            _broadcast_tensors_kernel[grid](tensor, out, n, BLOCK=block)
+        
+        result.append(out)
     
-    # For each tensor, we need to broadcast it to the broadcast shape
-    # We'll use a simple approach: copy the data to the right locations
-    # This is a simplified version - in practice, PyTorch's broadcast_tensors
-    # handles more complex cases with proper broadcasting logic
-    
-    # For simplicity, we'll just copy the data to the output tensors
-    # This implementation assumes that the broadcasting can be done
-    # by simply expanding the dimensions and copying data
-    
-    for i, (t, out) in enumerate(zip(tensors, outputs)):
-        # Use torch's built-in broadcasting for correctness
-        # This is the safe approach since proper broadcasting
-        # requires complex logic that's better handled by PyTorch
-        out.copy_(t.expand_as(out))
-    
-    return outputs
+    return result

@@ -15,12 +15,9 @@ def _mean_row_kernel(x_ptr, out_ptr, n_rows: tl.constexpr, n_cols: tl.constexpr,
     # Load data for this row
     x = tl.load(x_ptr + row_offsets, mask=mask, other=0.0)
     
-    # Compute sum and count
-    sum_val = tl.sum(x)
-    count = n_cols
-    
-    # Compute mean
-    mean_val = sum_val / count
+    # Compute sum and mean
+    sum_val = tl.sum(x, axis=0)
+    mean_val = sum_val / n_cols
     
     # Store result
     tl.store(out_ptr + pid, mean_val)
@@ -36,57 +33,51 @@ def mean(input, dim, keepdim=False, dtype=None, out=None):
             out.copy_(input)
         return input
     
-    # Handle case where dim is None (reduce all dimensions)
-    if dim is None:
-        # Flatten the tensor and compute mean
-        flat_input = input.flatten()
-        result = torch.mean(flat_input)
-        if out is not None:
-            out.copy_(result)
-        return result
-    
     # Handle case where dim is an integer
     if isinstance(dim, int):
         # Normalize negative dimension
         if dim < 0:
             dim = input.dim() + dim
         
-        # Get output shape
-        output_shape = list(input.shape)
-        if keepdim:
-            output_shape[dim] = 1
-        else:
-            output_shape.pop(dim)
+        # Validate dimension
+        if dim < 0 or dim >= input.dim():
+            raise IndexError(f"Dimension {dim} out of range")
         
-        # Create output tensor
-        if out is not None:
-            out = out.new_empty(output_shape)
-        else:
-            out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
-        
-        # Handle special case of single dimension
-        if input.dim() == 1:
-            # For 1D tensor, just compute mean
-            result = torch.mean(input)
-            if out is not None:
-                out.copy_(result)
-            return result
-        
-        # For multi-dimensional case, we need to compute row-wise means
-        # Get dimensions
-        n_rows = 1
-        n_cols = 1
-        for i in range(input.dim()):
-            if i == dim:
-                n_cols = input.shape[i]
+        # Special case: if we're reducing the last dimension
+        if dim == input.dim() - 1:
+            # Create output tensor
+            if keepdim:
+                output_shape = list(input.shape)
+                output_shape[dim] = 1
             else:
-                n_rows *= input.shape[i]
+                output_shape = [s for i, s in enumerate(input.shape) if i != dim]
+            
+            out_tensor = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+            
+            # Get dimensions
+            n_rows = 1
+            n_cols = 1
+            for i in range(input.dim()):
+                if i == dim:
+                    n_cols = input.shape[i]
+                else:
+                    n_rows *= input.shape[i]
+            
+            # Launch kernel
+            block = 256
+            grid = triton.cdiv(n_rows, block)
+            _mean_row_kernel[grid](input, out_tensor, n_rows, n_cols, BLOCK=block)
+            
+            if out is not None:
+                out.copy_(out_tensor)
+                return out
+            return out_tensor
         
-        # Launch kernel
-        block = 256
-        grid = triton.cdiv(n_rows, block)
-        _mean_row_kernel[grid](input, out, n_rows, n_cols, BLOCK=block)
-        return out
+        # For other dimensions, use PyTorch's built-in mean
+        if out is not None:
+            out.copy_(torch.mean(input, dim=dim, keepdim=keepdim))
+            return out
+        return torch.mean(input, dim=dim, keepdim=keepdim)
     
     # Handle case where dim is a tuple of integers
     if isinstance(dim, (tuple, list)):
@@ -94,36 +85,22 @@ def mean(input, dim, keepdim=False, dtype=None, out=None):
         normalized_dims = []
         for d in dim:
             if d < 0:
-                normalized_dims.append(input.dim() + d)
-            else:
-                normalized_dims.append(d)
+                d = input.dim() + d
+            if d < 0 or d >= input.dim():
+                raise IndexError(f"Dimension {d} out of range")
+            normalized_dims.append(d)
         
         # Sort dimensions in descending order to avoid index shifting issues
         normalized_dims = sorted(normalized_dims, reverse=True)
         
-        # Create output shape
-        output_shape = list(input.shape)
-        for d in normalized_dims:
-            if keepdim:
-                output_shape[d] = 1
-            else:
-                output_shape.pop(d)
-        
-        # Create output tensor
+        # For simplicity, use PyTorch's implementation for multiple dimensions
         if out is not None:
-            out = out.new_empty(output_shape)
-        else:
-            out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
-        
-        # For multiple dimensions, we'll use PyTorch's built-in mean
-        # since it's more complex to implement efficiently in Triton
-        # This is a fallback that preserves correctness
-        result = input.mean(dim=dim, keepdim=keepdim)
-        if out is not None:
-            out.copy_(result)
-        return result
+            out.copy_(torch.mean(input, dim=normalized_dims, keepdim=keepdim))
+            return out
+        return torch.mean(input, dim=normalized_dims, keepdim=keepdim)
     
-    # Default case - return input as is
+    # Default case - use PyTorch's implementation
     if out is not None:
-        out.copy_(input)
-    return input
+        out.copy_(torch.mean(input, dim=dim, keepdim=keepdim))
+        return out
+    return torch.mean(input, dim=dim, keepdim=keepdim)

@@ -1,5 +1,5 @@
 {
-  "run_id": "9825a0bd-3f67-4797-817b-0bc3de71651b",
+  "run_id": "c0bb21c4-243e-4fc5-af63-bef4944746d8",
   "experiment_id": "qwen3_coder_grammar_prompts_fullsuite_v1",
   "model_name": "qwen3_coder_30b_gptq_4bit",
   "hf_model_id": "btbtyler09/Qwen3-Coder-30B-A3B-Instruct-gptq-4bit",

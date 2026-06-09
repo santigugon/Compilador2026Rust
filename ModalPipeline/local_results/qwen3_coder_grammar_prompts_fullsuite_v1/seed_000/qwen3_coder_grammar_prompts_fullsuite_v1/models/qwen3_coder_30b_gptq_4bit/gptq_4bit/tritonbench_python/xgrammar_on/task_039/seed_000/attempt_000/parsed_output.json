@@ -1,0 +1,4 @@
+{
+  "instruction": "Implement a Triton kernel for log1p operation that computes the natural logarithm of (1 + input) with improved accuracy for small values.",
+  "predict": "import torch\nimport triton\nimport triton.language as tl\n\n@triton.jit\ndef _log1p_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    offsets = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offsets < n\n    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)\n    # Compute log(1 + x) using the numerically stable formula\n    y = tl.log1p(x)\n    tl.store(out_ptr + offsets, y, mask=mask)\n\n\ndef log1p(input, *, out=None):\n    if out is None:\n        out = torch.empty_like(input)\n    else:\n        assert out.shape == input.shape, \"Output tensor must have the same shape as input\"\n        \n    n = input.numel()\n    block = 256\n    grid = (triton.cdiv(n, block),)\n    \n    _log1p_kernel[grid](input, out, n, BLOCK=block)\n    return out"
+}

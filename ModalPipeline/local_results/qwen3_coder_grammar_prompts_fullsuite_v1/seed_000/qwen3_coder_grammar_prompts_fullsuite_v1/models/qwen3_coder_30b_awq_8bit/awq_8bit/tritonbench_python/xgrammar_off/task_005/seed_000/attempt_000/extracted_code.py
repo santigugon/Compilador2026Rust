@@ -27,12 +27,12 @@ def relu_sqrt(input, inplace=False, out=None):
         _relu_sqrt_kernel[grid](input, input, n, BLOCK=block)
         return input
     else:
-        # For non-inplace operation, use the provided out tensor or create a new one
+        # For non-inplace operation, create output tensor
         if out is not None:
-            # Ensure out tensor has the same shape and dtype as input
-            if out.shape != input.shape or out.dtype != input.dtype:
-                raise ValueError("Output tensor must have the same shape and dtype as input")
+            # Use provided output tensor
+            out = torch.empty_like(out)
         else:
+            # Create new output tensor
             out = torch.empty_like(input)
         
         n = input.numel()

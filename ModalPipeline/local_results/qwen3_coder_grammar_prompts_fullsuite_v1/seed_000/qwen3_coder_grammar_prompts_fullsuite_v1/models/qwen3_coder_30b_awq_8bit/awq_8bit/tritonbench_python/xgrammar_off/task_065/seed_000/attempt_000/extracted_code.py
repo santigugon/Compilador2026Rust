@@ -19,12 +19,11 @@ def asin(input, *, out=None):
     if out is None:
         out = torch.empty_like(input)
     else:
-        if out.shape != input.shape:
-            raise ValueError("Output tensor must have the same shape as input tensor")
+        assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
+        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input tensor"
     
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
-    
     _asin_kernel[grid](input, out, n, BLOCK=block)
     return out

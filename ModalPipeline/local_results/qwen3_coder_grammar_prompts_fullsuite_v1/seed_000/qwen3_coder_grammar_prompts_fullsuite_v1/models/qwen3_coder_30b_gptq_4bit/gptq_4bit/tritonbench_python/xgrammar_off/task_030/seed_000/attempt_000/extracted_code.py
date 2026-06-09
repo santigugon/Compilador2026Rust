@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+import math
 
 @triton.jit
 def _softmax_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
@@ -8,32 +9,28 @@ def _softmax_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    # Subtract max for numerical stability
-    x_max = tl.max(x, axis=0)
-    x = x - x_max
-    # Compute softmax
-    x = tl.exp(x)
-    x_sum = tl.sum(x, axis=0)
-    x = x / x_sum
-    tl.store(out_ptr + offsets, x, mask=mask)
+    x = x - tl.max(x, axis=0)
+    y = tl.exp(x)
+    y = y / tl.sum(y, axis=0)
+    tl.store(out_ptr + offsets, y, mask=mask)
 
 @triton.jit
 def _layer_norm_kernel(x_ptr, weight_ptr, out_ptr, n: tl.constexpr, normalized_shape: tl.constexpr, eps: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    offsets = pid * BLOCK + tl.arange(0.0, BLOCK)
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     
     # Compute mean and variance
     mean = tl.sum(x, axis=0) / normalized_shape
-    x_centered = x - mean
-    var = tl.sum(x_centered * x_centered, axis=0) / normalized_shape
-    std = tl.sqrt(var + eps)
+    var = tl.sum((x - mean) * (x - mean), axis=0) / normalized_shape
     
-    # Apply layer normalization
-    x_norm = x_centered / std
+    # Normalize
+    x_norm = (x - mean) / tl.sqrt(var + eps)
+    
+    # Apply weight
     if weight_ptr is not None:
-        weight = tl.load(weight_ptr + tl.arange(0, normalized_shape), mask=tl.arange(0, normalized_shape) < normalized_shape)
+        weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0)
         x_norm = x_norm * weight
     
     tl.store(out_ptr + offsets, x_norm, mask=mask)
@@ -48,75 +45,59 @@ def _cross_entropy_kernel(logits_ptr, targets_ptr, out_ptr, n: tl.constexpr, C: 
     targets = tl.load(targets_ptr + offsets, mask=mask, other=0.0)
     
     # Compute cross entropy loss
-    # For simplicity, we assume targets are class indices
-    # In a real implementation, we would handle both class indices and probabilities
-    
-    # This is a simplified version - in practice, you'd want to handle
-    # the full cross entropy computation with proper masking and smoothing
     loss = 0.0
     for i in range(C):
-        # Simplified cross entropy computation
-        # In practice, this would be more complex
-        pass
+        if targets[i] != ignore_index:
+            loss += logits[i] * (1.0 - label_smoothing) + label_smoothing / C
     
-    # For now, we'll just return a placeholder
-    tl.store(out_ptr + offsets, logits, mask=mask)
+    tl.store(out_ptr + offsets, loss, mask=mask)
 
 def fused_cross_entropy_softmax_layernorm(logits, targets, normalized_shape, weight=None, ignore_index=-100, reduction='mean', label_smoothing=0.0, eps=1e-5, *, out=None):
-    # Flatten logits and targets for processing
+    # Flatten logits and targets to 2D
     original_shape = logits.shape
     batch_size = logits.shape[0]
     num_classes = logits.shape[1]
     
     # Flatten logits and targets
-    logits_flat = logits.view(-1, num_classes)
-    targets_flat = targets.view(-1)
+    logits_flat = logits.view(batch_size, -1)
+    targets_flat = targets.view(batch_size, -1)
     
     # Compute softmax
     softmax_out = torch.empty_like(logits_flat)
     n = logits_flat.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
-    
     _softmax_kernel[grid](logits_flat, softmax_out, n, BLOCK=block)
     
     # Apply layer normalization
-    if out is None:
-        out_tensor = torch.empty_like(softmax_out)
-    else:
-        out_tensor = out
-    
-    # Handle weight parameter
-    weight_ptr = None
     if weight is not None:
-        weight_ptr = weight
+        weight_tensor = weight
+    else:
+        weight_tensor = torch.ones_like(softmax_out)
     
-    # Apply layer normalization
+    if out is not None:
+        normalized_out = out
+    else:
+        normalized_out = torch.empty_like(softmax_out)
+    
     n = softmax_out.numel()
+    block = 256
     grid = (triton.cdiv(n, block),)
-    _layer_norm_kernel[grid](softmax_out, weight_ptr, out_tensor, n, normalized_shape, eps, BLOCK=block)
+    _layer_norm_kernel[grid](softmax_out, weight_tensor, normalized_out, n, num_classes, eps, BLOCK=block)
     
     # Compute cross entropy loss
-    # For simplicity, we'll compute it using PyTorch
-    # In a full implementation, this would be done in Triton
+    loss_out = torch.empty(batch_size, dtype=torch.float32)
+    n = batch_size
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _cross_entropy_kernel[grid](logits_flat, targets_flat, loss_out, n, num_classes, ignore_index, label_smoothing, BLOCK=block)
     
-    # Reshape back to original shape
-    softmax_out = softmax_out.view(original_shape)
-    out_tensor = out_tensor.view(original_shape)
-    
-    # Return both softmax output and loss
-    # For loss computation, we'll use PyTorch's implementation
-    if len(targets.shape) == 1:
-        # Class indices
-        loss = torch.nn.functional.cross_entropy(
-            logits, targets, weight=weight, ignore_index=ignore_index, 
-            reduction=reduction, label_smoothing=label_smoothing
-        )
+    # Apply reduction
+    if reduction == 'mean':
+        loss = loss_out.mean()
+    elif reduction == 'sum':
+        loss = loss_out.sum()
     else:
-        # Class probabilities
-        loss = torch.nn.functional.cross_entropy(
-            logits, targets, weight=weight, ignore_index=ignore_index, 
-            reduction=reduction, label_smoothing=label_smoothing
-        )
+        loss = loss_out
     
-    return (out_tensor, loss)
+    return (normalized_out, loss)

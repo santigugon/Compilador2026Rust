@@ -3,71 +3,68 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _softmax_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+def _fused_cross_entropy_softmax_layernorm_kernel(
+    logits_ptr, targets_ptr, weight_ptr, out_ptr,
+    N, C, reduction, ignore_index, label_smoothing, eps,
+    logits_stride_0, logits_stride_1,
+    targets_stride_0,
+    weight_stride_0,
+    out_stride_0, out_stride_1,
+    BLOCK: tl.constexpr
+):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    x = tl.load(x_ptr + offsets, mask=mask, other=-float('inf'))
-    # Subtract max for numerical stability
-    x_max = tl.max(x, axis=0)
-    x = x - x_max
-    # Compute softmax
-    x_exp = tl.exp(x)
-    x_sum = tl.sum(x_exp, axis=0)
-    y = x_exp / x_sum
-    tl.store(out_ptr + offsets, y, mask=mask)
-
-@triton.jit
-def _layer_norm_kernel(x_ptr, weight_ptr, out_ptr, mean_ptr, var_ptr, 
-                      n: tl.constexpr, normalized_shape: tl.constexpr, 
-                      eps: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
+    batch_offset = pid * BLOCK
     
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0)
+    # Load logits for this batch
+    offsets = batch_offset + tl.arange(0, BLOCK)
+    mask = offsets < N
     
-    # Compute mean and variance
-    mean = tl.sum(x, axis=0) / normalized_shape
-    var = tl.sum((x - mean) * (x - mean), axis=0) / normalized_shape
+    # Load targets
+    targets = tl.load(targets_ptr + offsets, mask=mask, other=ignore_index)
     
-    # Layer normalization
-    x_norm = (x - mean) / tl.sqrt(var + eps)
-    y = x_norm * weight
+    # Initialize loss accumulator
+    loss = tl.zeros((BLOCK,), dtype=tl.float32)
     
-    tl.store(out_ptr + offsets, y, mask=mask)
-    if mean_ptr is not None:
-        tl.store(mean_ptr + pid, mean)
-    if var_ptr is not None:
-        tl.store(var_ptr + pid, var)
-
-@triton.jit
-def _cross_entropy_kernel(logits_ptr, targets_ptr, loss_ptr, 
-                         n: tl.constexpr, C: tl.constexpr, 
-                         ignore_index: tl.constexpr, 
-                         label_smoothing: tl.constexpr, 
-                         BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n
-    
-    logits = tl.load(logits_ptr + offsets * C, mask=mask, other=0.0)
-    targets = tl.load(targets_ptr + offsets, mask=mask, other=0.0)
-    
-    # Compute cross entropy with label smoothing
-    # For simplicity, we'll compute it in a basic way
-    # In practice, this would be more complex for full label smoothing
-    
-    # This is a simplified version - full implementation would be more complex
-    loss = 0.0
+    # Compute cross-entropy loss
     for i in range(C):
-        if targets == i:
-            loss += -tl.log(logits[i] + 1e-8)  # Add small epsilon for numerical stability
+        # Load logits
+        logits = tl.load(logits_ptr + offsets * logits_stride_0 + i * logits_stride_1, mask=mask, other=0.0)
+        
+        # Apply softmax
+        max_logits = tl.max(logits, axis=0)
+        exp_logits = tl.exp(logits - max_logits)
+        sum_exp_logits = tl.sum(exp_logits, axis=0)
+        softmax_probs = exp_logits / (sum_exp_logits + eps)
+        
+        # Apply weight if provided
+        if weight_ptr is not None:
+            weight = tl.load(weight_ptr + i * weight_stride_0, mask=(i < C), other=1.0)
+            softmax_probs = softmax_probs * weight
+        
+        # Compute loss
+        if label_smoothing > 0:
+            # Apply label smoothing
+            smooth_loss = -tl.log(softmax_probs + eps) * (1 - label_smoothing) / C
+            # Add smoothing term
+            smooth_loss += -tl.log(1.0 / C) * label_smoothing
+            # Apply to targets
+            target_mask = targets == i
+            loss += tl.where(target_mask, smooth_loss, 0.0)
         else:
-            loss += label_smoothing * -tl.log(logits[i] + 1e-8)
+            # Standard cross-entropy
+            target_mask = targets == i
+            loss += tl.where(target_mask, -tl.log(softmax_probs + eps), 0.0)
     
-    tl.store(loss_ptr + pid, loss, mask=mask)
+    # Apply reduction
+    if reduction == 0:  # 'none'
+        pass  # No reduction
+    elif reduction == 1:  # 'mean'
+        loss = loss / N
+    elif reduction == 2:  # 'sum'
+        loss = tl.sum(loss, axis=0)
+    
+    # Store loss
+    tl.store(out_ptr + offsets, loss, mask=mask)
 
 def fused_cross_entropy_softmax_layernorm(
     logits, targets, normalized_shape, weight=None, ignore_index=-100, 
@@ -77,59 +74,64 @@ def fused_cross_entropy_softmax_layernorm(
     if logits.dim() == 2:
         N, C = logits.shape
     else:
+        # For higher dimensional inputs, flatten to (N, C)
         N = logits.shape[0]
         C = logits.shape[1]
-        # Flatten for processing
         logits = logits.view(N, C)
     
-    # Flatten targets if needed
-    if targets.dim() > 1:
-        targets = targets.view(-1)
+    # Handle targets shape
+    if targets.dim() == 1:
+        targets = targets.view(N)
+    else:
+        targets = targets.view(N)
     
-    # Compute softmax
-    softmax_out = torch.empty_like(logits)
-    n = logits.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
-    _softmax_kernel[grid](logits, softmax_out, n, BLOCK=block)
+    # Handle weight
+    if weight is not None:
+        if weight.shape[0] != C:
+            raise ValueError(f"weight must have size {C} in dimension 0")
+    else:
+        weight = torch.ones(C, dtype=logits.dtype, device=logits.device)
+    
+    # Handle reduction
+    reduction_map = {'none': 0, 'mean': 1, 'sum': 2}
+    if reduction not in reduction_map:
+        raise ValueError(f"reduction must be 'none', 'mean', or 'sum'")
+    reduction_code = reduction_map[reduction]
+    
+    # Prepare output tensor
+    if out is not None:
+        out_probs = out
+    else:
+        out_probs = torch.empty_like(logits)
+    
+    # Compute softmax probabilities
+    # First, compute max for numerical stability
+    max_logits = logits.max(dim=1, keepdim=True)[0]
+    exp_logits = torch.exp(logits - max_logits)
+    sum_exp_logits = exp_logits.sum(dim=1, keepdim=True)
+    softmax_probs = exp_logits / sum_exp_logits
     
     # Apply layer normalization
-    if weight is None:
-        weight = torch.ones(C, dtype=logits.dtype, device=logits.device)
+    mean = softmax_probs.mean(dim=1, keepdim=True)
+    var = softmax_probs.var(dim=1, keepdim=True, unbiased=False)
+    normalized_probs = (softmax_probs - mean) / torch.sqrt(var + eps)
+    
+    # Compute cross-entropy loss
+    if label_smoothing > 0:
+        # Apply label smoothing
+        targets_one_hot = torch.zeros_like(softmax_probs)
+        targets_one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
+        smooth_targets = targets_one_hot * (1 - label_smoothing) + label_smoothing / C
+        loss = -torch.sum(smooth_targets * torch.log(softmax_probs + eps), dim=1)
     else:
-        weight = weight.to(logits.dtype).to(logits.device)
+        # Standard cross-entropy
+        loss = -torch.log(softmax_probs.gather(1, targets.unsqueeze(1)).squeeze(1) + eps)
     
-    if out is None:
-        normalized_out = torch.empty_like(softmax_out)
-    else:
-        normalized_out = out
-    
-    # For layer normalization, we need to compute mean and variance
-    # This is a simplified approach - full implementation would be more complex
-    # We'll compute it in a basic way for now
-    mean = torch.mean(softmax_out, dim=-1, keepdim=True)
-    var = torch.var(softmax_out, dim=-1, keepdim=True, unbiased=False)
-    normalized_probs = (softmax_out - mean) / torch.sqrt(var + eps)
-    normalized_probs = normalized_probs * weight
-    
-    if out is not None:
-        out.copy_(normalized_probs)
-    else:
-        out = normalized_probs
-    
-    # Compute cross entropy loss
-    # This is a simplified version - full implementation would handle label smoothing properly
-    if reduction == 'none':
-        loss = torch.zeros(N, dtype=logits.dtype, device=logits.device)
-    else:
-        loss = torch.tensor(0.0, dtype=logits.dtype, device=logits.device)
-    
-    # For a complete implementation, we would compute the actual cross entropy
-    # This is a placeholder for the actual computation
+    # Apply reduction
     if reduction == 'mean':
-        loss = torch.tensor(0.0, dtype=logits.dtype, device=logits.device)
+        loss = loss.mean()
     elif reduction == 'sum':
-        loss = torch.tensor(0.0, dtype=logits.dtype, device=logits.device)
+        loss = loss.sum()
     
     # Return loss and normalized probabilities
-    return (loss, normalized_out)
+    return loss, normalized_probs

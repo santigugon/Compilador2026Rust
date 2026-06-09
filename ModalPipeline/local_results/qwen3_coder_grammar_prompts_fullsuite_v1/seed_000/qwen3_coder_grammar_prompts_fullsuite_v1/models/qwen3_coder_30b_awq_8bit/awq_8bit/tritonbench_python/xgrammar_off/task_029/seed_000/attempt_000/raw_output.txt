@@ -34,10 +34,9 @@ def index_fill_(self, dim, index, value):
     # Get tensor dimensions
     shape = self.shape
     dim_size = shape[dim]
-    index_size = index.numel()
     
     # Handle empty index case
-    if index_size == 0:
+    if index.numel() == 0:
         return out
     
     # Get stride for the specified dimension
@@ -45,38 +44,44 @@ def index_fill_(self, dim, index, value):
     for i in range(dim + 1, len(shape)):
         stride *= shape[i]
     
-    # Create a temporary tensor to store the fill pattern
-    fill_pattern = torch.zeros_like(self, dtype=torch.float32)
+    # Get the value as a tensor
+    value_tensor = torch.tensor(value, dtype=torch.float32, device=self.device)
     
-    # Fill the pattern tensor with 1.0 at the specified indices
+    # Create a kernel that fills the specified indices with the value
+    # This is a simplified approach - we'll use a more direct method
+    
+    # For each element in the specified dimension, check if it's in the index
+    # and fill it with the value
+    
+    # Create a mask for the indices to fill
     if dim == 0:
-        for i in range(index_size):
+        # Fill along first dimension
+        for i in range(index.numel()):
             idx = index[i].item()
-            if 0 <= idx < dim_size:
-                fill_pattern[idx, ...] = 1.0
+            if 0 <= idx < shape[0]:
+                out[idx, ...] = value_tensor
     elif dim == 1:
-        for i in range(index_size):
+        # Fill along second dimension
+        for i in range(index.numel()):
             idx = index[i].item()
-            if 0 <= idx < dim_size:
-                fill_pattern[:, idx, ...] = 1.0
+            if 0 <= idx < shape[1]:
+                out[:, idx, ...] = value_tensor
     elif dim == 2:
-        for i in range(index_size):
+        # Fill along third dimension
+        for i in range(index.numel()):
             idx = index[i].item()
-            if 0 <= idx < dim_size:
-                fill_pattern[:, :, idx, ...] = 1.0
+            if 0 <= idx < shape[2]:
+                out[:, :, idx, ...] = value_tensor
     else:
-        # For higher dimensions, we need to handle it more carefully
+        # For higher dimensions, we need to handle more carefully
         # This is a simplified approach for the general case
-        for i in range(index_size):
+        for i in range(index.numel()):
             idx = index[i].item()
-            if 0 <= idx < dim_size:
-                # Create advanced indexing for the specific dimension
-                indices = [slice(None)] * len(shape)
-                indices[dim] = idx
-                fill_pattern[tuple(indices)] = 1.0
-    
-    # Apply the fill pattern
-    out = torch.where(fill_pattern.bool(), value, out)
+            if 0 <= idx < shape[dim]:
+                # Create slice for the specific dimension
+                slices = [slice(None)] * len(shape)
+                slices[dim] = idx
+                out[tuple(slices)] = value_tensor
     
     return out
 ```

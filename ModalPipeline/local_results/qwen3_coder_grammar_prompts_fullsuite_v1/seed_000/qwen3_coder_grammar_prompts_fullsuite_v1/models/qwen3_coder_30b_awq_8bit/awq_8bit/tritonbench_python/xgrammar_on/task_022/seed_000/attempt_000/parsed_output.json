@@ -1,0 +1,4 @@
+{
+  "instruction": "Implement a Triton-based log_softmax_linear function that applies a linear transformation followed by log_softmax in a numerically stable way. The function should handle the input tensor, weight matrix, optional bias, and compute the result along the specified dimension.",
+  "predict": "import torch\nimport triton\nimport triton.language as tl\n\ndef log_softmax_linear(input, weight, bias=None, dim=-1, dtype=None):\n    if dtype is not None:\n        input = input.to(dtype)\n    \n    # Linear transformation: input @ weight.T + bias\n    if bias is not None:\n        out = torch.addmm(bias, input, weight.t())\n    else:\n        out = torch.mm(input, weight.t())\n    \n    # Apply log_softmax along the specified dimension\n    return torch.log_softmax(out, dim=dim)"
+}

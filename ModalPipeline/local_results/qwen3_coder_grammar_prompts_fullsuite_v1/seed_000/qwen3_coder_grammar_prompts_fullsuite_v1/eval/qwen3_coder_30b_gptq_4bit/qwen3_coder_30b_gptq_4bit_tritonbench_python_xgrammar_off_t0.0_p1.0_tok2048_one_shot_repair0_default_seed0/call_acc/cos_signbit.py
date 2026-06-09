@@ -33,7 +33,7 @@ def cos_signbit(input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         output_cos_ptr=output_cos,
         output_signbit_ptr=output_signbit,
         n_elements=n_elements,
-        BLOCK_SIZE=BLOCK_SIZE
+        BLOCK_SIZE=BLOCK_SIZE,
     )
     return output_cos, output_signbit
 

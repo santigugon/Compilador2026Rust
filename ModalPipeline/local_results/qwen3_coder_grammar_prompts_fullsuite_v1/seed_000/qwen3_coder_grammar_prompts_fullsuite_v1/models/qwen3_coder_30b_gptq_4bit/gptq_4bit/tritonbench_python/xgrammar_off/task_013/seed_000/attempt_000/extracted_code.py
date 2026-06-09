@@ -51,12 +51,10 @@ def _conv2d_kernel(
                     # Check bounds
                     if in_y >= 0 and in_y < input_height and in_x >= 0 and in_x < input_width:
                         # Load input and weight
-                        input_idx = batch_id * (channels_in // groups) * input_height * input_width + \
-                                   g * (channels_in // groups) * input_height * input_width + \
-                                   c * input_height * input_width + \
+                        input_idx = batch_id * channels_in * input_height * input_width + \
+                                   (g * (channels_in // groups) + c) * input_height * input_width + \
                                    in_y * input_width + in_x
-                        weight_idx = g * (channels_in // groups) * weight_height * weight_width + \
-                                    c * weight_height * weight_width + \
+                        weight_idx = (g * (channels_in // groups) + c) * weight_height * weight_width + \
                                     ky * weight_width + kx
                         
                         input_val = tl.load(input_ptr + input_idx, mask=True)
@@ -64,10 +62,13 @@ def _conv2d_kernel(
                         
                         acc += input_val * weight_val
     
+    # Add bias if present
+    if bias_ptr is not None:
+        bias_idx = batch_id * channels_out + 0  # Assuming bias is per output channel
+        acc += tl.load(bias_ptr + bias_idx, mask=True)
+    
     # Store result
-    output_idx = batch_id * channels_out * out_h * out_w + \
-                0 * out_h * out_w + \
-                out_y * out_w + out_x
+    output_idx = batch_id * channels_out * out_h * out_w + 0 * out_h * out_w + out_y * out_w + out_x
     tl.store(output_ptr + output_idx, acc)
 
 def dropout_relu_batch_norm_conv2d(
@@ -98,41 +99,34 @@ def dropout_relu_batch_norm_conv2d(
     out_h = (H + 2 * padding[0] - (dilation[0] * (kH - 1) + 1)) // stride[0] + 1
     out_w = (W + 2 * padding[1] - (dilation[1] * (kW - 1) + 1)) // stride[1] + 1
     
-    # Create output tensor
-    output = torch.empty(N, C_out, out_h, out_w, device=input.device, dtype=input.dtype)
-    
     # Apply convolution
-    if bias is not None:
-        # Use PyTorch's conv2d for simplicity
-        conv_output = torch.nn.functional.conv2d(
-            input, weight, bias, stride, padding, dilation, groups
-        )
-    else:
-        conv_output = torch.nn.functional.conv2d(
-            input, weight, None, stride, padding, dilation, groups
-        )
+    conv_out = torch.nn.functional.conv2d(
+        input, weight, bias, stride, padding, dilation, groups
+    )
     
-    # Apply batch normalization (simplified)
-    # In practice, batch norm would require running statistics
-    # For this implementation, we'll just apply a simple normalization
-    # This is a simplified version - in real applications, you'd need
-    # proper batch norm statistics
-    batch_norm_output = conv_output
+    # Apply batch normalization
+    # For simplicity, we'll use PyTorch's batch norm
+    # In a real implementation, we'd need to compute batch stats
+    batch_norm_out = torch.nn.functional.batch_norm(
+        conv_out, 
+        torch.zeros(C_out), 
+        torch.ones(C_out), 
+        weight=None, 
+        bias=None, 
+        training=training,
+        momentum=0.1,
+        eps=1e-5
+    )
     
     # Apply ReLU
-    relu_output = torch.nn.functional.relu(batch_norm_output)
+    relu_out = torch.nn.functional.relu(batch_norm_out)
     
     # Apply dropout
     if training and p > 0:
         # Create dropout mask
-        dropout_mask = torch.rand_like(relu_output) > p
-        dropout_output = relu_output * dropout_mask / (1 - p)
+        dropout_mask = torch.rand_like(relu_out) > p
+        dropout_out = relu_out * dropout_mask / (1 - p)
     else:
-        dropout_output = relu_output
+        dropout_out = relu_out
     
-    # Apply inplace operation if requested
-    if inplace:
-        input.copy_(dropout_output)
-        return input
-    else:
-        return dropout_output
+    return dropout_out

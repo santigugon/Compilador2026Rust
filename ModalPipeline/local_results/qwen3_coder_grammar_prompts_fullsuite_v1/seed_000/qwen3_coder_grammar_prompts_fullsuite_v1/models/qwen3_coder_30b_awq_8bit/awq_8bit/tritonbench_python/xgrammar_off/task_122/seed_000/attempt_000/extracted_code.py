@@ -19,21 +19,28 @@ def _pow_kernel(x_ptr, y_ptr, out_ptr, n: tl.constexpr, broadcast_y: tl.constexp
     tl.store(out_ptr + offsets, result, mask=mask)
 
 def pow(input, exponent, *, out=None):
+    input = input.contiguous()
+    
     if out is None:
         out = torch.empty_like(input)
+    else:
+        out = out.contiguous()
     
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
     
-    # Handle scalar exponent case
-    if not torch.is_tensor(exponent):
-        # Convert scalar to tensor for kernel compatibility
-        exponent_tensor = torch.tensor(exponent, dtype=input.dtype, device=input.device)
-        _pow_kernel[grid](input, exponent_tensor, out, n, broadcast_y=True, BLOCK=block)
+    if torch.is_tensor(exponent):
+        exponent = exponent.contiguous()
+        broadcast_y = False
+        # Check if shapes are broadcastable
+        try:
+            torch.broadcast_tensors(input, exponent)
+        except RuntimeError:
+            raise ValueError("Input and exponent shapes are not broadcastable")
     else:
-        # Ensure exponent has the same device and dtype as input
-        exponent = exponent.to(input.dtype).to(input.device)
-        _pow_kernel[grid](input, exponent, out, n, broadcast_y=False, BLOCK=block)
+        broadcast_y = True
+        exponent = torch.tensor(exponent, dtype=input.dtype, device=input.device)
     
+    _pow_kernel[grid](input, exponent, out, n, broadcast_y, BLOCK=block)
     return out

@@ -3,65 +3,103 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _matmul_kernel(a_ptr, b_ptr, c_ptr, out_ptr, n: tl.constexpr, m: tl.constexpr, p: tl.constexpr, alpha: tl.constexpr, beta: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    pid_j = tl.program_id(1)
+def _matrix_multiply_symmetric_kernel(
+    a_ptr, b_ptr, c_ptr,
+    out_ptr,
+    n: tl.constexpr, m: tl.constexpr, p: tl.constexpr,
+    alpha: tl.constexpr, beta: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
     
     # Compute first operation: C = alpha * torch.mm(A, B) + beta * C
-    # Each thread computes one element of the output matrix
-    if pid_j < p:
-        # Load C
-        c_block = tl.load(c_ptr + tl.arange(0, n) * p + pid_j, mask=tl.arange(0, n) < n)
-        
-        # Compute A @ B
-        sum = tl.zeros((n,), dtype=tl.float32)
-        for k in range(m):
-            a_val = tl.load(a_ptr + tl.arange(0, n) * m + k, mask=tl.arange(0, n) < n)
-            b_val = tl.load(b_ptr + k * p + pid_j, mask=tl.arange(0, 1) < 1)
-            sum += a_val * b_val
-        
-        # Compute C = alpha * (A @ B) + beta * C
-        result = alpha * sum + beta * c_block
-        tl.store(out_ptr + tl.arange(0, n) * p + pid_j, result, mask=tl.arange(0, n) < n)
+    # Load A and B tiles
+    a_tile = tl.load(a_ptr + (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] * m + 
+                     tl.arange(0, BLOCK_K)[None, :])
+    b_tile = tl.load(b_ptr + (pid_n * BLOCK_N + tl.arange(0, BLOCK_N))[:, None] * p + 
+                     tl.arange(0, BLOCK_K)[None, :])
+    
+    # Compute matrix multiplication
+    c_tile = tl.dot(a_tile, b_tile)
+    
+    # Scale by alpha
+    c_tile = c_tile * alpha
+    
+    # Load C and add beta * C
+    c_load = tl.load(c_ptr + (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] * p + 
+                     (pid_n * BLOCK_N + tl.arange(0, BLOCK_N))[None, :])
+    c_tile = c_tile + beta * c_load
+    
+    # Store result
+    tl.store(out_ptr + (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] * p + 
+             (pid_n * BLOCK_N + tl.arange(0, BLOCK_N))[None, :], c_tile)
 
 @triton.jit
-def _symmetric_kernel(c_ptr, out_ptr, n: tl.constexpr, p: tl.constexpr, alpha: tl.constexpr, beta: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    pid_j = tl.program_id(1)
+def _matrix_multiply_symmetric_second_kernel(
+    c_ptr, out_ptr,
+    n: tl.constexpr, p: tl.constexpr,
+    alpha: tl.constexpr, beta: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
     
     # Compute second operation: C = alpha * torch.mm(C, C.T) + beta * C
-    # Each thread computes one element of the output matrix
-    if pid_j < p:
-        # Load C
-        c_block = tl.load(c_ptr + tl.arange(0, n) * p + pid_j, mask=tl.arange(0, n) < n)
-        
-        # Compute C @ C.T
-        sum = tl.zeros((n,), dtype=tl.float32)
-        for k in range(p):
-            c_val = tl.load(c_ptr + tl.arange(0, n) * p + k, mask=tl.arange(0, n) < n)
-            c_t_val = tl.load(c_ptr + k * p + pid_j, mask=tl.arange(0, 1) < 1)
-            sum += c_val * c_t_val
-        
-        # Compute C = alpha * (C @ C.T) + beta * C
-        result = alpha * sum + beta * c_block
-        tl.store(out_ptr + tl.arange(0, n) * p + pid_j, result, mask=tl.arange(0, n) < n)
+    # Load C tile
+    c_tile = tl.load(c_ptr + (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] * p + 
+                     tl.arange(0, p)[None, :])
+    
+    # Compute C * C.T
+    c_t = tl.trans(c_tile)
+    c_c_t = tl.dot(c_tile, c_t)
+    
+    # Scale by alpha
+    c_c_t = c_c_t * alpha
+    
+    # Load C and add beta * C
+    c_load = tl.load(c_ptr + (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] * p + 
+                     (pid_n * BLOCK_N + tl.arange(0, BLOCK_N))[None, :])
+    c_c_t = c_c_t + beta * c_load
+    
+    # Store result
+    tl.store(out_ptr + (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] * p + 
+             (pid_n * BLOCK_N + tl.arange(0, BLOCK_N))[None, :], c_c_t)
 
 def matrix_multiply_symmetric(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
     # First operation: C = alpha * torch.mm(A, B) + beta * C
     n, m = A.shape
-    m, p = B.shape
-    out1 = torch.empty_like(C)
+    m2, p = B.shape
+    assert m == m2, "Incompatible dimensions for matrix multiplication"
     
-    # Launch first kernel
-    block = 256
-    grid = (triton.cdiv(n, block), triton.cdiv(p, block))
-    _matmul_kernel[grid](A, B, C, out1, n, m, p, alpha, beta, BLOCK=block)
+    # Create output tensor for first operation
+    C1 = torch.empty_like(C)
+    
+    # First kernel for C = alpha * torch.mm(A, B) + beta * C
+    BLOCK_M = 32
+    BLOCK_N = 32
+    BLOCK_K = 32
+    
+    grid_m = triton.cdiv(n, BLOCK_M)
+    grid_n = triton.cdiv(p, BLOCK_N)
+    grid = (grid_m, grid_n)
+    
+    # First operation
+    _matrix_multiply_symmetric_kernel[grid](
+        A, B, C, C1, n, m, p, alpha, beta, BLOCK_M, BLOCK_N, BLOCK_K
+    )
     
     # Second operation: C = alpha * torch.mm(C, C.T) + beta * C
-    out2 = torch.empty_like(C)
+    # Create output tensor for second operation
+    out = torch.empty_like(C1)
     
-    # Launch second kernel
-    grid = (triton.cdiv(n, block), triton.cdiv(p, block))
-    _symmetric_kernel[grid](out1, out2, n, p, alpha, beta, BLOCK=block)
+    # Second kernel for C = alpha * torch.mm(C, C.T) + beta * C
+    grid_m = triton.cdiv(n, BLOCK_M)
+    grid_n = triton.cdiv(p, BLOCK_N)
+    grid = (grid_m, grid_n)
     
-    return out2
+    _matrix_multiply_symmetric_second_kernel[grid](
+        C1, out, n, p, alpha, beta, BLOCK_M, BLOCK_N
+    )
+    
+    return out

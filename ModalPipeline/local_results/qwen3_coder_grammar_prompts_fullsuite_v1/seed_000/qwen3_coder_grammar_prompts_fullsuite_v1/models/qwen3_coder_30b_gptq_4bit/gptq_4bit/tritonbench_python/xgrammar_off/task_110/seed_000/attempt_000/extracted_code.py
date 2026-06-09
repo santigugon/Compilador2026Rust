@@ -28,12 +28,11 @@ def _mean_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     # Use atomic operations to accumulate sum
     tl.atomic_add(out_ptr, x, mask=mask)
+    # Store the mean
+    mean = x / n
+    tl.store(out_ptr + offsets, mean, mask=mask)
 
 def exp_mean(input, dim=None, keepdim=False, dtype=None, out=None):
-    # Handle scalar input
-    if input.dim() == 0:
-        input = input.unsqueeze(0)
-    
     # Apply exponential function
     exp_input = torch.exp(input)
     
@@ -46,29 +45,16 @@ def exp_mean(input, dim=None, keepdim=False, dtype=None, out=None):
             result = out
         else:
             result = torch.empty((), dtype=dtype or exp_input.dtype, device=exp_input.device)
-        
-        # Use a simple approach for all elements mean
-        if total_elements == 1:
-            result.fill_(exp_input.item())
-        else:
-            # For larger tensors, use torch operations for numerical stability
-            result = exp_input.mean(dtype=dtype, keepdim=keepdim)
-        
+        # Use a simple approach for global mean
+        result = exp_input.sum()
+        result = result / total_elements
+        if out is not None:
+            out.copy_(result)
         return result
     
     # If dimension is specified, compute mean along that dimension
-    if out is not None:
-        result = out
-    else:
-        # Compute output shape
-        output_shape = list(exp_input.shape)
-        if keepdim:
-            output_shape[dim] = 1
-        else:
-            output_shape.pop(dim)
-        result = torch.empty(output_shape, dtype=dtype or exp_input.dtype, device=exp_input.device)
-    
-    # Use torch operations for mean along specified dimension
+    # For simplicity, we'll use PyTorch's built-in mean function
     result = exp_input.mean(dim=dim, keepdim=keepdim, dtype=dtype)
-    
+    if out is not None:
+        out.copy_(result)
     return result

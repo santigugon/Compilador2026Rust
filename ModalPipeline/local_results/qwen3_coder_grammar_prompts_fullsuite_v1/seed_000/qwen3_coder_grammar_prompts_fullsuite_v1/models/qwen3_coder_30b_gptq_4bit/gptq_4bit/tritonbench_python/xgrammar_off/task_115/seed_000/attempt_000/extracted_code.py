@@ -8,13 +8,12 @@ def _tanh_linear_kernel(
     in_features: tl.constexpr, out_features: tl.constexpr,
     stride_input_n: tl.constexpr, stride_input_f: tl.constexpr,
     stride_weight_o: tl.constexpr, stride_weight_f: tl.constexpr,
-    stride_bias: tl.constexpr,
-    stride_output_n: tl.constexpr, stride_output_f: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr
+    stride_bias: tl.constexpr, stride_output_n: tl.constexpr, stride_output_f: tl.constexpr,
+    BLOCK: tl.constexpr
 ):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    block_start = pid * BLOCK
+    offsets = block_start + tl.arange(0, BLOCK)
     
     # Load input
     input_offsets = offsets[:, None] * stride_input_n + tl.arange(0, in_features)[None, :] * stride_input_f
@@ -41,25 +40,28 @@ def _tanh_linear_kernel(
     tl.store(output_ptr + output_offsets, output, mask=(offsets[:, None] < 1) & (tl.arange(0, out_features)[None, :] < out_features))
 
 def tanh_linear(input, weight, bias=None):
-    # Get dimensions
+    # Flatten input to 2D for processing
     input_shape = input.shape
+    batch_size = input_shape[:-1]
     in_features = input_shape[-1]
     out_features = weight.shape[0]
     
-    # Reshape input to 2D for computation
-    input_2d = input.view(-1, in_features)
-    batch_size = input_2d.shape[0]
+    # Reshape input to (batch_size, in_features)
+    input_reshaped = input.view(-1, in_features)
+    batch_size_flat = input_reshaped.shape[0]
     
     # Create output tensor
-    output = torch.empty(batch_size, out_features, device=input.device, dtype=input.dtype)
+    output = torch.empty(batch_size_flat, out_features, device=input.device, dtype=input.dtype)
     
-    # Set up grid and block size
-    BLOCK_SIZE = 256
-    grid = (triton.cdiv(batch_size, BLOCK_SIZE),)
+    # Define block size
+    BLOCK = 256
+    
+    # Calculate grid size
+    grid = (triton.cdiv(batch_size_flat, BLOCK),)
     
     # Prepare strides
-    stride_input_n = input_2d.stride(0)
-    stride_input_f = input_2d.stride(1)
+    stride_input_n = input_reshaped.stride(0)
+    stride_input_f = input_reshaped.stride(1)
     stride_weight_o = weight.stride(0)
     stride_weight_f = weight.stride(1)
     stride_bias = 1 if bias is not None else 0
@@ -68,16 +70,15 @@ def tanh_linear(input, weight, bias=None):
     
     # Launch kernel
     _tanh_linear_kernel[grid](
-        input_2d, weight, bias, output,
+        input_reshaped, weight, bias, output,
         in_features, out_features,
         stride_input_n, stride_input_f,
         stride_weight_o, stride_weight_f,
-        stride_bias,
-        stride_output_n, stride_output_f,
-        BLOCK_SIZE
+        stride_bias, stride_output_n, stride_output_f,
+        BLOCK=BLOCK
     )
     
-    # Reshape output back to original shape
-    output = output.view(input_shape[:-1] + (out_features,))
+    # Reshape output back to original batch dimensions
+    output = output.view(*input_shape[:-1], out_features)
     
     return output

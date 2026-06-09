@@ -10,22 +10,20 @@ def _gelu_kernel(x_ptr, out_ptr, n: tl.constexpr, approximate: tl.constexpr, BLO
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     
-    # Compute GELU
     if approximate == 'none':
         # Exact GELU: x * 0.5 * (1 + erf(x / sqrt(2)))
         sqrt_2 = 1.4142135623730951
-        erf_arg = x / sqrt_2
-        # Using approximation of erf for better performance
-        # erf(x) ≈ tanh(sqrt(pi/2) * x)
-        erf_x = tl.tanh(1.702 * erf_arg)
+        erf_x = tl.erf(x / sqrt_2)
         y = x * 0.5 * (1.0 + erf_x)
-    else:  # approximate == 'tanh'
+    else:
         # Approximate GELU using tanh
-        # GELU ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-        sqrt_2_over_pi = 1.4142135623730951 / 3.14159265358979323846
+        # GELU approx = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        pi = 3.141592653589793
+        sqrt_2_over_pi = 1.4142135623730951 / pi
         x_cubed = x * x * x
         tanh_arg = sqrt_2_over_pi * (x + 0.044715 * x_cubed)
-        y = 0.5 * x * (1.0 + tl.tanh(tanh_arg))
+        tanh_x = tl.tanh(tanh_arg)
+        y = x * 0.5 * (1.0 + tanh_x)
     
     tl.store(out_ptr + offsets, y, mask=mask)
 
@@ -36,50 +34,48 @@ def _min_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     mask = offsets < n
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
     
-    # Simple reduction to find minimum
-    # This is a simplified version - in practice, you'd want a proper reduction kernel
-    # For now, we'll compute the minimum using a simple approach
-    min_val = tl.minimum(x, x)
-    tl.store(out_ptr + offsets, min_val, mask=mask)
+    # Initialize minimum value
+    min_val = tl.full([BLOCK], float('inf'), dtype=tl.float32)
+    
+    # Reduce to find minimum
+    for i in range(0, n, BLOCK):
+        current_offsets = i + tl.arange(0, BLOCK)
+        current_mask = current_offsets < n
+        current_x = tl.load(x_ptr + current_offsets, mask=current_mask, other=0.0)
+        min_val = tl.minimum(min_val, current_x)
+    
+    # Store the minimum value
+    tl.store(out_ptr + pid, min_val[0], mask=pid < 1)
 
 def min_gelu(input, dim=None, keepdim=False, approximate='none', out=None):
-    # Handle scalar input
-    if input.dim() == 0:
-        input = input.unsqueeze(0)
+    # Apply GELU activation
+    input = input.float()
+    out_gelu = torch.empty_like(input)
     
-    # Apply GELU
-    input_flat = input.flatten()
-    out_gelu = torch.empty_like(input_flat)
-    
-    n = input_flat.numel()
+    n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
     
     # Determine approximate method
-    approx_method = 0 if approximate == 'none' else 1
+    approx_method = 'none' if approximate == 'none' else 'tanh'
     
-    _gelu_kernel[grid](input_flat, out_gelu, n, approx_method, BLOCK=block)
+    _gelu_kernel[grid](input, out_gelu, n, approx_method, BLOCK=block)
     
-    # Reshape to original shape for reduction
-    out_gelu = out_gelu.view(input.shape)
-    
-    # Apply min reduction
+    # If no dimension is specified, return minimum of all elements
     if dim is None:
-        # Reduce all elements
+        # Use PyTorch's min function for simplicity
         result = torch.min(out_gelu)
-    else:
-        # Reduce along specified dimension
-        result = torch.min(out_gelu, dim=dim, keepdim=keepdim)
-    
-    # Handle out parameter
-    if out is not None:
-        if isinstance(result, tuple):
-            out[0] = result[0]
-            out[1] = result[1]
-            return out
-        else:
+        if out is not None:
             out.copy_(result)
             return out
+        return result
     
-    return result
+    # If dimension is specified, reduce along that dimension
+    result = torch.min(out_gelu, dim=dim, keepdim=keepdim)
+    
+    if out is not None:
+        out.copy_(result.values if hasattr(result, 'values') else result)
+        return out
+    
+    return result.values if hasattr(result, 'values') else result
 ```

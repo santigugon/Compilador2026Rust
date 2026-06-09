@@ -1,0 +1,7 @@
+{
+  "status": "failed",
+  "model_name": "qwen3_coder_30b_awq_8bit",
+  "condition_id": "qwen3_coder_30b_awq_8bit_tritonbench_python_xgrammar_on_t0.0_p1.0_tok2048_one_shot_repair0_default_seed0",
+  "seed": 0,
+  "error": ""
+}

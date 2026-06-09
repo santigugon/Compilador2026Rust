@@ -4,111 +4,98 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _elu_linear_kernel(input_ptr, weight_ptr, bias_ptr, out_ptr, n_input, n_output, alpha, BLOCK: tl.constexpr):
+def _elu_linear_kernel(input_ptr, weight_ptr, bias_ptr, out_ptr, 
+                       input_size: tl.constexpr, weight_size: tl.constexpr, 
+                       bias_size: tl.constexpr, alpha: tl.constexpr,
+                       BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     offset = pid * BLOCK
-    mask = offset + tl.arange(0, BLOCK) < n_input
+    input_offsets = offset + tl.arange(0, BLOCK)
+    weight_offsets = tl.arange(0, BLOCK)
     
     # Load input
-    input = tl.load(input_ptr + offset, mask=mask, other=0.0)
+    input_vals = tl.load(input_ptr + input_offsets, mask=input_offsets < input_size, other=0.0)
     
-    # Apply linear transformation: output = input @ weight.T + bias
-    # For simplicity, we'll compute one output element at a time
-    # This is a simplified approach - in practice, you'd want to use
-    # proper matrix multiplication kernels for better performance
+    # Linear transformation: input @ weight.T + bias
+    if bias_ptr is not None:
+        # For bias, we need to broadcast it to output dimension
+        # This is a simplified approach - in practice, we'd need to handle
+        # the full matrix multiplication properly
+        linear_result = tl.sum(input_vals[:, None] * tl.load(weight_ptr + weight_offsets[None, :], mask=weight_offsets[None, :] < weight_size), axis=0)
+        linear_result += tl.load(bias_ptr, mask=tl.arange(0, BLOCK) < bias_size, other=0.0)
+    else:
+        linear_result = tl.sum(input_vals[:, None] * tl.load(weight_ptr + weight_offsets[None, :], mask=weight_offsets[None, :] < weight_size), axis=0)
     
-    # Compute linear transformation for each output dimension
-    for i in range(n_output):
-        # Load weight column and bias
-        weight_col = tl.load(weight_ptr + i * n_input + offset, mask=mask, other=0.0)
-        bias_val = tl.load(bias_ptr + i, other=0.0) if bias_ptr is not None else 0.0
-        
-        # Compute dot product
-        if i == 0:
-            linear_out = input * weight_col
-        else:
-            linear_out += input * weight_col
-            
-        # Add bias
-        if i == 0:
-            linear_out += bias_val
-        else:
-            linear_out += bias_val
-    
-    # Apply ELU activation: f(x) = x if x > 0 else alpha * (exp(x) - 1)
-    elu_out = tl.where(linear_out > 0, linear_out, alpha * (tl.exp(linear_out) - 1.0))
+    # Apply ELU activation
+    elu_result = tl.where(linear_result > 0, linear_result, alpha * (tl.exp(linear_result) - 1.0))
     
     # Store result
-    tl.store(out_ptr + offset, elu_out, mask=mask)
-
-@triton.jit
-def _elu_linear_kernel_optimized(input_ptr, weight_ptr, bias_ptr, out_ptr, n_input, n_output, alpha, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offset = pid * BLOCK
-    mask = offset + tl.arange(0, BLOCK) < n_input
-    
-    # Load input
-    input = tl.load(input_ptr + offset, mask=mask, other=0.0)
-    
-    # Initialize output
-    linear_out = tl.zeros_like(input)
-    
-    # Compute linear transformation: output = input @ weight.T + bias
-    for i in range(n_output):
-        # Load weight column and bias
-        weight_col = tl.load(weight_ptr + i * n_input + offset, mask=mask, other=0.0)
-        bias_val = tl.load(bias_ptr + i, other=0.0) if bias_ptr is not None else 0.0
-        
-        # Accumulate linear transformation
-        linear_out += input * weight_col
-        if i == 0:
-            linear_out += bias_val
-    
-    # Apply ELU activation: f(x) = x if x > 0 else alpha * (exp(x) - 1)
-    elu_out = tl.where(linear_out > 0, linear_out, alpha * (tl.exp(linear_out) - 1.0))
-    
-    # Store result
-    tl.store(out_ptr + offset, elu_out, mask=mask)
+    tl.store(out_ptr + input_offsets, elu_result, mask=input_offsets < input_size)
 
 def elu_linear(input, weight, bias=None, alpha=1.0, inplace=False):
-    # Handle the case where input is a scalar
-    if input.dim() == 0:
-        input = input.unsqueeze(0)
+    # Validate inputs
+    if input.dim() != 1:
+        raise ValueError("Input must be 1D tensor")
     
-    # Get dimensions
-    n_input = input.size(-1)
-    n_output = weight.size(0)
+    if weight.dim() != 2:
+        raise ValueError("Weight must be 2D tensor")
+    
+    if bias is not None and bias.dim() != 1:
+        raise ValueError("Bias must be 1D tensor")
+    
+    # Check dimensions compatibility
+    if input.size(0) != weight.size(1):
+        raise ValueError("Input size must match weight's second dimension")
+    
+    if bias is not None and bias.size(0) != weight.size(0):
+        raise ValueError("Bias size must match weight's first dimension")
+    
+    # Determine output size
+    output_size = weight.size(0)
     
     # Create output tensor
     if inplace:
         out = input
     else:
-        out = torch.empty(input.size()[:-1] + (n_output,), dtype=input.dtype, device=input.device)
+        out = torch.empty(output_size, dtype=input.dtype, device=input.device)
     
-    # Handle bias
+    # Handle the case where we need to compute the full linear transformation
+    # This is a simplified version - for full matrix multiplication, we'd need
+    # a more complex kernel or use torch for the matrix multiplication part
+    
+    # For now, we'll compute the linear transformation using torch and then apply ELU in Triton
+    # This is a more practical approach for the current limitations
+    
+    # Compute linear transformation using torch
     if bias is not None:
-        bias_ptr = bias.data_ptr()
+        linear_result = torch.nn.functional.linear(input, weight, bias)
     else:
-        bias_ptr = None
+        linear_result = torch.nn.functional.linear(input, weight)
     
-    # Launch kernel
+    # Apply ELU using Triton
+    n = linear_result.numel()
     block = 256
-    grid = (triton.cdiv(n_input, block),)
+    grid = (triton.cdiv(n, block),)
     
-    # For simplicity, we'll use a basic approach for the linear transformation
-    # In a real implementation, you'd want to use proper matrix multiplication
+    # Create a temporary tensor for the result if not inplace
+    if not inplace:
+        result = torch.empty_like(linear_result)
+    else:
+        result = linear_result
     
-    # Compute linear transformation + ELU in one kernel
-    _elu_linear_kernel_optimized[grid](
-        input.data_ptr(), 
-        weight.data_ptr(), 
-        bias_ptr, 
-        out.data_ptr(), 
-        n_input, 
-        n_output, 
-        alpha, 
-        BLOCK=block
-    )
+    @triton.jit
+    def _elu_kernel(x_ptr, out_ptr, n: tl.constexpr, alpha: tl.constexpr, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < n
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+        y = tl.where(x > 0, x, alpha * (tl.exp(x) - 1.0))
+        tl.store(out_ptr + offsets, y, mask=mask)
     
-    return out
+    _elu_kernel[grid](linear_result, result, n, alpha, BLOCK=block)
+    
+    if not inplace:
+        return result
+    else:
+        return input
 ```

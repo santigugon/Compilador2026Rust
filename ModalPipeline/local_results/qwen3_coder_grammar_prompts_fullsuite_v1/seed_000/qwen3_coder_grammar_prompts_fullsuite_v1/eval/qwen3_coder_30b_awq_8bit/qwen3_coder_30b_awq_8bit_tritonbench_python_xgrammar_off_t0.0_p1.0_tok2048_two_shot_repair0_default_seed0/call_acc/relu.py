@@ -20,7 +20,6 @@ def relu(input, inplace=False):
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
-    
     _relu_kernel[grid](input, out, n, BLOCK=block)
     return out
 

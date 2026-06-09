@@ -17,7 +17,7 @@ def _polygamma_kernel(n_ptr, x_ptr, out_ptr, n: tl.constexpr, size: tl.constexpr
     
     # For n=0, compute digamma function
     if n == 0:
-        # Use asymptotic expansion for digamma
+        # Use the asymptotic expansion for digamma
         # ψ(x) ≈ ln(x) - 1/(2x) - 1/(12x^2) + 1/(120x^4) - 1/(252x^6)
         x_sq = x * x
         x_pow2 = x_sq
@@ -26,50 +26,51 @@ def _polygamma_kernel(n_ptr, x_ptr, out_ptr, n: tl.constexpr, size: tl.constexpr
         
         result = tl.log(x) - 0.5 / x - 1.0 / (12.0 * x_pow2) + 1.0 / (120.0 * x_pow4) - 1.0 / (252.0 * x_pow6)
     else:
-        # For higher order derivatives, we'll compute a simplified version
-        # This is a basic approximation - in practice, more sophisticated methods would be used
-        # We'll compute the sum for a fixed number of terms
-        term = tl.zeros((BLOCK,), dtype=tl.float32)
-        sign = tl.where(n % 2 == 0, 1.0, -1.0)
+        # For higher order derivatives, we compute the series approximation
+        # We'll use a simple iterative approach with a fixed number of terms
+        # This is a simplified implementation for demonstration
+        # In practice, more sophisticated algorithms would be used
         
-        # Compute factorial
-        factorial = 1.0
-        for i in range(1, n + 1):
-            factorial *= i
-            
-        # Compute sum for first few terms
-        for k in range(100):  # Fixed number of terms for approximation
-            k_val = k + 1.0
-            denominator = tl.pow(x + k_val, n + 1)
-            term = sign * factorial / denominator
+        # Initialize result
+        result = tl.zeros((BLOCK,), dtype=tl.float32)
+        
+        # Compute the series: sum_{k=0}^{∞} 1/(x+k)^(n+1)
+        # We'll use a reasonable number of terms (e.g., 100)
+        for i in range(100):
+            k = i
+            term = 1.0 / (tl.pow(x + k, n + 1))
             result = result + term
             
+        # Apply the coefficient (-1)^(n+1) * n!
+        sign = tl.where((n + 1) % 2 == 0, 1.0, -1.0)
+        factorial = 1.0
+        for i in range(1, n + 1):
+            factorial = factorial * i
+        result = sign * factorial * result
+    
     tl.store(out_ptr + offsets, result, mask=mask)
 
 def polygamma(n, input, *, out=None) -> torch.Tensor:
     if out is None:
         out = torch.empty_like(input)
     
-    if not isinstance(n, int) or n < 0:
+    # Handle scalar n
+    if not isinstance(n, int):
+        n = int(n)
+    
+    # Validate n
+    if n < 0:
         raise ValueError("n must be a non-negative integer")
+    
+    # For n=0, we compute digamma function
+    # For n>0, we compute the n-th derivative of digamma
     
     size = input.numel()
     block = 256
     grid = (triton.cdiv(size, block),)
     
-    # Create a tensor with the value of n for all elements
-    n_tensor = torch.full((1,), n, dtype=torch.int32, device=input.device)
+    # Create a tensor for n to pass to kernel
+    n_tensor = torch.tensor(n, dtype=torch.int32, device=input.device)
     
-    # For simplicity, we'll use a direct implementation for the first few cases
-    # In practice, this would be more complex and require more sophisticated math
-    if n == 0:
-        # Compute digamma function
-        out = torch.digamma(input)
-    else:
-        # For higher order derivatives, we'll compute a simplified version
-        # This is a placeholder implementation
-        out = torch.empty_like(input)
-        n_tensor = torch.full((1,), n, dtype=torch.int32, device=input.device)
-        _polygamma_kernel[grid](n_tensor, input, out, n, size, BLOCK=block)
-    
+    _polygamma_kernel[grid](n_tensor, input, out, n, size, BLOCK=block)
     return out

@@ -42,30 +42,36 @@ def _matmul_kernel(
              c)
 
 def matmul(input, other, *, out=None):
-    # Handle 1D case (dot product)
+    # Handle the case where one of the tensors is 1D
     if input.dim() == 1 and other.dim() == 1:
+        # Dot product case
         if out is not None:
-            raise ValueError("1D dot product does not support out parameter")
+            raise ValueError("out parameter not supported for 1D dot product")
         return torch.dot(input, other)
     
-    # Handle 2D case (matrix multiplication)
+    # For 2D or higher dimensional tensors, use Triton kernel
     if input.dim() == 2 and other.dim() == 2:
+        # Standard matrix multiplication
+        M, K = input.shape
+        K, N = other.shape
         if out is None:
-            out = torch.empty(input.size(0), other.size(1), dtype=input.dtype, device=input.device)
+            out = torch.empty(M, N, dtype=input.dtype, device=input.device)
         else:
-            assert out.shape == (input.size(0), other.size(1)), "Output tensor has incorrect shape"
+            assert out.shape == (M, N), "Output tensor shape mismatch"
         
-        # Determine block size and grid size
-        BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+        # Define block sizes
+        BLOCK_M = 64
+        BLOCK_N = 64
+        BLOCK_K = 32
         GROUP_M = 8
         
         # Calculate grid size
-        grid = (triton.cdiv(input.size(0), BLOCK_M) * triton.cdiv(other.size(1), BLOCK_N),)
+        grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
         
         # Launch kernel
         _matmul_kernel[grid](
             input, other, out,
-            input.size(0), other.size(1), input.size(1),
+            M, N, K,
             input.stride(0), input.stride(1),
             other.stride(0), other.stride(1),
             out.stride(0), out.stride(1),
@@ -73,37 +79,7 @@ def matmul(input, other, *, out=None):
         )
         return out
     
-    # Handle batched matrix multiplication
-    if input.dim() > 2 or other.dim() > 2:
-        # Use PyTorch's built-in matmul for higher dimensional cases
-        if out is None:
-            return torch.matmul(input, other)
-        else:
-            torch.matmul(input, other, out=out)
-            return out
-    
-    # Handle mixed 1D and 2D case (matrix-vector product)
-    if input.dim() == 2 and other.dim() == 1:
-        if out is None:
-            out = torch.empty(input.size(0), dtype=input.dtype, device=input.device)
-        else:
-            assert out.shape == (input.size(0),), "Output tensor has incorrect shape"
-        
-        # Use PyTorch's built-in matmul for matrix-vector product
-        torch.matmul(input, other, out=out)
-        return out
-    
-    if input.dim() == 1 and other.dim() == 2:
-        if out is None:
-            out = torch.empty(other.size(1), dtype=other.dtype, device=other.device)
-        else:
-            assert out.shape == (other.size(1),), "Output tensor has incorrect shape"
-        
-        # Use PyTorch's built-in matmul for vector-matrix product
-        torch.matmul(other, input, out=out)
-        return out
-    
-    # Fallback to PyTorch for unsupported cases
+    # For higher dimensional tensors, use torch's built-in matmul
     if out is None:
         return torch.matmul(input, other)
     else:

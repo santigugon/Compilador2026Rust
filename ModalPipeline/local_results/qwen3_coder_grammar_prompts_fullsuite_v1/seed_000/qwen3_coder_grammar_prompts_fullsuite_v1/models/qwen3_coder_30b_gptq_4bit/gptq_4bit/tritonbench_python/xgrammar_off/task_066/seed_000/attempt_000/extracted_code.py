@@ -41,44 +41,43 @@ def fused_masked_select_add_gelu(input, mask, other, *, alpha=1, approximate='no
     if not torch.is_tensor(other):
         other = torch.tensor(other, dtype=input.dtype, device=input.device)
     
-    # Ensure other has the same shape as input for broadcasting
-    if other.shape != input.shape:
+    # Ensure other is broadcastable with input
+    if other.dim() == 0:
         other = other.expand_as(input)
+    elif other.shape != input.shape:
+        # Handle broadcasting
+        other = other.expand(input.shape)
     
-    # Ensure mask has the same shape as input
-    if mask.shape != input.shape:
-        mask = mask.expand_as(input)
+    # Ensure mask is boolean
+    mask = mask.to(torch.bool)
     
     # Create output tensor
     if out is not None:
-        out = torch.empty_like(out)
+        out = out
     else:
         out = torch.empty_like(input)
     
-    # Flatten tensors for processing
-    input_flat = input.flatten()
-    mask_flat = mask.flatten()
-    other_flat = other.flatten()
-    out_flat = out.flatten()
+    # Get total number of elements
+    n = input.numel()
     
-    n = input_flat.numel()
-    block = 256
-    grid = (triton.cdiv(n, block),)
+    # Determine block size
+    BLOCK = 256
+    
+    # Grid size
+    grid = (triton.cdiv(n, BLOCK),)
     
     # Handle case where other is a scalar
     if not torch.is_tensor(other):
         other_ptr = None
     else:
-        other_ptr = other_flat.data_ptr()
+        other_ptr = other
+        if other.shape != input.shape:
+            other = other.expand_as(input)
     
+    # Launch kernel
     _fused_masked_select_add_gelu_kernel[grid](
-        input_flat.data_ptr(),
-        mask_flat.data_ptr(),
-        other_ptr,
-        out_flat.data_ptr(),
-        n,
-        alpha,
-        BLOCK=block
+        input, mask, other_ptr, out,
+        n, alpha, BLOCK
     )
     
     return out

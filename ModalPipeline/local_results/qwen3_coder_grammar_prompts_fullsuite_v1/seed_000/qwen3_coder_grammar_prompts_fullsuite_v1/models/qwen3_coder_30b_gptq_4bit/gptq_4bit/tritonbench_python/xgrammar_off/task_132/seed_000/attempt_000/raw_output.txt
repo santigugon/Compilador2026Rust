@@ -34,6 +34,12 @@ def mul_sub(input, other_mul, other_sub, alpha=1, out=None):
     other_mul = other_mul.to(input.device).to(input.dtype)
     other_sub = other_sub.to(input.device).to(input.dtype)
     
+    # Expand dimensions if needed for broadcasting
+    if other_mul.dim() == 0:
+        other_mul = other_mul.expand_as(input)
+    if other_sub.dim() == 0:
+        other_sub = other_sub.expand_as(input)
+    
     # Handle broadcasting
     if other_mul.shape != input.shape:
         other_mul = other_mul.expand_as(input)

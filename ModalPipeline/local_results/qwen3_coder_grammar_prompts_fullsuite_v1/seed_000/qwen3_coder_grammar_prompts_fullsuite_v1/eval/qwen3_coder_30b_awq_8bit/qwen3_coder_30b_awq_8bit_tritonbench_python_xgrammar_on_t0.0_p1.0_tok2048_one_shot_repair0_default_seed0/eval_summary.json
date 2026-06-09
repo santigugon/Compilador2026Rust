@@ -1,0 +1,137 @@
+{
+  "total_predictions": 166,
+  "phase1_call_acc": {
+    "passed": 29,
+    "rate": 17.47,
+    "duration_ms": 443907.27849900007
+  },
+  "phase2_exec_acc": {
+    "passed": 29,
+    "rate": 17.47
+  },
+  "phase3_efficiency": {
+    "speedup_vs_pytorch": 1.3,
+    "raw_output_tail": "================================================================================================================================================================\nabs.json: 0.8001\nadd_mean.json: 0.7979\nargmax.json: 0.9569\nautocast.json: 0.1108\nbessel_j1.json: 3.6034\ncos.json: 0.7955\ndropout_relu_batch_norm_conv2d.json: 1.3918\nerf.json: 0.8008\nerfc_sqrt.json: 1.9061\nfused_hstack_div.json: 0.7311\ngelu_std.json: 0.2699\nleaky_relu.json: 0.805\nlog.json: 0.7996\nmatrix_multiply_and_row_dot.json failed\npolygamma.json failed\npseudoinverse_svd.json: 0.9646\nrad2deg_sqrt.json: 0.9965\nreciprocal.json: 0.8004\nrelu.json: 0.799\nrsqrt.json: 3.3141\nselu.json: 6.6415\nsigmoid.json: 0.8001\nsignbit.json: 0.8191\nsoftmax.json: 0.3572\nsqrt.json: 0.7976\nsqrt_exp.json: 1.541\ntensordot_rsqrt.json: 0.9942\n[0.8001, 0.7979, 0.9569, 0.1108, 3.6034, 0.7955, 1.3918, 0.8008, 1.9061, 0.7311, 0.2699, 0.805, 0.7996, 0.9646, 0.9965, 0.8004, 0.799, 3.3141, 6.6415, 0.8001, 0.8191, 0.3572, 0.7976, 1.541, 0.9942]\n\nperf_results\nspeed up: 1.3\n================================================================================================================================================================\n",
+    "duration_ms": 88.50690799999938
+  },
+  "per_op": {
+    "abs.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "add_mean.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "argmax.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "autocast.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "bessel_j1.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "combined_activation.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "cos.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "dropout_relu_batch_norm_conv2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "erf.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "erfc_sqrt.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_hstack_div.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "gelu_std.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "leaky_relu.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "log.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "logsumexp.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "matrix_multiply_and_row_dot.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "polygamma.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "pseudoinverse_svd.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "rad2deg_sqrt.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "reciprocal.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "relu.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "rsqrt.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "selu.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "sigmoid.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "signbit.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "softmax.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "sqrt.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "sqrt_exp.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "tensordot_rsqrt.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    }
+  },
+  "call_acc_dir": "/results/qwen3_coder_grammar_prompts_fullsuite_v1/eval/qwen3_coder_30b_awq_8bit/qwen3_coder_30b_awq_8bit_tritonbench_python_xgrammar_on_t0.0_p1.0_tok2048_one_shot_repair0_default_seed0/call_acc",
+  "perf_results_dir": "/results/qwen3_coder_grammar_prompts_fullsuite_v1/eval/qwen3_coder_30b_awq_8bit/qwen3_coder_30b_awq_8bit_tritonbench_python_xgrammar_on_t0.0_p1.0_tok2048_one_shot_repair0_default_seed0/perf_results"
+}

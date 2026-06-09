@@ -5,118 +5,123 @@ import triton.language as tl
 
 @triton.jit
 def _solve_kernel(A_ptr, B_ptr, out_ptr, n: tl.constexpr, batch_size: tl.constexpr, BLOCK: tl.constexpr):
+    # Get batch index
     batch_idx = tl.program_id(0)
-    pid = tl.program_id(1)
     
-    # Load matrix A and B for this batch
-    A_batch = A_ptr + batch_idx * n * n
-    B_batch = B_ptr + batch_idx * n * 1
+    # Get pointers for this batch
+    A_batch_ptr = A_ptr + batch_idx * n * n
+    B_batch_ptr = B_ptr + batch_idx * n * (1 if batch_size == 1 else 1)
+    out_batch_ptr = out_ptr + batch_idx * n * (1 if batch_size == 1 else 1)
     
-    # Create a copy of A for Gaussian elimination
-    A_copy = tl.full((BLOCK, BLOCK), 0.0, dtype=tl.float32)
-    B_copy = tl.full((BLOCK, 1), 0.0, dtype=tl.float32)
+    # Create shared memory for LU decomposition
+    L = tl.shared_ptr(tl.zeros((BLOCK, BLOCK), dtype=tl.float32), (BLOCK, BLOCK))
+    U = tl.shared_ptr(tl.zeros((BLOCK, BLOCK), dtype=tl.float32), (BLOCK, BLOCK))
     
-    # Load A and B into shared memory
-    for i in range(BLOCK):
-        for j in range(BLOCK):
-            if i < n and j < n:
-                A_copy[i, j] = tl.load(A_batch + i * n + j)
-        if i < n:
-            B_copy[i, 0] = tl.load(B_batch + i)
+    # Copy A to shared memory
+    for i in range(n):
+        for j in range(n):
+            if i < BLOCK and j < BLOCK:
+                L[i, j] = tl.load(A_batch_ptr + i * n + j)
+                U[i, j] = tl.load(A_batch_ptr + i * n + j)
     
-    # Forward elimination
-    for k in range(BLOCK):
-        if k < n:
-            # Find pivot
-            pivot_row = k
-            for i in range(k + 1, BLOCK):
-                if i < n and tl.abs(A_copy[i, k]) > tl.abs(A_copy[pivot_row, k]):
-                    pivot_row = i
-            
-            # Swap rows if needed
-            if pivot_row != k:
-                for j in range(BLOCK):
-                    temp = A_copy[k, j]
-                    A_copy[k, j] = A_copy[pivot_row, j]
-                    A_copy[pivot_row, j] = temp
-                temp = B_copy[k, 0]
-                B_copy[k, 0] = B_copy[pivot_row, 0]
-                B_copy[pivot_row, 0] = temp
-            
-            # Check for singular matrix
-            if tl.abs(A_copy[k, k]) < 1e-12:
-                # Set solution to zero for singular case
-                for i in range(BLOCK):
-                    if i < n:
-                        tl.store(out_ptr + batch_idx * n + i, 0.0)
-                return
-            
-            # Eliminate
-            for i in range(k + 1, BLOCK):
-                if i < n:
-                    factor = A_copy[i, k] / A_copy[k, k]
-                    for j in range(k + 1, BLOCK):
-                        if j < n:
-                            A_copy[i, j] = A_copy[i, j] - factor * A_copy[k, j]
-                    B_copy[i, 0] = B_copy[i, 0] - factor * B_copy[k, 0]
+    # LU decomposition
+    for k in range(n):
+        # Find pivot
+        pivot = k
+        for i in range(k + 1, n):
+            if tl.abs(U[i, k]) > tl.abs(U[pivot, k]):
+                pivot = i
+        
+        # Swap rows in L and U
+        if pivot != k:
+            for j in range(n):
+                temp = L[k, j]
+                L[k, j] = L[pivot, j]
+                L[pivot, j] = temp
+                temp = U[k, j]
+                U[k, j] = U[pivot, j]
+                U[pivot, j] = temp
+        
+        # Eliminate
+        for i in range(k + 1, n):
+            if U[k, k] != 0:
+                factor = U[i, k] / U[k, k]
+                L[i, k] = factor
+                for j in range(k + 1, n):
+                    U[i, j] = U[i, j] - factor * U[k, j]
+            else:
+                L[i, k] = 0
     
-    # Back substitution
-    for i in range(BLOCK - 1, -1, -1):
-        if i < n:
-            sum_val = B_copy[i, 0]
-            for j in range(i + 1, BLOCK):
-                if j < n:
-                    sum_val = sum_val - A_copy[i, j] * tl.load(out_ptr + batch_idx * n + j)
-            tl.store(out_ptr + batch_idx * n + i, sum_val / A_copy[i, i])
+    # Forward substitution
+    for i in range(n):
+        for j in range(i + 1, n):
+            if L[i, i] != 0:
+                B_batch_ptr[j] = B_batch_ptr[j] - L[j, i] * B_batch_ptr[i]
+    
+    # Backward substitution
+    for i in range(n - 1, -1, -1):
+        if U[i, i] != 0:
+            B_batch_ptr[i] = B_batch_ptr[i] / U[i, i]
+            for j in range(i):
+                B_batch_ptr[j] = B_batch_ptr[j] - U[j, i] * B_batch_ptr[i]
+    
+    # Store result
+    for i in range(n):
+        tl.store(out_batch_ptr + i, B_batch_ptr[i])
 
 def solve(A, B, *, left=True, out=None):
-    if not left:
-        raise NotImplementedError("Only left=True is supported")
-    
-    # Handle scalar case
+    # Handle scalar inputs
     if A.dim() == 0 or B.dim() == 0:
-        raise ValueError("solve() is not supported for scalar inputs")
+        raise ValueError("solve: inputs must be at least 1D")
     
-    # Handle batched case
+    # Handle batched inputs
     if A.dim() > 2:
         batch_dims = A.shape[:-2]
         n = A.shape[-1]
         batch_size = 1
         for dim in batch_dims:
             batch_size *= dim
-        
-        # Flatten batch dimensions
-        A_flat = A.view(-1, n, n)
-        B_flat = B.view(-1, n, 1)
-        
-        if out is None:
-            out = torch.empty_like(B_flat)
-        
-        # Process each batch
-        for i in range(batch_size):
-            A_batch = A_flat[i]
-            B_batch = B_flat[i]
-            out_batch = out[i]
-            
-            # For small matrices, use a simple approach
-            if n <= 32:
-                # Use torch for small matrices to avoid complex Triton implementation
-                out_batch.copy_(torch.linalg.solve(A_batch, B_batch))
-            else:
-                # For larger matrices, use a simple iterative approach
-                out_batch.copy_(torch.linalg.solve(A_batch, B_batch))
-        
-        return out.view(B.shape)
+    else:
+        batch_dims = ()
+        n = A.shape[-1]
+        batch_size = 1
     
-    # Non-batched case
-    n = A.shape[-1]
-    if out is None:
+    # Ensure B has correct shape
+    if B.dim() == 1:
+        B = B.unsqueeze(1)
+    elif B.dim() > 2:
+        B = B.view(-1, B.shape[-1])
+    
+    # Create output tensor
+    if out is not None:
+        out = out.view(-1, n)
+    else:
         out = torch.empty_like(B)
     
-    # For small matrices, use torch directly
-    if n <= 32:
-        return torch.linalg.solve(A, B)
+    # Handle left vs right solve
+    if not left:
+        # For right solve, we need to transpose A and B
+        A = A.transpose(-2, -1)
+        B = B.transpose(-2, -1)
     
-    # For larger matrices, use a simple approach
-    return torch.linalg.solve(A, B)
+    # Launch kernel
+    if batch_size == 1:
+        grid = (1,)
+    else:
+        grid = (batch_size,)
+    
+    block = 32
+    _solve_kernel[grid](A, B, out, n, batch_size, BLOCK=block)
+    
+    # Reshape output to match expected dimensions
+    if len(batch_dims) > 0:
+        out = out.view(*batch_dims, n, 1)
+    else:
+        out = out.view(n, 1)
+    
+    # If B was 1D, return 1D result
+    if B.dim() == 1:
+        out = out.squeeze(-1)
+    
+    return out
 ```

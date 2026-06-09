@@ -1,0 +1,29 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _log_tanh_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    # Compute natural logarithm
+    log_x = tl.log(x)
+    # Apply hyperbolic tangent
+    tanh_log_x = 2.0 / (1.0 + tl.exp(-2.0 * log_x)) - 1.0
+    tl.store(out_ptr + offsets, tanh_log_x, mask=mask)
+
+def log_tanh(input, out=None) -> torch.Tensor:
+    if out is None:
+        out = torch.empty_like(input)
+    else:
+        assert out.shape == input.shape, "Output tensor must have the same shape as input tensor"
+        assert out.dtype == input.dtype, "Output tensor must have the same dtype as input tensor"
+    
+    n = input.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    
+    _log_tanh_kernel[grid](input, out, n, BLOCK=block)
+    return out

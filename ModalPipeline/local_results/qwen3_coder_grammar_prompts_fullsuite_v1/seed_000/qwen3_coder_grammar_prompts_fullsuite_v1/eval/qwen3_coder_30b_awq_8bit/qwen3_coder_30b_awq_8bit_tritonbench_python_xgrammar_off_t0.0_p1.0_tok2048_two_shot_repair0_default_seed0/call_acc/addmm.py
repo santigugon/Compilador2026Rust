@@ -1,0 +1,137 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _addmm_kernel(mat1_ptr, mat2_ptr, input_ptr, out_ptr, 
+                  m: tl.constexpr, n: tl.constexpr, p: tl.constexpr,
+                  stride_mat1_m: tl.constexpr, stride_mat1_n: tl.constexpr,
+                  stride_mat2_n: tl.constexpr, stride_mat2_p: tl.constexpr,
+                  stride_input_m: tl.constexpr, stride_input_p: tl.constexpr,
+                  stride_out_m: tl.constexpr, stride_out_p: tl.constexpr,
+                  beta: tl.constexpr, alpha: tl.constexpr,
+                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Compute the starting indices for this block
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Create masks for boundaries
+    mask_m = offs_m < m
+    mask_n = offs_n < p
+    
+    # Initialize accumulator for mat1 @ mat2
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Compute mat1 @ mat2
+    for k in range(0, n, BLOCK_K):
+        # Load mat1 block
+        mat1_mask = (offs_m[:, None] < m) & (offs_k[None, :] < n)
+        mat1 = tl.load(mat1_ptr + offs_m[:, None] * stride_mat1_m + 
+                       offs_k[None, :] * stride_mat1_n, mask=mat1_mask, other=0.0)
+        
+        # Load mat2 block
+        mat2_mask = (offs_k[:, None] < n) & (offs_n[None, :] < p)
+        mat2 = tl.load(mat2_ptr + offs_k[:, None] * stride_mat2_n + 
+                       offs_n[None, :] * stride_mat2_p, mask=mat2_mask, other=0.0)
+        
+        # Compute partial dot product
+        acc += tl.dot(mat1, mat2)
+    
+    # Compute output: alpha * (mat1 @ mat2) + beta * input
+    out = acc * alpha
+    
+    # Load input if beta != 0
+    if beta != 0.0:
+        input_mask = (offs_m[:, None] < m) & (offs_n[None, :] < p)
+        input = tl.load(input_ptr + offs_m[:, None] * stride_input_m + 
+                        offs_n[None, :] * stride_input_p, mask=input_mask, other=0.0)
+        out = out + beta * input
+    
+    # Store result
+    out_mask = (offs_m[:, None] < m) & (offs_n[None, :] < p)
+    tl.store(out_ptr + offs_m[:, None] * stride_out_m + 
+             offs_n[None, :] * stride_out_p, out, mask=out_mask)
+
+def addmm(input, mat1, mat2, *, beta=1, alpha=1, out=None):
+    # Ensure inputs are contiguous for easier handling
+    mat1 = mat1.contiguous()
+    mat2 = mat2.contiguous()
+    input = input.contiguous()
+    
+    # Get dimensions
+    m, n = mat1.shape
+    _, p = mat2.shape
+    
+    # Check if input is broadcastable with (m, p)
+    if input.shape != (m, p):
+        # Try to broadcast input to (m, p)
+        try:
+            input = input.expand(m, p)
+        except RuntimeError:
+            raise ValueError("input is not broadcastable with the result of mat1 @ mat2")
+    
+    # Create output tensor
+    if out is None:
+        out = torch.empty(m, p, dtype=mat1.dtype, device=mat1.device)
+    else:
+        if out.shape != (m, p):
+            raise ValueError("out tensor must have shape (m, p)")
+        if out.dtype != mat1.dtype or out.device != mat1.device:
+            raise ValueError("out tensor must have the same dtype and device as mat1")
+    
+    # Launch kernel
+    BLOCK_M = 16
+    BLOCK_N = 16
+    BLOCK_K = 32
+    
+    grid_m = triton.cdiv(m, BLOCK_M)
+    grid_n = triton.cdiv(p, BLOCK_N)
+    grid = (grid_m, grid_n)
+    
+    _addmm_kernel[grid](
+        mat1, mat2, input, out,
+        m, n, p,
+        mat1.stride(0), mat1.stride(1),
+        mat2.stride(0), mat2.stride(1),
+        input.stride(0), input.stride(1),
+        out.stride(0), out.stride(1),
+        beta, alpha,
+        BLOCK_M, BLOCK_N, BLOCK_K
+    )
+    
+    return out
+
+##################################################################################################################################################
+
+
+
+import torch
+
+def test_addmm():
+    results = {}
+
+    # Test case 1: Default beta and alpha
+    input1 = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device='cuda')
+    mat1_1 = torch.tensor([[1.0, 0.0], [0.0, 1.0]], device='cuda')
+    mat2_1 = torch.tensor([[5.0, 6.0], [7.0, 8.0]], device='cuda')
+    results["test_case_1"] = addmm(input1, mat1_1, mat2_1)
+
+    # Test case 2: Custom beta and alpha
+    input2 = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device='cuda')
+    mat1_2 = torch.tensor([[1.0, 0.0], [0.0, 1.0]], device='cuda')
+    mat2_2 = torch.tensor([[5.0, 6.0], [7.0, 8.0]], device='cuda')
+    results["test_case_2"] = addmm(input2, mat1_2, mat2_2, beta=0.5, alpha=2.0)
+
+    # Test case 3: Zero beta
+    input3 = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device='cuda')
+    mat1_3 = torch.tensor([[1.0, 0.0], [0.0, 1.0]], device='cuda')
+    mat2_3 = torch.tensor([[5.0, 6.0], [7.0, 8.0]], device='cuda')
+    results["test_case_3"] = addmm(input3, mat1_3, mat2_3, beta=0.0)
+
+    return results
+
+test_results = test_addmm()

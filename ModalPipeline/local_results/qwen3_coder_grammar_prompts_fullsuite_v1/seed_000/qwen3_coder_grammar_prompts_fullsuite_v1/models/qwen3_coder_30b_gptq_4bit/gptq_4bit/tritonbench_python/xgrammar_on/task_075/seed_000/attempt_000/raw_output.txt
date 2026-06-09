@@ -1,0 +1,4 @@
+{
+    "instruction": "Computes the solution `x` to the equation `Ax = b` using the Cholesky decomposition. It first performs Cholesky decomposition on a symmetric positive-definite matrix `A` to obtain a lower triangular matrix `L` such that `A = L * L.T`, then solves for `x` in `Ax = b` using the Cholesky factorization.",
+    "predict": "import torch\nimport triton\nimport triton.language as tl\n\ndef fused_cholesky_solve(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:\n    n, k = A.shape[0], b.shape[1]\n    \n    # Perform Cholesky decomposition\n    L = torch.linalg.cholesky(A)\n    \n    # Solve L * y = b for y\n    y = torch.trtrs(b, L, upper=False)[0]\n    \n    # Solve L.T * x = y for x\n    x = torch.trtrs(y, L.T, upper=True)[0]\n    \n    return x"
+}

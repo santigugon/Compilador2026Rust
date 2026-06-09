@@ -10,8 +10,8 @@ def softmax_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     row = tl.program_id(0)
-    output_row = output_ptr + row * n_cols
     input_row = input_ptr + row * n_cols
+    output_row = output_ptr + row * n_cols
     
     # Load input data
     values = tl.load(input_row + tl.arange(0, BLOCK_SIZE), mask=tl.arange(0, BLOCK_SIZE) < n_cols)
@@ -40,13 +40,15 @@ def softmax(input, dim, dtype=None):
     n_rows = 1
     n_cols = shape[dim]
     
-    # Compute number of rows
+    # Compute total number of rows
     for i in range(len(shape)):
         if i != dim:
             n_rows *= shape[i]
     
     # Set block size
     BLOCK_SIZE = 1024
+    if n_cols > BLOCK_SIZE:
+        BLOCK_SIZE = triton.next_power_of_2(n_cols)
     
     # Launch kernel
     grid = (n_rows,)

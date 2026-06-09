@@ -1,0 +1,113 @@
+{
+  "total_predictions": 166,
+  "phase1_call_acc": {
+    "passed": 23,
+    "rate": 13.86,
+    "duration_ms": 460416.2852719999
+  },
+  "phase2_exec_acc": {
+    "passed": 23,
+    "rate": 13.86
+  },
+  "phase3_efficiency": {
+    "speedup_vs_pytorch": 1.31,
+    "raw_output_tail": "================================================================================================================================================================\nadd_mean.json: 0.7972\nautocast.json: 0.1104\nbroadcast_tensors.json: 0.7679\ndeterminant_via_qr.json: 1.5427\ndropout_relu_batch_norm_conv2d.json: 2.3952\nexp_mean.json: 0.8099\nfused_instance_norm_selu_conv2d.json failed\nfused_svd_reconstruct.json: 8.629\nlog.json: 0.8025\nmatrix_power_eig.json: 0.1011\nnormalize_pairwise_distance.json: 0.2642\nones_like.json: 1.194\npixel_shuffle_conv2d.json failed\npseudoinverse_svd.json: 0.9824\nrelu_batch_norm_conv2d.json: 0.3357\nrelu_conv2d.json: 0.8616\nrsqrt.json failed\nsolve_and_add_scaled_vector..json: 0.9725\nsum_std.json: 0.7046\ntensordot_rsqrt.json: 0.9934\n[0.7972, 0.1104, 0.7679, 1.5427, 2.3952, 0.8099, 8.629, 0.8025, 0.1011, 0.2642, 1.194, 0.9824, 0.3357, 0.8616, 0.9725, 0.7046, 0.9934]\n\nperf_results\nspeed up: 1.31\n================================================================================================================================================================\n",
+    "duration_ms": 78.91157800031579
+  },
+  "per_op": {
+    "add_mean.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "autocast.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "broadcast_tensors.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "determinant_via_qr.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "dropout_relu_batch_norm_conv2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "exp_mean.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_instance_norm_selu_conv2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "fused_svd_reconstruct.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "log.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "matrix_multiply_and_row_dot.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "matrix_multiply_symmetric.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "matrix_power_eig.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "normalize_pairwise_distance.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "ones_like.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "pixel_shuffle_conv2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "pseudoinverse_svd.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "relu_batch_norm_conv2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "relu_conv2d.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "rsqrt.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "solve_and_add_scaled_vector.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "sum_std.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "tensordot_rsqrt.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    },
+    "tril_mm_and_scale.py": {
+      "call_acc_passed": true,
+      "exe_acc_passed": true
+    }
+  },
+  "call_acc_dir": "/results/qwen3_coder_grammar_prompts_fullsuite_v1/eval/qwen3_coder_30b_gptq_4bit/qwen3_coder_30b_gptq_4bit_tritonbench_python_xgrammar_on_t0.0_p1.0_tok2048_one_shot_repair0_default_seed0/call_acc",
+  "perf_results_dir": "/results/qwen3_coder_grammar_prompts_fullsuite_v1/eval/qwen3_coder_30b_gptq_4bit/qwen3_coder_30b_gptq_4bit_tritonbench_python_xgrammar_on_t0.0_p1.0_tok2048_one_shot_repair0_default_seed0/perf_results"
+}

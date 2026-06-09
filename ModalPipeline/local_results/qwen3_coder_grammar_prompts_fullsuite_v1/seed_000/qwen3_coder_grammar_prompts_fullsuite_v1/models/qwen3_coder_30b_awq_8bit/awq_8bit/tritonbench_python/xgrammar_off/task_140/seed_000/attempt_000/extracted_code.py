@@ -19,23 +19,22 @@ def _tril_mm_and_scale_kernel(A_ptr, B_ptr, out_ptr, n: tl.constexpr, p: tl.cons
     # Load B values
     B_vals = tl.load(B_ptr + col, mask=col_mask, other=0.0)
     
-    # Compute partial dot products
+    # Compute partial results for each row
     result = tl.zeros((BLOCK, BLOCK), dtype=tl.float32)
     for k in range(n):
-        # Load A value with triangular mask
+        # Load A value with triangular constraint
         a_val = tl.load(A_ptr + k * n + row, mask=row_mask, other=0.0)
-        # Apply triangular mask: only keep elements where row >= k
+        # Only keep values where row >= k (lower triangular)
         a_val = tl.where(row >= k, a_val, 0.0)
-        # Broadcast and multiply
-        a_broadcast = a_val[:, None]
-        b_broadcast = B_vals[None, :]
-        result += a_broadcast * b_broadcast
+        # Compute partial dot product
+        result += a_val[:, None] * B_vals[None, :]
     
-    # Scale by alpha and beta
-    result = result * alpha * beta
+    # Scale by alpha
+    result *= alpha
     
-    # Store result
-    tl.store(out_ptr + row[:, None] * p + col, result, mask=mask)
+    # Scale by beta and store
+    result *= beta
+    tl.store(out_ptr + row * p + col, result, mask=mask)
 
 def tril_mm_and_scale(A: torch.Tensor, B: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
     n, p = B.shape
@@ -45,7 +44,8 @@ def tril_mm_and_scale(A: torch.Tensor, B: torch.Tensor, alpha: float, beta: floa
     BLOCK = 16
     grid = (triton.cdiv(n, BLOCK), triton.cdiv(p, BLOCK))
     
-    # Launch kernel
-    _tril_mm_and_scale_kernel[grid](A, B, out, n, p, alpha, beta, BLOCK=BLOCK)
+    _tril_mm_and_scale_kernel[grid](
+        A, B, out, n, p, alpha, beta, BLOCK=BLOCK
+    )
     
     return out

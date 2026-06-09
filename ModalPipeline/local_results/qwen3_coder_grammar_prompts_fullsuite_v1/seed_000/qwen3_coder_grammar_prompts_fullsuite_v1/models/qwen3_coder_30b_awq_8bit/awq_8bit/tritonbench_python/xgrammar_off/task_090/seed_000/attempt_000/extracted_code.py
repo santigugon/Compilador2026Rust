@@ -45,40 +45,37 @@ def _fused_hardshrink_dropout_kernel(
 def fused_hardshrink_dropout(input: torch.Tensor, p: float = 0.5, training: bool = True, inplace: bool = False, lambd: float = 0.5) -> torch.Tensor:
     # Handle scalar inputs
     if input.dim() == 0:
-        input = input.unsqueeze(0)
-        output = torch.empty_like(input)
-        if not training:
-            output = input.clone()
-        else:
-            # For scalar case, we need to handle it specially
-            if torch.rand(1).item() > p:
-                output = input.clone()
+        # For scalar tensors, we need to handle differently
+        if training:
+            # Generate random number for dropout
+            rand_val = torch.rand((), device=input.device, dtype=torch.float32)
+            if rand_val > p:
+                x = input
             else:
-                output = torch.zeros_like(input)
-        
+                x = torch.tensor(0.0, device=input.device, dtype=input.dtype)
+        else:
+            x = input
+            
         # Apply hard shrinkage
-        abs_input = torch.abs(output)
-        output = torch.where(abs_input > lambd, output, torch.zeros_like(output))
-        
-        if input.dim() == 0:
-            output = output.squeeze(0)
-        return output
+        if torch.abs(x) <= lambd:
+            result = torch.tensor(0.0, device=input.device, dtype=input.dtype)
+        else:
+            result = x
+        return result
     
     # For non-scalar tensors
-    out = torch.empty_like(input) if not inplace else input
-    
+    out = torch.empty_like(input)
     n = input.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
     
-    _fused_hardshrink_dropout_kernel[grid](
-        input, 
-        out, 
-        n, 
-        p, 
-        training, 
-        lambd, 
-        BLOCK=block
-    )
-    
-    return out
+    # Handle inplace operation
+    if inplace and training:
+        # For inplace operation, we need to work on the input tensor directly
+        # But we need to be careful about the order of operations
+        _fused_hardshrink_dropout_kernel[grid](input, input, n, p, training, lambd, BLOCK=block)
+        return input
+    else:
+        # Normal case: use output tensor
+        _fused_hardshrink_dropout_kernel[grid](input, out, n, p, training, lambd, BLOCK=block)
+        return out

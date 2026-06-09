@@ -42,7 +42,7 @@ def pseudoinverse_svd(A, *, full_matrices=True, rcond=1e-15, out=None) -> torch.
         full_matrices (bool, optional): If `True` (default), compute the full SVD. If `False`, compute the reduced SVD.
         rcond (float, optional): Relative condition number threshold. Singular values smaller than `rcond * largest_singular_value` are set to zero. Default: `1e-15`.
         out (Tensor, optional): Output tensor. Ignored if `None`. Default: `None`.
-    
+        
     Returns:
         Tensor: Pseudoinverse of A with shape `(*, n, m)`.
     """
@@ -56,9 +56,8 @@ def pseudoinverse_svd(A, *, full_matrices=True, rcond=1e-15, out=None) -> torch.
     # For simplicity, we'll use PyTorch's SVD implementation
     # In a real implementation, this would use Triton kernels
     
-    # Handle batch dimensions
-    batch_shape = tuple(batch_dims)
-    if batch_shape:
+    # Handle batched case
+    if len(batch_dims) > 0:
         # Reshape for batch processing
         A_reshaped = A.view(-1, m, n)
         batch_size = A_reshaped.shape[0]
@@ -67,44 +66,42 @@ def pseudoinverse_svd(A, *, full_matrices=True, rcond=1e-15, out=None) -> torch.
         result_list = []
         for i in range(batch_size):
             A_batch = A_reshaped[i]
-            # Use torch's SVD for computation
-            U, S, Vt = torch.linalg.svd(A_batch, full_matrices=full_matrices)
-            
-            # Apply condition number threshold
-            max_singular = S.max()
-            threshold = rcond * max_singular
-            S = S.where(S > threshold, torch.zeros_like(S))
-            
-            # Compute pseudoinverse
-            S_inv = torch.where(S != 0, 1.0 / S, torch.zeros_like(S))
-            U_t = U.mT
-            V_t = Vt.mT
-            pseudoinv = V_t @ torch.diag(S_inv) @ U_t
-            
-            result_list.append(pseudoinv)
+            result = _pseudoinverse_svd_single(A_batch, full_matrices, rcond)
+            result_list.append(result)
         
-        # Stack results
+        # Stack results back
         result = torch.stack(result_list, dim=0)
-        result = result.view(*batch_shape, n, m)
+        result = result.view(*batch_dims, n, m)
     else:
         # Single matrix case
-        U, S, Vt = torch.linalg.svd(A, full_matrices=full_matrices)
-        
-        # Apply condition number threshold
-        max_singular = S.max()
-        threshold = rcond * max_singular
-        S = S.where(S > threshold, torch.zeros_like(S))
-        
-        # Compute pseudoinverse
-        S_inv = torch.where(S != 0, 1.0 / S, torch.zeros_like(S))
-        U_t = U.mT
-        V_t = Vt.mT
-        result = V_t @ torch.diag(S_inv) @ U_t
+        result = _pseudoinverse_svd_single(A, full_matrices, rcond)
     
-    # Return result
+    # Handle output tensor
     if out is not None:
         out.copy_(result)
         return out
+    else:
+        return result
+
+def _pseudoinverse_svd_single(A, full_matrices, rcond):
+    """Helper function to compute pseudoinverse for a single matrix."""
+    # Use PyTorch's SVD for actual computation
+    U, S, Vh = torch.linalg.svd(A, full_matrices=full_matrices)
+    
+    # Compute threshold
+    max_singular = S.max()
+    threshold = rcond * max_singular
+    
+    # Zero out small singular values
+    S_mask = S > threshold
+    S_inv = torch.where(S_mask, 1.0 / S, torch.zeros_like(S))
+    
+    # Reconstruct pseudoinverse
+    # Pseudoinverse = V * S^+ * U^T
+    S_inv_diag = torch.diag(S_inv)
+    V = Vh.mH  # V^H
+    result = V @ S_inv_diag @ U.mH  # V * S^+ * U^T
+    
     return result
 
 ##################################################################################################################################################

@@ -17,8 +17,7 @@ def _combined_activation_kernel(
     for i in range(0, n_in, BLOCK):
         # Load input and weight1 blocks
         input_offsets = batch_id * n_in + i + tl.arange(0, BLOCK)
-        weight1_offsets = i + out_id * n_in + tl.arange(0, BLOCK)
-        
+        weight1_offsets = i + out_id + tl.arange(0, BLOCK) * n_out
         mask = (input_offsets < (batch_id + 1) * n_in) & (weight1_offsets < n_in * n_out)
         
         input_vals = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
@@ -26,13 +25,11 @@ def _combined_activation_kernel(
         
         acc += tl.sum(input_vals * weight1_vals)
     
-    # Compute activation functions
-    # Apply sigmoid and tanh
-    activation = 2.0 / (1.0 + tl.exp(-2.0 * acc)) - 1.0  # tanh
-    activation = 1.0 / (1.0 + tl.exp(-activation))  # sigmoid
+    # Apply activation functions
+    activation = tl.sigmoid(acc) * tl.tanh(acc)
     
-    # Element-wise multiplication with weight2
-    # weight2 is broadcastable to output shape, so we compute it per batch
+    # Apply element-wise multiplication with weight2
+    # weight2 is broadcastable, so we load it once per output
     weight2_val = tl.load(weight2_ptr + out_id, mask=out_id < n_out, other=0.0)
     activation = activation * weight2_val
     
@@ -46,46 +43,32 @@ def _combined_activation_kernel(
 
 def combined_activation(input, weight1, weight2, bias, *, out=None):
     # Validate dimensions
-    batch_shape = input.shape[:-2]
+    assert input.dim() >= 2, "input must have at least 2 dimensions"
+    assert weight1.dim() == 2, "weight1 must be 2-dimensional"
+    assert weight1.shape[1] == input.shape[-1], "weight1 and input dimensions must be compatible"
+    
+    # Compute batch dimensions
+    batch_shape = input.shape[:-1]
+    n_batch = 1
+    for dim in batch_shape:
+        n_batch *= dim
+    
     n_in = input.shape[-1]
-    n_out = weight1.shape[-1]
-    
-    # Check compatibility
-    assert weight1.shape[-2] == n_in, "Weight1 dimension mismatch"
-    assert weight2.shape[-1] == n_out, "Weight2 dimension mismatch"
-    assert bias.shape[-1] == n_out, "Bias dimension mismatch"
-    
-    # Compute output shape
-    output_shape = batch_shape + (n_out,)
+    n_out = weight1.shape[1]
     
     # Create output tensor
     if out is None:
-        out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+        out = torch.empty(*batch_shape, n_out, dtype=input.dtype, device=input.device)
     else:
-        assert out.shape == output_shape, "Output tensor shape mismatch"
-    
-    # Handle batch dimensions
-    batch_size = 1
-    for dim in batch_shape:
-        batch_size *= dim
+        assert out.shape == (*batch_shape, n_out), "out tensor must have correct shape"
     
     # Launch kernel
     block = 32
-    grid = (batch_size * n_out,)
+    grid = (n_batch * n_out,)
     
-    # Flatten input and weight1 for kernel processing
-    input_flat = input.view(-1, n_in)
-    weight1_flat = weight1.view(n_in, n_out)
-    weight2_flat = weight2.view(-1, n_out)
-    bias_flat = bias.view(-1, n_out)
-    
-    # Create output tensor with flattened shape
-    out_flat = out.view(-1, n_out)
-    
-    # Launch kernel
     _combined_activation_kernel[grid](
-        input_flat, weight1_flat, weight2_flat, bias_flat, out_flat,
-        batch_size, n_in, n_out, BLOCK=block
+        input, weight1, weight2, bias, out,
+        n_batch, n_in, n_out, BLOCK=block
     )
     
     return out

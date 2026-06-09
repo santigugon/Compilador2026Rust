@@ -37,16 +37,14 @@ def _fused_embedding_add_tanh_kernel(
         # Load weight values for each embedding dimension
         weight_offsets = embedding_offsets + i
         weight_values = tl.load(weight_ptr + weight_offsets, mask=mask, other=0.0)
-        embeddings = tl.where(mask, embeddings + weight_values, embeddings)
+        embeddings = tl.where(i == 0, weight_values, embeddings)
     
-    # Load other tensor (broadcasting)
-    other_values = tl.load(other_ptr + offsets, mask=mask, other=0.0)
-    
-    # Add other tensor to embeddings
-    result = embeddings + other_values
+    # Add other tensor
+    other_offsets = offsets * embedding_dim
+    other_values = tl.load(other_ptr + other_offsets, mask=mask, other=0.0)
     
     # Apply tanh activation
-    result = 2.0 / (1.0 + tl.exp(-2.0 * result)) - 1.0
+    result = 2.0 / (1.0 + tl.exp(-2.0 * (embeddings + other_values))) - 1.0
     
     # Apply max_norm if specified
     if max_norm > 0:
@@ -59,9 +57,7 @@ def _fused_embedding_add_tanh_kernel(
     
     # Store result
     out_offsets = offsets * embedding_dim
-    for i in range(embedding_dim):
-        out_offsets_i = out_offsets + i
-        tl.store(out_ptr + out_offsets_i, result[:, i], mask=mask)
+    tl.store(out_ptr + out_offsets, result, mask=mask)
 
 def fused_embedding_add_tanh(
     input_indices,
@@ -75,41 +71,49 @@ def fused_embedding_add_tanh(
     sparse=False,
     out=None
 ):
-    # Handle scalar padding_idx
-    if padding_idx is not None and not isinstance(padding_idx, int):
-        padding_idx = int(padding_idx)
-    
-    # Handle scalar max_norm
-    if max_norm is not None and not isinstance(max_norm, (int, float)):
-        max_norm = float(max_norm)
-    
     # Validate inputs
     if input_indices.dim() == 0:
         input_indices = input_indices.unsqueeze(0)
     
-    # Compute output shape
-    output_shape = list(input_indices.shape)
-    output_shape.append(weight.shape[1])
-    
-    # Create output tensor
-    if out is not None:
-        out = torch.empty_like(out)
-    else:
-        out = torch.empty(output_shape, dtype=torch.float32, device=weight.device)
-    
     # Get dimensions
     n_indices = input_indices.numel()
-    embedding_dim = weight.shape[1]
+    embedding_dim = weight.size(1)
     
-    # Handle special cases
-    if n_indices == 0:
-        return out
+    # Handle optional parameters
+    if padding_idx is None:
+        padding_idx = -1
+    else:
+        padding_idx = int(padding_idx)
     
-    # Set up kernel launch parameters
-    BLOCK = 256
-    grid = (triton.cdiv(n_indices, BLOCK),)
+    if max_norm is None:
+        max_norm = 0.0
+    else:
+        max_norm = float(max_norm)
+    
+    # Create output tensor
+    if out is None:
+        # Compute output shape
+        output_shape = list(input_indices.shape)
+        output_shape.append(embedding_dim)
+        out = torch.empty(output_shape, dtype=torch.float32, device=weight.device)
+    else:
+        # Ensure output has correct shape
+        expected_shape = list(input_indices.shape)
+        expected_shape.append(embedding_dim)
+        if out.shape != tuple(expected_shape):
+            raise ValueError("Output tensor shape does not match expected shape")
+    
+    # Handle scalar other tensor
+    if other.dim() == 0:
+        other = other.unsqueeze(0)
+    
+    # Ensure other tensor is broadcastable
+    # For simplicity, we'll assume other is properly broadcastable
     
     # Launch kernel
+    block = 256
+    grid = (triton.cdiv(n_indices, block),)
+    
     _fused_embedding_add_tanh_kernel[grid](
         input_indices,
         weight,
@@ -117,10 +121,10 @@ def fused_embedding_add_tanh(
         out,
         n_indices,
         embedding_dim,
-        padding_idx if padding_idx is not None else -1,
-        max_norm if max_norm is not None else 0.0,
+        padding_idx,
+        max_norm,
         norm_type,
-        BLOCK=BLOCK
+        BLOCK=block
     )
     
     return out

@@ -14,26 +14,23 @@ def _scaled_add_norm_kernel(y_ptr, x_ptr, out_ptr, n: tl.constexpr, alpha: tl.co
     tl.store(y_ptr + offsets, y, mask=mask)
     # Compute squared sum for norm
     y_squared = y * y
-    tl.store(out_ptr + offsets, y_squared, mask=mask)
+    tl.atomic_add(out_ptr, y_squared, mask=mask)
 
 def scaled_add_norm(y, x, alpha):
-    # Ensure inputs are contiguous and have the same shape
-    if y.shape != x.shape:
-        raise ValueError("y and x must have the same shape")
+    # Ensure inputs are contiguous
+    y = y.contiguous()
+    x = x.contiguous()
     
-    # Create output tensor for squared values
-    out = torch.empty_like(y)
+    # Create output tensor for squared sum
+    out = torch.zeros(1, dtype=torch.float32, device=y.device)
     
     n = y.numel()
     block = 256
     grid = (triton.cdiv(n, block),)
     
-    # Launch kernel to perform y += alpha * x and store squared values
     _scaled_add_norm_kernel[grid](y, x, out, n, alpha, BLOCK=block)
     
-    # Sum the squared values and compute the 2-norm
-    squared_sum = out.sum()
-    norm = torch.sqrt(squared_sum)
-    
+    # Compute the 2-norm
+    norm = torch.sqrt(out[0])
     return norm
 ```
