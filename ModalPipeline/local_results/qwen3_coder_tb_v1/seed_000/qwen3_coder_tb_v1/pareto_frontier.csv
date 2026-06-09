@@ -1,5 +1,4 @@
 quantization,correctness_rate,peak_gpu_memory_mb,mean_latency_ms
-awq_4bit,1.0,,4879.146976800001
-awq_8bit,0.0,,6590.237229000003
-bf16_or_fp16,0.0,,6271.0781849999985
-gptq_4bit,0.0,,5604.091816799996
+awq_8bit,0.0,,6843.5397791999885
+bf16_or_fp16,0.0,,6375.7853104000105
+gptq_4bit,0.0,,5734.483305999993

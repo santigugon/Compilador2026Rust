@@ -23,7 +23,7 @@ def fused_bmm_rmsnorm_gelu_dropout_sub_kernel(
     p_idx = (block_idx % (N * P // BLOCK_SIZE_N // BLOCK_SIZE_P)) * BLOCK_SIZE_P
     
     # Load input1 and input2
-    input1_block = tl.load(input1_ptr + batch_idx * N * M + n_idx * M + tl.arange(0, BLOCK_SIZE_M)[:, None] * M + tl.arange(0, BLOCK_SIZE_K)[None, :])
+    input1_block = tl.load(input1_ptr + batch_idx * N * M + n_idx * M + tl.arange(0, BLOCK_SIZE_N)[:, None] * M + tl.arange(0, BLOCK_SIZE_K)[None, :])
     input2_block = tl.load(input2_ptr + batch_idx * M * P + tl.arange(0, BLOCK_SIZE_K)[:, None] * P + p_idx + tl.arange(0, BLOCK_SIZE_P)[None, :])
     
     # Perform batch matrix multiplication
@@ -43,7 +43,7 @@ def fused_bmm_rmsnorm_gelu_dropout_sub_kernel(
     # Apply dropout
     if training:
         # Generate random mask
-        mask = tl.random.rand(BLOCK_SIZE_M, BLOCK_SIZE_P) > dropout_p
+        mask = tl.random.rand(BLOCK_SIZE_N, BLOCK_SIZE_P) > dropout_p
         output_block = output_block * mask / (1.0 - dropout_p)
     
     # Subtract other tensor
@@ -63,9 +63,11 @@ def fused_bmm_rmsnorm_gelu_dropout_sub(input1, input2, other, normalized_shape, 
     B, N, M = input1.shape
     _, _, P = input2.shape
     
-    # Ensure other is broadcastable to (B, N, P)
-    if other.shape != (B, N, P):
-        other = other.expand(B, N, P)
+    # Ensure normalized_shape is correct
+    if isinstance(normalized_shape, int):
+        normalized_shape = [normalized_shape]
+    else:
+        normalized_shape = list(normalized_shape)
     
     # Create output tensor if not provided
     if out is None:
@@ -82,7 +84,7 @@ def fused_bmm_rmsnorm_gelu_dropout_sub(input1, input2, other, normalized_shape, 
         N=N,
         M=M,
         P=P,
-        normalized_shape=normalized_shape,
+        normalized_shape=normalized_shape[0],
         dropout_p=dropout_p,
         eps=eps,
         training=training,

@@ -14,7 +14,7 @@ def _solve_multiple_lu_kernel(
     if batch_idx >= batch_size:
         return
     
-    # Load A and Bs for this batch
+    # Load A matrix for this batch
     A_batch = A_ptr + batch_idx * n * n
     Bs_batch = Bs_ptr + batch_idx * n * k
     X_batch = X_ptr + batch_idx * n * k
@@ -61,45 +61,40 @@ def _solve_multiple_lu_kernel(
     
     # Copy A to U
     for i in range(n):
-        for j in range(n):
-            if i <= j:
-                U[i * BLOCK_SIZE + j] = A_batch[i * n + j]
-            else:
-                U[i * BLOCK_SIZE + j] = 0.0
+        for j in range(i, n):
+            U[i * BLOCK_SIZE + j] = A_batch[i * n + j]
     
-    # Forward substitution
-    for i in range(n):
-        for j in range(i + 1, n):
-            for k_idx in range(n):
-                A_batch[j * n + k_idx] -= L[j * BLOCK_SIZE + i] * A_batch[i * n + k_idx]
-    
-    # Backward substitution
-    for i in range(n - 1, -1, -1):
-        for j in range(i + 1, n):
-            for k_idx in range(n):
-                A_batch[i * n + k_idx] -= L[i * BLOCK_SIZE + j] * A_batch[j * n + k_idx]
-    
-    # Copy result to output
+    # Forward substitution to solve L * Y = B
     for i in range(n):
         for j in range(k):
-            X_batch[i * k + j] = A_batch[i * n + j]
+            y = 0.0
+            for l in range(i):
+                y += L[i * BLOCK_SIZE + l] * Bs_batch[l * k + j]
+            Bs_batch[i * k + j] = Bs_batch[i * k + j] - y
+    
+    # Backward substitution to solve U * X = Y
+    for i in range(n - 1, -1, -1):
+        for j in range(k):
+            x = Bs_batch[i * k + j]
+            for l in range(i + 1, n):
+                x -= U[i * BLOCK_SIZE + l] * Bs_batch[l * k + j]
+            Bs_batch[i * k + j] = x / U[i * BLOCK_SIZE + i]
 
 def solve_multiple_lu(A, Bs, *, pivot=True, out=None) -> torch.Tensor:
     # Validate inputs
-    assert A.dim() >= 2, "A must have at least 2 dimensions"
-    assert Bs.dim() >= 2, "Bs must have at least 2 dimensions"
+    assert A.ndim >= 2, "A must have at least 2 dimensions"
+    assert Bs.ndim >= 2, "Bs must have at least 2 dimensions"
     assert A.shape[-1] == A.shape[-2], "A must be square"
     assert A.shape[-1] == Bs.shape[-2], "A and Bs must have compatible dimensions"
     
     # Get batch dimensions
     batch_shape = A.shape[:-2]
-    n = A.shape[-1]
-    k = Bs.shape[-1]
-    
-    # Flatten batch dimensions for kernel execution
     batch_size = 1
     for dim in batch_shape:
         batch_size *= dim
+    
+    n = A.shape[-1]
+    k = Bs.shape[-1]
     
     # Create output tensor if not provided
     if out is None:

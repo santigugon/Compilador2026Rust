@@ -1,5 +1,4 @@
 role,attempts,overall_pass_rate
 baseline,5,0.0
 high_precision_quantized,5,0.0
-low_precision_candidate,5,1.0
 low_precision_candidate_alt,5,0.0

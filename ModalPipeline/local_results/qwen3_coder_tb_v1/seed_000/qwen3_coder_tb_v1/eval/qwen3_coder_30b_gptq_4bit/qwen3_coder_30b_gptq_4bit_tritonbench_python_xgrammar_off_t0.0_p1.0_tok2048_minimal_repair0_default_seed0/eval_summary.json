@@ -3,7 +3,7 @@
   "phase1_call_acc": {
     "passed": 0,
     "rate": 0.0,
-    "duration_ms": 18175.19716800001
+    "duration_ms": 15725.420998000005
   },
   "phase2_exec_acc": {
     "passed": 0,

@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-from typing import Union, Tuple, Optional
+from typing import Union, Tuple
 
 @triton.jit
 def sigmoid_conv2d_kernel(
@@ -26,50 +26,47 @@ def sigmoid_conv2d_kernel(
     out_h = out_h_idx * BLOCK_SIZE_H
     out_w = out_w_idx * BLOCK_SIZE_W
     
-    # Shared memory for input tile
-    input_tile = tl.shared.load(input_ptr + batch_idx * in_channels * input_height * input_width + 
-                               tl.arange(0, BLOCK_SIZE_H)[:, None] * input_width + 
-                               tl.arange(0, BLOCK_SIZE_W)[None, :])
+    # Load bias if present
+    bias_val = 0.0
+    if bias_ptr is not None:
+        bias_val = tl.load(bias_ptr + out_ch_idx)
     
     # Initialize accumulator
     acc = 0.0
     
-    # Perform convolution
-    for k_h in range(weight_height):
-        for k_w in range(weight_width):
-            # Calculate input indices with padding and dilation
-            in_h = out_h * stride_h + k_h * dilation_h - pad_h
-            in_w = out_w * stride_w + k_w * dilation_w - pad_w
-            
-            # Check bounds
-            if in_h >= 0 and in_h < input_height and in_w >= 0 and in_w < input_width:
-                # Load input and weight
-                input_val = input_tile[in_h, in_w]
-                weight_val = weight_ptr[out_ch_idx * in_channels * weight_height * weight_width + 
-                                       k_h * weight_width + k_w]
-                acc += input_val * weight_val
+    # Loop over input channels and kernel elements
+    for g in range(groups):
+        for kh in range(weight_height):
+            for kw in range(weight_width):
+                # Calculate input indices with dilation and padding
+                ih = out_h * stride_h + kh * dilation_h - pad_h
+                iw = out_w * stride_w + kw * dilation_w - pad_w
+                
+                # Check bounds
+                if ih >= 0 and ih < input_height and iw >= 0 and iw < input_width:
+                    # Load input and weight
+                    input_val = tl.load(input_ptr + batch_idx * in_channels * input_height * input_width +
+                                        g * input_height * input_width + ih * input_width + iw)
+                    weight_val = tl.load(weight_ptr + out_ch_idx * groups * weight_height * weight_width +
+                                         g * weight_height * weight_width + kh * weight_width + kw)
+                    acc += input_val * weight_val
     
-    # Add bias if present
-    if bias_ptr is not None:
-        acc += bias_ptr[out_ch_idx]
-    
-    # Apply sigmoid
-    output_val = tl.sigmoid(acc)
+    # Add bias and apply sigmoid
+    result = tl.sigmoid(acc + bias_val)
     
     # Store result
-    output_ptr[batch_idx * out_channels * output_height * output_width + 
-              out_ch_idx * output_height * output_width + 
-              out_h_idx * output_width + out_w_idx] = output_val
+    tl.store(output_ptr + batch_idx * out_channels * output_height * output_width +
+             out_ch_idx * output_height * output_width + out_h * output_width + out_w, result)
 
 def sigmoid_conv2d(
     input: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor = None,
     stride: Union[int, Tuple[int, int]] = 1,
     padding: Union[int, Tuple[int, int], str] = 0,
     dilation: Union[int, Tuple[int, int]] = 1,
     groups: int = 1,
-    out: Optional[torch.Tensor] = None
+    out: torch.Tensor = None
 ) -> torch.Tensor:
     # Parse stride
     if isinstance(stride, int):
@@ -108,20 +105,23 @@ def sigmoid_conv2d(
     if out is None:
         out = torch.empty(batch_size, out_channels, output_height, output_width, device=input.device, dtype=input.dtype)
     
-    # Configure grid and block sizes
-    BLOCK_SIZE_H = 16
-    BLOCK_SIZE_W = 16
-    BLOCK_SIZE_C = 32
+    # Ensure tensors are on the same device
+    if bias is not None:
+        bias = bias.to(input.device)
     
     # Launch kernel
     grid = (
         batch_size,
         out_channels,
-        (output_height + BLOCK_SIZE_H - 1) // BLOCK_SIZE_H,
-        (output_width + BLOCK_SIZE_W - 1) // BLOCK_SIZE_W
+        (output_height + 15) // 16,
+        (output_width + 15) // 16
     )
     
-    # Launch kernel
+    # Launch kernel with appropriate block sizes
+    BLOCK_SIZE_H = 16
+    BLOCK_SIZE_W = 16
+    BLOCK_SIZE_C = 16
+    
     sigmoid_conv2d_kernel[grid](
         input_ptr=input.data_ptr(),
         weight_ptr=weight.data_ptr(),

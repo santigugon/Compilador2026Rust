@@ -47,12 +47,12 @@ def div(input, other, *, rounding_mode=None, out=None):
         other = other.to(common_dtype)
     
     # Determine rounding mode
-    rounding_mode_code = -1
+    rounding_mode_int = -1
     if rounding_mode is not None:
         rounding_modes = {"trunc": 0, "floor": 1, "round": 2}
         if rounding_mode not in rounding_modes:
             raise ValueError(f"Unsupported rounding_mode: {rounding_mode}")
-        rounding_mode_code = rounding_modes[rounding_mode]
+        rounding_mode_int = rounding_modes[rounding_mode]
     
     # Handle broadcasting
     input_size = input.numel()
@@ -80,7 +80,7 @@ def div(input, other, *, rounding_mode=None, out=None):
         out.data_ptr(),
         input_size,
         other_size,
-        rounding_mode_code,
+        rounding_mode_int,
         BLOCK_SIZE
     )
     

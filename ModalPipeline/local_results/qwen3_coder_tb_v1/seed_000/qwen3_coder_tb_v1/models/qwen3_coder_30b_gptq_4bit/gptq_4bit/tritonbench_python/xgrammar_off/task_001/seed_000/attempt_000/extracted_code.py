@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _div_kernel(
+def div_kernel(
     input_ptr,
     other_ptr,
     output_ptr,
@@ -18,50 +18,49 @@ def _div_kernel(
     input = tl.load(input_ptr + offsets, mask=mask)
     other = tl.load(other_ptr + offsets, mask=mask)
     
-    if rounding_mode == 0:  # None
-        result = input / other
-    elif rounding_mode == 1:  # "floor"
-        result = tl.floor(input / other)
-    elif rounding_mode == 2:  # "round"
-        result = tl.round(input / other)
-    elif rounding_mode == 3:  # "trunc"
-        result = tl.trunc(input / other)
-    else:
-        result = input / other
+    # Perform division
+    output = input / other
     
-    tl.store(output_ptr + offsets, result, mask=mask)
+    # Apply rounding if specified
+    if rounding_mode == "floor":
+        output = tl.floor(output)
+    elif rounding_mode == "ceil":
+        output = tl.ceil(output)
+    elif rounding_mode == "trunc":
+        output = tl.trunc(output)
+    elif rounding_mode == "round":
+        output = tl.round(output)
+    
+    tl.store(output_ptr + offsets, output, mask=mask)
 
 def div(input, other, *, rounding_mode=None, out=None):
     if isinstance(other, (int, float, complex)):
         other = torch.tensor(other, dtype=input.dtype, device=input.device)
     else:
-        other = other.to(input.dtype)
+        other = other.to(input.dtype).to(input.device)
     
     if out is None:
         out = torch.empty_like(input)
     
-    if input.shape != other.shape:
-        input, other = torch.broadcast_tensors(input, other)
+    # Ensure tensors have the same device
+    if input.device != other.device:
+        other = other.to(input.device)
     
+    # Handle broadcasting
+    input, other = torch.broadcast_tensors(input, other)
+    
+    # Get total number of elements
     n_elements = input.numel()
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
     
-    rounding_mode_map = {
-        None: 0,
-        "floor": 1,
-        "round": 2,
-        "trunc": 3
-    }
-    rounding_mode_code = rounding_mode_map.get(rounding_mode, 0)
-    
-    _div_kernel[grid](
+    # Launch kernel
+    grid = (triton.cdiv(n_elements, 1024),)
+    div_kernel[grid](
         input_ptr=input.data_ptr(),
         other_ptr=other.data_ptr(),
         output_ptr=out.data_ptr(),
         n_elements=n_elements,
-        rounding_mode=rounding_mode_code,
-        BLOCK_SIZE=BLOCK_SIZE
+        rounding_mode=rounding_mode,
+        BLOCK_SIZE=1024
     )
     
     return out
